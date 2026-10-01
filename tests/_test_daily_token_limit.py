@@ -18,7 +18,7 @@ import tempfile
 import time
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app"))
 _TMP = tempfile.mkdtemp(prefix="wb-daily-")
 os.environ["ACCOUNTS_DIR"] = os.path.join(_TMP, "accounts")
 os.environ["WB_PROXY_USAGE_DIR"] = _TMP
@@ -150,6 +150,8 @@ class DailyTokenLimitTests(unittest.TestCase):
 
         class Pool(object):
             accounts = [account]
+            # 真账号池在 __init__ 里就有这个开关；关着时请求路径不做评分折叠。
+            smart_routing = False
 
             def count_ready(self, realm, model=None):
                 return sum(a.ready(model=model) for a in self.accounts)
