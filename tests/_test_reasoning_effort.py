@@ -201,6 +201,9 @@ class FakeUpstream(object):
 class FakeAccount(object):
     uid = "acct-effort"
 
+    def release_request(self, model=None):
+        """账号并发名额：真实 Account 在响应体读完时释放，这个桩不需要计数。"""
+
 
 class FakeHandler(object):
     """借来真实的调度、响应函数与判重方法，配一套最小的请求对象。"""

@@ -178,7 +178,7 @@ class ConcurrencyLimitTests(unittest.TestCase):
         proxy.POOL = stub_pool(account)
         accounts.urlopen = lambda *a, **k: response
         try:
-            got, picked = proxy.follow_up_with_tool_results(
+            got, picked, _effort = proxy.follow_up_with_tool_results(
                 [], {"base_messages": [], "convo_messages": [], "realm": "cn"},
                 "glm-5.3", "sess-1", 0.0, account=account)
         finally:
