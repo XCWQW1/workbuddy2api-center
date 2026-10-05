@@ -60,6 +60,9 @@ class FakeUpstream(object):
 class FakeAccount(object):
     uid = "acct-test"
 
+    def release_request(self, model=None):
+        """账号并发名额：真实的 Account 在响应体读完时释放，这个桩不计数。"""
+
 
 class ChatChunks(object):
     """A chat stream that thinks, talks and then calls one tool."""

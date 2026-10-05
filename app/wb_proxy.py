@@ -15,6 +15,7 @@ start-wb-proxy.command (or ./start-wb-proxy.sh) on macOS/Linux.
 """
 import argparse
 import calendar
+import contextlib
 import copy
 import email.utils
 import hashlib
@@ -4555,7 +4556,25 @@ def _retry_same_account(account, counters):
     return True
 
 
-def open_upstream(payload, session_key=None, target_realm=None, only_uid=None):
+@contextlib.contextmanager
+def upstream_lease(upstream, account, model):
+    """Hold one "account + model" in-flight slot until the body is finished.
+
+    The slot is taken in open_upstream() and has to survive past the return:
+    a streaming body is still being read by the caller long after the response
+    object was handed back. Releasing it on close therefore belongs here, not
+    inside open_upstream(), and this wrapper is what the callers already drive
+    with `with upstream:`.
+    """
+    try:
+        with upstream:
+            yield upstream
+    finally:
+        account.release_request(model)
+
+
+def open_upstream(payload, session_key=None, target_realm=None, only_uid=None,
+                  without_slot=False, pin=None):
     # Refresh the daily token guard before picking. The scan underneath is
     # incremental and TTL-cached, so this is a stat() plus a cached dict on
     # the hot path, and an account parked by the guard is skipped like any
@@ -4576,6 +4595,10 @@ def open_upstream(payload, session_key=None, target_realm=None, only_uid=None):
         # （该函数可能在最前面插入 SYSTEM_PROMPT）。
         session_key = derive_affinity_key(upstream_body.get("messages"))
     total = max(1, POOL.count_ready(realm, model=model)) if POOL else 1
+    # 续写轮：必须回到一直以来服务这段对话的那个账号（前缀缓存就在那里），
+    # 而不是重新选号——重选会让同一段对话换号、缓存重建，还会因为名额被
+    # 自己占着而选不到人。调用方把账号传进来固定住。
+    pinned = without_slot and pin is not None
     tried = set()
     # 换号时不主动解绑：绑定留在原账号上，下一轮取号把这个账号排除在外，
     # 账号池自己按「换号」记账并重新绑定。原地重试（同账号换身份、5xx 重试、
@@ -4596,7 +4619,12 @@ def open_upstream(payload, session_key=None, target_realm=None, only_uid=None):
     # 才不会在轮到下一个账号之前就把循环用完。
     max_attempts += MAX_TRANSIENT_SAME_ACCOUNT_RETRIES
     for _attempt in range(max_attempts):
-        if only_uid:
+        if pinned:
+            # 续写轮：只用一直服务这段对话的那个账号。
+            account = pin
+            if account.uid in tried or account.realm != realm:
+                account = None
+        elif only_uid:
             account = POOL.get(only_uid) if POOL else None
             if account is not None and (account.uid in tried or account.realm != realm
                                         or not account.ready(model=model)):
@@ -4615,6 +4643,15 @@ def open_upstream(payload, session_key=None, target_realm=None, only_uid=None):
             continue
         tried.add(account.uid)
         last_uid = account.uid
+        # 单账号单模型的名额：按「账号 + 模型」计数，满了就换下一个账号，
+        # 与这个模型在该账号上冷却时的处理一致。上限为 0 时永远拿得到。
+        if without_slot:
+            # 续写轮：名额已经由调用方那层持有，不再占第二个。
+            pass
+        elif not account.acquire_request(model):
+            log("account %s at its '%s' concurrency limit, rotating"
+                % (account.uid[:8], model))
+            continue
         chat_url = account.chat_base_url() + CHAT_PATH
         # The cache key is account scoped, so it is rebuilt per candidate rather
         # than once up front. Opt-in only: measurement showed the upstream
@@ -4634,6 +4671,10 @@ def open_upstream(payload, session_key=None, target_realm=None, only_uid=None):
             # 重新组装，档位却只由模型与请求本身决定，调用方把它写进用量流水。
             return resp, account, upstream_effort_of(upstream_body, model)
         except urllib.error.HTTPError as exc:
+            # 这一轮上游调用结束了；名额归还得等响应体读完，所以这里先退。
+            # 续写轮没占名额，不能退别人的。
+            if not without_slot:
+                account.release_request(model)
             if exc.code == 429:
                 try:
                     detail = exc.read(600).decode("utf-8", "replace")
@@ -4688,6 +4729,8 @@ def open_upstream(payload, session_key=None, target_realm=None, only_uid=None):
                 continue
             raise
         except Exception as exc:
+            if not without_slot:
+                account.release_request(model)
             if is_transient(exc):
                 transient_hits += 1
                 last_error = exc
@@ -4723,6 +4766,14 @@ def open_upstream(payload, session_key=None, target_realm=None, only_uid=None):
             raise exc
         raise last_error
     if only_uid:
+        selected = POOL.get(only_uid) if POOL else None
+        if (selected and selected.ready(model=model)
+                and not selected.has_request_capacity(model)):
+            reason = ("the selected account reached its concurrent request limit "
+                      "for '%s'" % model)
+            error = RateLimited(None, reason, wait=1, message=reason)
+            error.account_uid = selected.uid
+            raise error
         raise RuntimeError("no usable account: the selected account %s cannot "
                            "serve this request" % str(only_uid)[:8])
     throttled, wait = realm_model_throttled(realm, model)
@@ -4730,6 +4781,13 @@ def open_upstream(payload, session_key=None, target_realm=None, only_uid=None):
         raise RateLimited(None, "usage exceeds frequency limit", wait=wait)
     enabled = [a for a in POOL.accounts
                if a.realm == realm and a.enabled and a.access_token] if POOL else []
+    # 名额用满是「暂不接单」，与冷却、限额同类：要给出 429，而不是让人
+    # 以为账号池不可用（503）。
+    ready = [a for a in enabled if a.ready(model=model)]
+    if ready and all(not a.has_request_capacity(model) for a in ready):
+        reason = ("every usable account reached its concurrent request limit "
+                  "for '%s'" % model)
+        raise RateLimited(None, reason, wait=1, message=reason)
     if enabled and all(a.daily_limit_blocked() for a in enabled):
         reason = ("every usable account reached today's token limit (%s per "
                   "account); the pool resumes after local midnight"
@@ -5318,7 +5376,7 @@ def build_citations(text, sources):
 
 
 def follow_up_with_tool_results(internal_calls, holder, model, session_key, t_start,
-                                drop_tools=False):
+                                drop_tools=False, account=None):
     """执行反代自己代跑的网络工具，把结果喂回模型，返回新的上游连线。
 
     返回的三元组与 open_upstream() 一致：上游响应、账号、本次请求实际使用的
@@ -5370,8 +5428,11 @@ def follow_up_with_tool_results(internal_calls, holder, model, session_key, t_st
         })
     body["messages"] = convo
     body["stream"] = True
+    # 续写轮：名额仍然由调用方那层持有，这里不再占第二个（否则上限为 1
+    # 的账号会被自己的续写卡死），账号也固定用正在服务这条对话的那一个。
     return open_upstream(body, session_key=session_key,
-                         target_realm=holder.get("realm"))
+                         target_realm=holder.get("realm"),
+                         without_slot=True, pin=account)
 
 
 def internal_calls_from_chat(chat_obj, web_tools=False):
@@ -8847,11 +8908,21 @@ class Handler(BaseHTTPRequestHandler):
             if updated is None:
                 return self._error(404, "no such account")
             log("account %s note %s" % (uid[:8], "cleared" if not note else "set"))
+        if "concurrencyLimit" in payload:
+            limit, problem = wb_accounts.normalise_concurrency_limit(
+                payload.get("concurrencyLimit"))
+            if problem:
+                return self._error(400, problem, "invalid_request_error")
+            updated = POOL.set_concurrency_limit(uid, limit)
+            if updated is None:
+                return self._error(404, "no such account")
+            log("account %s concurrency limit %s"
+                % (uid[:8], "cleared" if not limit else "set to %d" % limit))
         if updated is None:
             return self._error(
                 400,
                 "nothing to update: pass 'enabled', 'proxy', 'proxySlot', "
-                "'priority' or 'note'",
+                "'priority', 'note' or 'concurrencyLimit'",
             )
         return self._json(200, {"account": updated})
 
@@ -8991,7 +9062,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(503, message +
                                    " - add or enable one at the dashboard (/)")
             return self._error(502, f"upstream unreachable: {exc}")
-        with upstream:
+        with upstream_lease(upstream, account, model):
             if want_stream:
                 return self._responses_stream_response(
                     upstream, model, custom_names, request_meta, fp, account, t_start, ns_map,
@@ -9050,7 +9121,8 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 upstream, account, _ = follow_up_with_tool_results(
-                    internal, holder, model, session_key, t_start, drop_tools=give_up)
+                    internal, holder, model, session_key, t_start, drop_tools=give_up,
+                    account=account)
             if total_usage:
                 holder["usage"] = total_usage
             failure = holder.get("upstream_failure")
@@ -9134,7 +9206,8 @@ class Handler(BaseHTTPRequestHandler):
                       "web_sources": sources}
             try:
                 upstream, account, _ = follow_up_with_tool_results(
-                    calls, holder, model, session_key, t_start, drop_tools=give_up)
+                    calls, holder, model, session_key, t_start, drop_tools=give_up,
+                    account=account)
             except Exception as exc:
                 record_error(model, 502, "web tool follow-up failed: %s" % exc,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -9253,7 +9326,7 @@ class Handler(BaseHTTPRequestHandler):
         upstream, account, effort = self._open_messages_upstream(chat_req, session_key, model, t_start)
         if upstream is None:
             return None
-        with upstream:
+        with upstream_lease(upstream, account, model):
             if want_stream:
                 return self._messages_stream_from_chat(upstream, model, chat_req, fp,
                                                        account, t_start, effort=effort)
@@ -9282,7 +9355,7 @@ class Handler(BaseHTTPRequestHandler):
         upstream, account, effort = self._open_messages_upstream(chat_req, session_key, model, t_start)
         if upstream is None:
             return None
-        with upstream:
+        with upstream_lease(upstream, account, model):
             if want_stream:
                 return self._messages_stream_from_responses(
                     upstream, model, custom_names, request_meta, chat_req, namespace_map,
@@ -9426,7 +9499,8 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 upstream, account, _ = follow_up_with_tool_results(
-                    internal, holder, model, session_key, t_start, drop_tools=give_up)
+                    internal, holder, model, session_key, t_start, drop_tools=give_up,
+                    account=account)
             if total_usage:
                 writer.usage = total_usage
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -9479,7 +9553,8 @@ class Handler(BaseHTTPRequestHandler):
                       "web_sources": sources}
             try:
                 upstream, account, _ = follow_up_with_tool_results(
-                    calls, holder, model, session_key, t_start, drop_tools=give_up)
+                    calls, holder, model, session_key, t_start, drop_tools=give_up,
+                    account=account)
             except Exception as exc:
                 record_error(model, 502, "web tool follow-up failed: %s" % exc,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -9646,7 +9721,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(503, message +
                                    " - add or enable one at the dashboard (/)")
             return self._error(502, f"upstream unreachable: {exc}")
-        with upstream:
+        with upstream_lease(upstream, account, model):
             if want_stream:
                 return self._chat_stream_response(
                     upstream, model, fp, account, t_start, effort=effort)

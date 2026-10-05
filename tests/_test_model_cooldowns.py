@@ -29,6 +29,27 @@ import wb_proxy as proxy
 import wb_settings as settings
 
 
+def stub_pool(account):
+    """open_upstream 需要的最小账号池替身：一个账号、没有绑定。"""
+    class Pool(object):
+        accounts = [account]
+        smart_routing = False
+        affinity = types.SimpleNamespace(unbind=lambda _key: None)
+
+        def count_ready(self, realm, model=None):
+            return sum(a.ready(model=model) for a in self.accounts)
+
+        def pick_for_session(self, realm, session_key=None, exclude=(), model=None):
+            return next((a for a in self.accounts
+                         if a.uid not in exclude and a.realm == realm
+                         and a.ready(model=model)), None)
+
+        def apply_daily_token_limit(self, value=None, usage=None):
+            return value or 0
+
+    return Pool()
+
+
 class ModelCooldownTests(unittest.TestCase):
     def account(self):
         return accounts.Account({"uid": "synthetic-cn", "realm": "cn", "accessToken": "token"})
@@ -118,29 +139,8 @@ class ModelCooldownTests(unittest.TestCase):
         error = urllib.error.HTTPError("https://upstream.invalid", 429, "rate limit", {},
                                        io.BytesIO(detail.encode("utf-8")))
 
-        class Pool(object):
-            accounts = [account]
-            affinity = types.SimpleNamespace(unbind=lambda _key: None)
-            # 真账号池在 __init__ 里就有这个开关；关着时请求路径不做评分折叠。
-            smart_routing = False
-
-            def count_ready(self, realm, model=None):
-                return sum(a.ready(model=model) for a in self.accounts)
-
-            def pick_for_session(self, realm, session_key=None, exclude=(), model=None):
-                return next((a for a in self.accounts if a.uid not in exclude
-                             and a.realm == realm and a.ready(model=model)), None)
-
-            def list_public(self):
-                return [a.public() for a in self.accounts]
-
-            def apply_daily_token_limit(self, value=None, usage=None):
-                # The production path pushes the daily guard into the pool before
-                # picking; this stub only needs to answer the call.
-                return value or 0
-
         old_pool, old_urlopen = proxy.POOL, accounts.urlopen
-        proxy.POOL = Pool()
+        proxy.POOL = stub_pool(account)
         accounts.urlopen = lambda *args, **kwargs: (_ for _ in ()).throw(error)
         try:
             with self.assertRaises(proxy.RateLimited) as caught:

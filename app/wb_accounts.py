@@ -224,6 +224,9 @@ DEFAULT_ACCOUNT_PRIORITY = 100
 #: Account files are hand-editable, so a priority outside this range is clamped
 #: instead of skewing the selection order.
 MAX_ACCOUNT_PRIORITY = 9999
+#: 单账号单模型的并发上限，0 表示不限。上限按「账号 + 模型」计数：同一个
+#: 账号可以同时服务 N 个 glm-5.3 和另外 N 个 deepseek，两者互不占用名额。
+MAX_ACCOUNT_CONCURRENCY = 1000
 #: 评分分配按最近一小时被选中的次数判断账号忙不忙，由 mark_pick() 记下的
 #: 选中时刻算出来。
 LOAD_WINDOW_SECONDS = 3600
@@ -344,6 +347,8 @@ class Account(object):
         # 面板备注：跟着凭证文件走，重新登录与桌面端导入不会带上它，
         # AccountPool.add() 因此把它列进 KEEP_ON_REPLACE_FIELDS。
         self.note = _stored_note(data.get("note"))
+        # 单账号单模型的并发上限：0 表示不限。计数在内存里，重启即清空。
+        self.concurrency_limit = _stored_concurrency_limit(data.get("concurrencyLimit"))
         self.last_error = str(data.get("lastError") or "")
         self.cooldown_until = float(data.get("cooldownUntil") or 0)
         # Per-model throttling. Upstream rate limits (code 6004 "usage exceeds
@@ -385,6 +390,10 @@ class Account(object):
         # The dashboard snapshots this state while request threads update it.
         # Keep it separate from _refresh_lock, which spans network requests.
         self._throttle_lock = threading.Lock()
+        # 在途请求计数：键是模型名，值是这个账号正在服务的该模型请求数。
+        # 与 _throttle_lock 分开，免得面板轮询去读计数时挡住请求线程。
+        self._concurrency_lock = threading.Lock()
+        self._in_flight = {}
         # 删除标记：面板删掉账号后，请求线程手里的旧引用还会走到 save()，
         # 没有这个标记就会把刚删掉的凭证文件重新写出来。
         self.deleted = False
@@ -408,6 +417,7 @@ class Account(object):
             "enabled": self.enabled,
             "priority": self.priority,
             "note": self.note,
+            "concurrencyLimit": self.concurrency_limit,
             "lastError": self.last_error,
             "cooldownUntil": self.cooldown_until,
             "credits": self.credits,
@@ -514,6 +524,8 @@ class Account(object):
             "issuedAt": self.issued_at,
             "expiresIn": _human_delta(exp - time.time()) if exp else None,
             "hasRefreshToken": bool(self.refresh_token),
+            "concurrencyLimit": int(self.concurrency_limit or 0),
+            "activeRequests": self.active_requests,
             "lastError": last_error,
             "inCooldown": deadline > now,
             "cooldownFor": round(max(0.0, deadline - now)) or None,
@@ -1071,6 +1083,74 @@ class Account(object):
                 self.last_error = ""
                 self.cooldown_until = 0
 
+    # -- 单账号单模型的并发名额 ---------------------------------------------
+
+    def _capacity_key(self, model):
+        return str(model or "")
+
+    def active_for_model(self, model):
+        with self._concurrency_lock:
+            return self._in_flight.get(self._capacity_key(model), 0)
+
+    @property
+    def active_requests(self):
+        with self._concurrency_lock:
+            return sum(self._in_flight.values())
+
+    def has_request_capacity(self, model=None):
+        """这个账号在这个模型上还有空名额吗（上限为 0 时永远有）。"""
+        with self._concurrency_lock:
+            if self.concurrency_limit <= 0:
+                return True
+            return self._in_flight.get(self._capacity_key(model), 0) < self.concurrency_limit
+
+    def acquire_request(self, model=None):
+        """原子地占一个名额；已经满了返回 False。
+
+        判定与自增在同一把锁里，否则并发请求可能同时看到最后一个空位。
+        """
+        key = self._capacity_key(model)
+        with self._concurrency_lock:
+            used = self._in_flight.get(key, 0)
+            if self.concurrency_limit > 0 and used >= self.concurrency_limit:
+                return False
+            self._in_flight[key] = used + 1
+            return True
+
+    def release_request(self, model=None):
+        key = self._capacity_key(model)
+        with self._concurrency_lock:
+            used = self._in_flight.get(key, 0) - 1
+            if used > 0:
+                self._in_flight[key] = used
+            else:
+                self._in_flight.pop(key, None)
+
+def normalise_concurrency_limit(value):
+    """Return (limit, error) for the per-account concurrency cap.
+
+    The cap counts in-flight requests per account *and* model, so 0 means
+    unlimited and a hand-edited file cannot smuggle in a negative or absurd
+    number.
+    """
+    if isinstance(value, bool) or value is None or (
+            isinstance(value, float) and not value.is_integer()):
+        return None, "concurrencyLimit must be a non-negative whole number"
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None, "concurrencyLimit must be a non-negative whole number"
+    if number < 0 or number > MAX_ACCOUNT_CONCURRENCY:
+        return None, ("concurrencyLimit must be between 0 and %d"
+                      % MAX_ACCOUNT_CONCURRENCY)
+    return number, ""
+
+
+def _stored_concurrency_limit(value):
+    limit, problem = normalise_concurrency_limit(value)
+    return 0 if problem else limit
+
+
 def _human_delta(seconds):
     if seconds is None: return None
     if seconds <= 0: return "expired"
@@ -1224,6 +1304,7 @@ KEEP_ON_REPLACE_FIELDS = (
     ("product", "product"),
     ("priority", "priority"),
     ("note", "note"),
+    ("concurrencyLimit", "concurrency_limit"),
     ("proxySlot", "proxy_slot"),
     ("proxy", "proxy_legacy"),
     ("credits", "credits"),
@@ -1511,6 +1592,15 @@ class AccountPool(object):
         account.save(self.dir)
         return account.public()
 
+    def set_concurrency_limit(self, uid, value):
+        """Persist one account's per-model concurrency cap (0 = unlimited)."""
+        account = self.get(uid)
+        if account is None:
+            return None
+        account.concurrency_limit = value
+        account.save(self.dir)
+        return account.public()
+
     def set_all_enabled(self, enabled, realm=None):
         with self._lock:
             for account in self.accounts:
@@ -1585,6 +1675,8 @@ class AccountPool(object):
             return "its balance is below the reserved credits"
         if account.daily_limit_blocked():
             return "it reached today's token limit"
+        if not account.has_request_capacity(model):
+            return "it reached its concurrent request limit for this model"
         if not account.ready(model=model):
             return "its token expired and could not be refreshed"
         return ""
@@ -1595,7 +1687,9 @@ class AccountPool(object):
             bound_uid = self.affinity.get(session_key)
             if bound_uid and bound_uid not in exclude:
                 account = self.get(bound_uid)
-                if account and account.realm == realm and account.ready(model=model):
+                # 名额满了与冷却中同义：这段对话换号，绑定重算。
+                if (account and account.realm == realm and account.ready(model=model)
+                        and account.has_request_capacity(model)):
                     # 绑定命中也算一次接单：评分分配按「最近一小时实际接到的
                     # 份额」判断一个账号忙不忙，漏掉这些请求会把最忙的账号
                     # 看成最闲的。
@@ -1651,7 +1745,7 @@ class AccountPool(object):
         for index in order:
             account = snapshot[index]
             if account.uid in exclude: continue
-            if account.ready(model=model):
+            if account.ready(model=model) and account.has_request_capacity(model):
                 with self._lock: self._cursor = (index + 1) % total
                 self.count_routing("cursor_pick")
                 account.mark_pick()
@@ -1681,7 +1775,8 @@ class AccountPool(object):
         if total == 0: return None
         now = time.time()
         candidates = [index for index, account in enumerate(snapshot)
-                      if account.uid not in exclude and account.servable(model=model)]
+                      if account.uid not in exclude and account.servable(model=model)
+                      and account.has_request_capacity(model)]
         if not candidates: return None
         targets = {index: snapshot[index].credit_target_per_day(now=now) for index in candidates}
         known = sorted(t for t in targets.values() if t is not None)
@@ -1708,7 +1803,7 @@ class AccountPool(object):
         ranked.sort()
         for _score, _share, _hour, _priority, _offset, index in ranked:
             account = snapshot[index]
-            if account.ready(model=model):
+            if account.ready(model=model) and account.has_request_capacity(model):
                 with self._lock: self._cursor = (index + 1) % total
                 self.count_routing("smart_pick")
                 account.mark_pick(now)
@@ -2094,4 +2189,9 @@ def normalise_import_row(row, realm=None):
     note = pick("note")
     if note is not None:
         kwargs["note"] = _stored_note(note)
+    # 并发上限也是面板设置，与优先级、备注同一个口径：导出文档带着它，
+    # 外来行不带时保留已存的值。
+    concurrency = pick("concurrencyLimit")
+    if concurrency is not None:
+        kwargs["concurrencyLimit"] = _stored_concurrency_limit(concurrency)
     return kwargs
