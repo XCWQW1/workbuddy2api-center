@@ -15,7 +15,6 @@ start-wb-proxy.command (or ./start-wb-proxy.sh) on macOS/Linux.
 """
 import argparse
 import calendar
-import contextlib
 import copy
 import email.utils
 import hashlib
@@ -4556,25 +4555,51 @@ def _retry_same_account(account, counters):
     return True
 
 
-@contextlib.contextmanager
-def upstream_lease(upstream, account, model):
-    """Hold one "account + model" in-flight slot until the body is finished.
+class SlotLease(object):
+    """一个请求占着的「账号 + 模型」并发名额，响应体读完才归还。
 
-    The slot is taken in open_upstream() and has to survive past the return:
-    a streaming body is still being read by the caller long after the response
-    object was handed back. Releasing it on close therefore belongs here, not
-    inside open_upstream(), and this wrapper is what the callers already drive
-    with `with upstream:`.
+    open_upstream() 选号时占下、成功后交给它保管；续写轮传入同一个对象，
+    选回原账号就沿用，换号就先占新名额再归还旧的。
     """
-    try:
-        with upstream:
-            yield upstream
-    finally:
-        account.release_request(model)
+
+    def __init__(self):
+        self.account = None
+        self.model = None
+
+    def _holds(self, account, model):
+        return account is self.account and model == self.model
+
+    def claim(self, account, model):
+        """为这一次尝试占名额；已经持有同一个名额时直接沿用。"""
+        if self._holds(account, model):
+            return True
+        return account.acquire_request(model)
+
+    def drop(self, account, model):
+        """这一次尝试没有用上：退掉刚占的名额，已经持有的那个不动。"""
+        if not self._holds(account, model):
+            account.release_request(model)
+
+    def keep(self, account, model):
+        """这一次尝试成功：持有它的名额，换号时归还旧的那个。"""
+        if self._holds(account, model):
+            return
+        self.release()
+        self.account, self.model = account, model
+
+    def release(self):
+        if self.account is not None:
+            self.account.release_request(self.model)
+            self.account = self.model = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.release()
 
 
-def open_upstream(payload, session_key=None, target_realm=None, only_uid=None,
-                  without_slot=False, pin=None):
+def open_upstream(payload, session_key=None, target_realm=None, only_uid=None, *, lease):
     # Refresh the daily token guard before picking. The scan underneath is
     # incremental and TTL-cached, so this is a stat() plus a cached dict on
     # the hot path, and an account parked by the guard is skipped like any
@@ -4595,10 +4620,6 @@ def open_upstream(payload, session_key=None, target_realm=None, only_uid=None,
         # （该函数可能在最前面插入 SYSTEM_PROMPT）。
         session_key = derive_affinity_key(upstream_body.get("messages"))
     total = max(1, POOL.count_ready(realm, model=model)) if POOL else 1
-    # 续写轮：必须回到一直以来服务这段对话的那个账号（前缀缓存就在那里），
-    # 而不是重新选号——重选会让同一段对话换号、缓存重建，还会因为名额被
-    # 自己占着而选不到人。调用方把账号传进来固定住。
-    pinned = without_slot and pin is not None
     tried = set()
     # 换号时不主动解绑：绑定留在原账号上，下一轮取号把这个账号排除在外，
     # 账号池自己按「换号」记账并重新绑定。原地重试（同账号换身份、5xx 重试、
@@ -4619,19 +4640,17 @@ def open_upstream(payload, session_key=None, target_realm=None, only_uid=None,
     # 才不会在轮到下一个账号之前就把循环用完。
     max_attempts += MAX_TRANSIENT_SAME_ACCOUNT_RETRIES
     for _attempt in range(max_attempts):
-        if pinned:
-            # 续写轮：只用一直服务这段对话的那个账号。
-            account = pin
-            if account.uid in tried or account.realm != realm:
-                account = None
-        elif only_uid:
+        # 名额满的账号与冷却一样被跳过，换下一个账号。
+        if only_uid:
             account = POOL.get(only_uid) if POOL else None
             if account is not None and (account.uid in tried or account.realm != realm
-                                        or not account.ready(model=model)):
+                                        or not account.ready(model=model)
+                                        or not lease.claim(account, model)):
                 account = None
         else:
-            account = POOL.pick_for_session(realm=realm, session_key=session_key,
-                                            exclude=tried, model=model) if POOL else None
+            account = POOL.pick_for_session(
+                realm=realm, session_key=session_key, exclude=tried, model=model,
+                claim=lambda candidate: lease.claim(candidate, model)) if POOL else None
         if account is None:
             if transient_hits and _attempt < max_attempts - 1:
                 tried.clear()
@@ -4639,42 +4658,36 @@ def open_upstream(payload, session_key=None, target_realm=None, only_uid=None,
                 continue
             break
         if account.realm != realm:
+            lease.drop(account, model)
             if session_key and POOL: POOL.affinity.unbind(session_key)
             continue
         tried.add(account.uid)
         last_uid = account.uid
-        # 单账号单模型的名额：按「账号 + 模型」计数，满了就换下一个账号，
-        # 与这个模型在该账号上冷却时的处理一致。上限为 0 时永远拿得到。
-        if without_slot:
-            # 续写轮：名额已经由调用方那层持有，不再占第二个。
-            pass
-        elif not account.acquire_request(model):
-            log("account %s at its '%s' concurrency limit, rotating"
-                % (account.uid[:8], model))
-            continue
-        chat_url = account.chat_base_url() + CHAT_PATH
-        # The cache key is account scoped, so it is rebuilt per candidate rather
-        # than once up front. Opt-in only: measurement showed the upstream
-        # caches prefixes without it (see prompt_cache_key_enabled).
-        if prompt_cache_key_enabled():
-            attempt_body = inject_prompt_cache_key(upstream_body, account.uid, session_key)
-        else:
-            attempt_body = upstream_body
-        attempt_data = json.dumps(attempt_body, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(chat_url, data=attempt_data, method="POST",
-                                     headers=account.headers(purpose="chat"))
+        try:
+            chat_url = account.chat_base_url() + CHAT_PATH
+            # The cache key is account scoped, so it is rebuilt per candidate rather
+            # than once up front. Opt-in only: measurement showed the upstream
+            # caches prefixes without it (see prompt_cache_key_enabled).
+            if prompt_cache_key_enabled():
+                attempt_body = inject_prompt_cache_key(upstream_body, account.uid, session_key)
+            else:
+                attempt_body = upstream_body
+            attempt_data = json.dumps(attempt_body, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(chat_url, data=attempt_data, method="POST",
+                                         headers=account.headers(purpose="chat"))
+        except BaseException:
+            lease.drop(account, model)
+            raise
         try:
             resp = wb_accounts.urlopen(req, timeout=600, proxy=account.proxy)
             account.clear_error(model=model)
             reset_switch_counter(account, model)
+            lease.keep(account, model)
             # 第三个元素是这次请求实际使用的推理档位：请求体在每次尝试里都会
             # 重新组装，档位却只由模型与请求本身决定，调用方把它写进用量流水。
             return resp, account, upstream_effort_of(upstream_body, model)
         except urllib.error.HTTPError as exc:
-            # 这一轮上游调用结束了；名额归还得等响应体读完，所以这里先退。
-            # 续写轮没占名额，不能退别人的。
-            if not without_slot:
-                account.release_request(model)
+            lease.drop(account, model)
             if exc.code == 429:
                 try:
                     detail = exc.read(600).decode("utf-8", "replace")
@@ -4729,8 +4742,7 @@ def open_upstream(payload, session_key=None, target_realm=None, only_uid=None,
                 continue
             raise
         except Exception as exc:
-            if not without_slot:
-                account.release_request(model)
+            lease.drop(account, model)
             if is_transient(exc):
                 transient_hits += 1
                 last_error = exc
@@ -4781,8 +4793,7 @@ def open_upstream(payload, session_key=None, target_realm=None, only_uid=None,
         raise RateLimited(None, "usage exceeds frequency limit", wait=wait)
     enabled = [a for a in POOL.accounts
                if a.realm == realm and a.enabled and a.access_token] if POOL else []
-    # 名额用满是「暂不接单」，与冷却、限额同类：要给出 429，而不是让人
-    # 以为账号池不可用（503）。
+    # 名额用满是「暂不接单」：报 429，不报账号池不可用（503）。
     ready = [a for a in enabled if a.ready(model=model)]
     if ready and all(not a.has_request_capacity(model) for a in ready):
         reason = ("every usable account reached its concurrent request limit "
@@ -5376,7 +5387,7 @@ def build_citations(text, sources):
 
 
 def follow_up_with_tool_results(internal_calls, holder, model, session_key, t_start,
-                                drop_tools=False, account=None):
+                                lease, drop_tools=False):
     """执行反代自己代跑的网络工具，把结果喂回模型，返回新的上游连线。
 
     返回的三元组与 open_upstream() 一致：上游响应、账号、本次请求实际使用的
@@ -5428,11 +5439,9 @@ def follow_up_with_tool_results(internal_calls, holder, model, session_key, t_st
         })
     body["messages"] = convo
     body["stream"] = True
-    # 续写轮：名额仍然由调用方那层持有，这里不再占第二个（否则上限为 1
-    # 的账号会被自己的续写卡死），账号也固定用正在服务这条对话的那一个。
+    # 同一个 lease：选回原账号沿用名额，换号则名额转移。
     return open_upstream(body, session_key=session_key,
-                         target_realm=holder.get("realm"),
-                         without_slot=True, pin=account)
+                         target_realm=holder.get("realm"), lease=lease)
 
 
 def internal_calls_from_chat(chat_obj, web_tools=False):
@@ -9022,6 +9031,7 @@ class Handler(BaseHTTPRequestHandler):
                chat_req.get("reasoning_effort"),
                sorted(custom_names) or "-")
         )
+        lease = SlotLease()
         try:
             req_realm = self._request_realm() or CURRENT_REALM
             blocked = self._cross_realm_error(chat_req.get("model"), req_realm)
@@ -9034,7 +9044,7 @@ class Handler(BaseHTTPRequestHandler):
             if key_blocked:
                 return self._error(400, key_blocked, "invalid_request_error")
             upstream, account, effort = open_upstream(
-                chat_req, session_key=session_key, target_realm=req_realm)
+                chat_req, session_key=session_key, target_realm=req_realm, lease=lease)
         except ContentRejected as exc:
             record_error(model, 403, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
@@ -9062,18 +9072,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(503, message +
                                    " - add or enable one at the dashboard (/)")
             return self._error(502, f"upstream unreachable: {exc}")
-        with upstream_lease(upstream, account, model):
+        with upstream, lease:
             if want_stream:
                 return self._responses_stream_response(
                     upstream, model, custom_names, request_meta, fp, account, t_start, ns_map,
                     base_body=chat_req, session_key=session_key, realm=req_realm,
-                    effort=effort)
+                    effort=effort, lease=lease)
             return self._responses_nonstream_response(
                 upstream, model, custom_names, request_meta, fp, account, t_start, ns_map,
                 base_body=chat_req, session_key=session_key, realm=req_realm,
-                effort=effort)
+                effort=effort, lease=lease)
 
-    def _responses_stream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, effort=None):
+    def _responses_stream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, effort=None, *, lease):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -9121,8 +9131,8 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 upstream, account, _ = follow_up_with_tool_results(
-                    internal, holder, model, session_key, t_start, drop_tools=give_up,
-                    account=account)
+                    internal, holder, model, session_key, t_start, lease,
+                    drop_tools=give_up)
             if total_usage:
                 holder["usage"] = total_usage
             failure = holder.get("upstream_failure")
@@ -9175,7 +9185,7 @@ class Handler(BaseHTTPRequestHandler):
                      fp=fp, account=account.uid, effort=effort)
         return
 
-    def _responses_nonstream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, effort=None):
+    def _responses_nonstream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, effort=None, *, lease):
         # 跟串流那条一样：客户端宣告 web_search / web_fetch 时由反代代跑。
         # 中间那几轮对客户端不可见，最后才组成一个 Responses 对象返回；不这样
         # 做的话 web_search 的 function_call 会直接漏给客户端，客户端只会回
@@ -9206,8 +9216,8 @@ class Handler(BaseHTTPRequestHandler):
                       "web_sources": sources}
             try:
                 upstream, account, _ = follow_up_with_tool_results(
-                    calls, holder, model, session_key, t_start, drop_tools=give_up,
-                    account=account)
+                    calls, holder, model, session_key, t_start, lease,
+                    drop_tools=give_up)
             except Exception as exc:
                 record_error(model, 502, "web tool follow-up failed: %s" % exc,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -9259,7 +9269,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_messages_via_responses(payload)
         return self._handle_messages_via_chat(payload)
 
-    def _open_messages_upstream(self, chat_req, session_key, model, t_start):
+    def _open_messages_upstream(self, chat_req, session_key, model, t_start, lease):
         """Open the upstream for a translated Messages request.
 
         On failure the Anthropic-shaped reply has already been written and
@@ -9274,7 +9284,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._anthropic_error(400, guard, "invalid_request_error")
                     return None, None, None
             upstream, account, effort = open_upstream(chat_req, session_key=session_key,
-                                                      target_realm=req_realm)
+                                                      target_realm=req_realm, lease=lease)
             return upstream, account, effort
         except ContentRejected as exc:
             record_error(model, 403, exc.detail[:200],
@@ -9323,10 +9333,12 @@ class Handler(BaseHTTPRequestHandler):
         log("messages: mode=openai-completions model=%s stream=%s msgs=%d tools=%d"
             % (model, want_stream, len(chat_req.get("messages") or []),
                len(chat_req.get("tools") or [])))
-        upstream, account, effort = self._open_messages_upstream(chat_req, session_key, model, t_start)
+        lease = SlotLease()
+        upstream, account, effort = self._open_messages_upstream(chat_req, session_key, model,
+                                                                 t_start, lease)
         if upstream is None:
             return None
-        with upstream_lease(upstream, account, model):
+        with upstream, lease:
             if want_stream:
                 return self._messages_stream_from_chat(upstream, model, chat_req, fp,
                                                        account, t_start, effort=effort)
@@ -9352,17 +9364,19 @@ class Handler(BaseHTTPRequestHandler):
         log("messages: mode=openai-responses model=%s stream=%s msgs=%d tools=%d"
             % (model, want_stream, len(chat_req.get("messages") or []),
                len(chat_req.get("tools") or [])))
-        upstream, account, effort = self._open_messages_upstream(chat_req, session_key, model, t_start)
+        lease = SlotLease()
+        upstream, account, effort = self._open_messages_upstream(chat_req, session_key, model,
+                                                                 t_start, lease)
         if upstream is None:
             return None
-        with upstream_lease(upstream, account, model):
+        with upstream, lease:
             if want_stream:
                 return self._messages_stream_from_responses(
                     upstream, model, custom_names, request_meta, chat_req, namespace_map,
-                    fp, account, t_start, session_key, effort=effort)
+                    fp, account, t_start, session_key, effort=effort, lease=lease)
             return self._messages_nonstream_from_responses(
                 upstream, model, custom_names, request_meta, chat_req, namespace_map,
-                fp, account, t_start, session_key, effort=effort)
+                fp, account, t_start, session_key, effort=effort, lease=lease)
 
     def _messages_stream_headers(self):
         self.send_response(200)
@@ -9462,7 +9476,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _messages_stream_from_responses(self, upstream, model, custom_names, request_meta,
                                         chat_req, namespace_map, fp, account, t_start,
-                                        session_key, effort=None):
+                                        session_key, effort=None, *, lease):
         self._messages_stream_headers()
         writer = MessageStreamWriter(model, input_tokens=_messages_input_estimate(chat_req))
         holder = {"usage": None, "custom_names": custom_names,
@@ -9499,8 +9513,8 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 upstream, account, _ = follow_up_with_tool_results(
-                    internal, holder, model, session_key, t_start, drop_tools=give_up,
-                    account=account)
+                    internal, holder, model, session_key, t_start, lease,
+                    drop_tools=give_up)
             if total_usage:
                 writer.usage = total_usage
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -9527,7 +9541,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _messages_nonstream_from_responses(self, upstream, model, custom_names, request_meta,
                                            chat_req, namespace_map, fp, account, t_start,
-                                           session_key, effort=None):
+                                           session_key, effort=None, *, lease):
         sources = []
         rounds = 0
         web_tools = web_tools_active(chat_req)
@@ -9553,8 +9567,8 @@ class Handler(BaseHTTPRequestHandler):
                       "web_sources": sources}
             try:
                 upstream, account, _ = follow_up_with_tool_results(
-                    calls, holder, model, session_key, t_start, drop_tools=give_up,
-                    account=account)
+                    calls, holder, model, session_key, t_start, lease,
+                    drop_tools=give_up)
             except Exception as exc:
                 record_error(model, 502, "web tool follow-up failed: %s" % exc,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -9667,6 +9681,7 @@ class Handler(BaseHTTPRequestHandler):
         want_stream = bool(payload.get("stream"))
         model = payload.get("model") or "hy4-preview"
         t_start = time.time()
+        lease = SlotLease()
         try:
             req_realm = self._request_realm() or CURRENT_REALM
             blocked = self._cross_realm_error(payload.get("model"), req_realm)
@@ -9690,7 +9705,8 @@ class Handler(BaseHTTPRequestHandler):
                                        "invalid_request_error")
             upstream, account, effort = open_upstream(payload, session_key=session_key,
                                                       target_realm=req_realm,
-                                                      only_uid=pinned or None)
+                                                      only_uid=pinned or None,
+                                                      lease=lease)
         except ContentRejected as exc:
             record_error(model, 403, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
@@ -9721,7 +9737,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(503, message +
                                    " - add or enable one at the dashboard (/)")
             return self._error(502, f"upstream unreachable: {exc}")
-        with upstream_lease(upstream, account, model):
+        with upstream, lease:
             if want_stream:
                 return self._chat_stream_response(
                     upstream, model, fp, account, t_start, effort=effort)

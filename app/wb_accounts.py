@@ -224,8 +224,7 @@ DEFAULT_ACCOUNT_PRIORITY = 100
 #: Account files are hand-editable, so a priority outside this range is clamped
 #: instead of skewing the selection order.
 MAX_ACCOUNT_PRIORITY = 9999
-#: 单账号单模型的并发上限，0 表示不限。上限按「账号 + 模型」计数：同一个
-#: 账号可以同时服务 N 个 glm-5.3 和另外 N 个 deepseek，两者互不占用名额。
+#: 单账号单模型的并发上限：同一账号的每个模型各自计数，0 表示不限。
 MAX_ACCOUNT_CONCURRENCY = 1000
 #: 评分分配按最近一小时被选中的次数判断账号忙不忙，由 mark_pick() 记下的
 #: 选中时刻算出来。
@@ -390,8 +389,7 @@ class Account(object):
         # The dashboard snapshots this state while request threads update it.
         # Keep it separate from _refresh_lock, which spans network requests.
         self._throttle_lock = threading.Lock()
-        # 在途请求计数：键是模型名，值是这个账号正在服务的该模型请求数。
-        # 与 _throttle_lock 分开，免得面板轮询去读计数时挡住请求线程。
+        # 在途请求计数：键是模型名；独立锁，面板读计数时不挡请求线程。
         self._concurrency_lock = threading.Lock()
         self._in_flight = {}
         # 删除标记：面板删掉账号后，请求线程手里的旧引用还会走到 save()，
@@ -1105,10 +1103,7 @@ class Account(object):
             return self._in_flight.get(self._capacity_key(model), 0) < self.concurrency_limit
 
     def acquire_request(self, model=None):
-        """原子地占一个名额；已经满了返回 False。
-
-        判定与自增在同一把锁里，否则并发请求可能同时看到最后一个空位。
-        """
+        """原子地占一个名额；已经满了返回 False。"""
         key = self._capacity_key(model)
         with self._concurrency_lock:
             used = self._in_flight.get(key, 0)
@@ -1125,6 +1120,14 @@ class Account(object):
                 self._in_flight[key] = used
             else:
                 self._in_flight.pop(key, None)
+
+
+def _claim(account, model, claim):
+    """选号时的名额判定：有 claim 就原子地占名额，没有就只检查。"""
+    if claim is not None:
+        return claim(account)
+    return account.has_request_capacity(model)
+
 
 def normalise_concurrency_limit(value):
     """Return (limit, error) for the per-account concurrency cap.
@@ -1675,43 +1678,45 @@ class AccountPool(object):
             return "its balance is below the reserved credits"
         if account.daily_limit_blocked():
             return "it reached today's token limit"
-        if not account.has_request_capacity(model):
-            return "it reached its concurrent request limit for this model"
         if not account.ready(model=model):
             return "its token expired and could not be refreshed"
         return ""
 
-    def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None):
+    def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None,
+                         claim=None):
+        """选一个账号接这次请求。
+
+        claim(account) 选中前原子地占名额，占不到就跳过；不传时只检查。
+        """
         exclude = exclude or set()
         if session_key:
             bound_uid = self.affinity.get(session_key)
             if bound_uid and bound_uid not in exclude:
                 account = self.get(bound_uid)
-                # 名额满了与冷却中同义：这段对话换号，绑定重算。
                 if (account and account.realm == realm and account.ready(model=model)
-                        and account.has_request_capacity(model)):
+                        and _claim(account, model, claim)):
                     # 绑定命中也算一次接单：评分分配按「最近一小时实际接到的
                     # 份额」判断一个账号忙不忙，漏掉这些请求会把最忙的账号
                     # 看成最闲的。
                     account.mark_pick()
                     self.count_routing("bound_hit")
                     return account
-                # 绑定指向的账号此刻不能接单（冷却、限额、令牌失效）：这段
-                # 对话只能换号，前端缓存要在新账号上重建一次。
-                return self._rebind(realm, session_key, exclude, model)
+                # 绑定的账号此刻不能接单（冷却、限额、令牌失效、名额满）：换号
+                # 并重新绑定，接手账号重算完整前缀后，缓存就跟着它。
+                return self._rebind(realm, session_key, exclude, model, claim)
             if bound_uid:
                 # 调用方把这个账号排除在外（原地重试用完、正在换号）：这段
                 # 对话同样要落到别的账号上，计数与绑定失效走同一条路。
-                return self._rebind(realm, session_key, exclude, model)
-            account = self.pick(realm=realm, exclude=exclude, model=model)
+                return self._rebind(realm, session_key, exclude, model, claim)
+            account = self.pick(realm=realm, exclude=exclude, model=model, claim=claim)
             if account:
                 self.affinity.bind(session_key, account.uid)
                 self.count_routing("fresh_binding")
             return account
         self.count_routing("no_key")
-        return self.pick(realm=realm, exclude=exclude, model=model)
+        return self.pick(realm=realm, exclude=exclude, model=model, claim=claim)
 
-    def _rebind(self, realm, session_key, exclude, model):
+    def _rebind(self, realm, session_key, exclude, model, claim=None):
         """换一个账号接手这段对话，并把这次换号记进打点。
 
         调用方把一个账号排除在外与绑定失效的后果相同：这段对话要落到别的
@@ -1719,18 +1724,18 @@ class AccountPool(object):
         """
         self.affinity.unbind(session_key)
         self.count_routing("bound_lost")
-        account = self.pick(realm=realm, exclude=exclude, model=model)
+        account = self.pick(realm=realm, exclude=exclude, model=model, claim=claim)
         if account:
             self.affinity.bind(session_key, account.uid)
         return account
 
-    def pick(self, realm=None, exclude=None, model=None):
+    def pick(self, realm=None, exclude=None, model=None, claim=None):
         """选一个能接单的账号：评分分配或者原来的轮询顺序。"""
         if self.smart_routing:
-            return self._pick_scored(realm=realm, exclude=exclude, model=model)
-        return self._pick_cursor(realm=realm, exclude=exclude, model=model)
+            return self._pick_scored(realm=realm, exclude=exclude, model=model, claim=claim)
+        return self._pick_cursor(realm=realm, exclude=exclude, model=model, claim=claim)
 
-    def _pick_cursor(self, realm=None, exclude=None, model=None):
+    def _pick_cursor(self, realm=None, exclude=None, model=None, claim=None):
         exclude = exclude or set()
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
@@ -1745,14 +1750,14 @@ class AccountPool(object):
         for index in order:
             account = snapshot[index]
             if account.uid in exclude: continue
-            if account.ready(model=model) and account.has_request_capacity(model):
+            if account.ready(model=model) and _claim(account, model, claim):
                 with self._lock: self._cursor = (index + 1) % total
                 self.count_routing("cursor_pick")
                 account.mark_pick()
                 return account
         return None
 
-    def _pick_scored(self, realm=None, exclude=None, model=None):
+    def _pick_scored(self, realm=None, exclude=None, model=None, claim=None):
         """按积分到期节奏与最近一小时的忙闲给新对话选号。
 
         每个账号到期前每天至少要消耗掉的积分是它的义务，义务减去今天的消耗
@@ -1803,7 +1808,7 @@ class AccountPool(object):
         ranked.sort()
         for _score, _share, _hour, _priority, _offset, index in ranked:
             account = snapshot[index]
-            if account.ready(model=model) and account.has_request_capacity(model):
+            if account.ready(model=model) and _claim(account, model, claim):
                 with self._lock: self._cursor = (index + 1) % total
                 self.count_routing("smart_pick")
                 account.mark_pick(now)

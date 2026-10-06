@@ -40,12 +40,13 @@ def stub_pool(account, pick=None):
         def get(self, uid):
             return account if uid == account.uid else None
 
-        def pick_for_session(self, realm, session_key=None, exclude=(), model=None):
+        def pick_for_session(self, realm, session_key=None, exclude=(), model=None,
+                             claim=None):
             if pick is not None:
                 return pick(account, exclude, model)
             return next((a for a in self.accounts
                          if a.uid not in exclude and a.realm == realm
-                         and a.ready(model=model)), None)
+                         and a.ready(model=model) and (claim is None or claim(a))), None)
 
         def apply_daily_token_limit(self, value=None, usage=None):
             return value or 0
@@ -58,12 +59,13 @@ class ConcurrencyLimitTests(unittest.TestCase):
         return accounts.Account({"uid": "synthetic-cn", "realm": "cn",
                                  "accessToken": "token"})
 
-    def call(self, account, payload, pool=None, **kwargs):
+    def call(self, account, payload, pool=None, lease=None, **kwargs):
         """Drive one open_upstream() against a stubbed upstream."""
         old_pool = proxy.POOL
         proxy.POOL = pool or stub_pool(account)
         try:
-            return proxy.open_upstream(payload, target_realm="cn", **kwargs)
+            return proxy.open_upstream(payload, target_realm="cn",
+                                       lease=lease or proxy.SlotLease(), **kwargs)
         finally:
             proxy.POOL = old_pool
 
@@ -155,7 +157,8 @@ class ConcurrencyLimitTests(unittest.TestCase):
         try:
             with self.assertRaises(proxy.RateLimited) as caught:
                 proxy.open_upstream({"model": "glm-5.3", "messages": [
-                    {"role": "user", "content": "hello"}]}, target_realm="cn")
+                    {"role": "user", "content": "hello"}]}, target_realm="cn",
+                    lease=proxy.SlotLease())
         finally:
             proxy.POOL = old_pool
         self.assertIn("concurrent request limit", caught.exception.message)
@@ -164,51 +167,152 @@ class ConcurrencyLimitTests(unittest.TestCase):
         self.assertEqual(caught.exception.wait, 1)
 
     def test_a_web_tool_continuation_reuses_its_own_slot(self):
-        """续写轮不能再占一个名额，否则上限为 1 的账号会被自己卡死。
-
-        网络工具的后续回合会再进一次 open_upstream；它必须复用调用方那层
-        已持有的名额，并用同一个账号（前缀缓存就在那里）。
-        """
+        """续写轮选回原账号时沿用调用方的名额，上限为 1 的账号不会被自己卡死。"""
         account = self.account()
         account.concurrency_limit = 1
-        self.assertTrue(account.acquire_request("glm-5.3"))
         response = object()
+        lease = proxy.SlotLease()
 
         old_pool, old_urlopen = proxy.POOL, accounts.urlopen
         proxy.POOL = stub_pool(account)
         accounts.urlopen = lambda *a, **k: response
         try:
+            proxy.open_upstream({"model": "glm-5.3", "messages": [
+                {"role": "user", "content": "hi"}]}, target_realm="cn", lease=lease)
             got, picked, _effort = proxy.follow_up_with_tool_results(
-                [], {"base_messages": [], "convo_messages": [], "realm": "cn"},
-                "glm-5.3", "sess-1", 0.0, account=account)
+                [], {"base_body": {"model": "glm-5.3"}, "base_messages": [],
+                     "convo_messages": [], "realm": "cn"},
+                "glm-5.3", "sess-1", 0.0, lease)
         finally:
             proxy.POOL, accounts.urlopen = old_pool, old_urlopen
         self.assertIs(got, response, "续写轮要拿到新的上游连线")
-        self.assertIs(picked, account, "续写轮要回到同一个账号")
+        self.assertIs(picked, account)
         self.assertEqual(account.active_for_model("glm-5.3"), 1,
-                         "续写轮不能额外占一个名额（仍只是调用方那一个）")
+                         "续写轮不能额外占一个名额")
+        lease.release()
+        self.assertEqual(account.active_for_model("glm-5.3"), 0)
 
-    def test_a_web_tool_continuation_does_not_hand_back_the_outer_slot(self):
+    def test_a_failed_continuation_keeps_the_outer_slot(self):
         """续写轮失败时不能把调用方还没用完的名额退掉。"""
         account = self.account()
         account.concurrency_limit = 1
-        self.assertTrue(account.acquire_request("glm-5.3"))
+        lease = proxy.SlotLease()
+        old_pool, old_urlopen = proxy.POOL, accounts.urlopen
+        proxy.POOL = stub_pool(account)
+        accounts.urlopen = lambda *a, **k: object()
+        try:
+            proxy.open_upstream({"model": "glm-5.3", "messages": [
+                {"role": "user", "content": "hi"}]}, target_realm="cn", lease=lease)
+        finally:
+            proxy.POOL, accounts.urlopen = old_pool, old_urlopen
 
         error = urllib.error.HTTPError("https://upstream.invalid", 500, "boom", {},
                                        io.BytesIO(b""))
-        old_pool, old_urlopen = proxy.POOL, accounts.urlopen
         proxy.POOL = stub_pool(account)
         accounts.urlopen = lambda *a, **k: (_ for _ in ()).throw(error)
         try:
             with self.assertRaises(Exception):
                 proxy.follow_up_with_tool_results(
-                    [], {"base_messages": [], "convo_messages": [], "realm": "cn"},
-                    "glm-5.3", "sess-1", 0.0, account=account)
+                    [], {"base_body": {"model": "glm-5.3"}, "base_messages": [],
+                         "convo_messages": [], "realm": "cn"},
+                    "glm-5.3", "sess-1", 0.0, lease)
         finally:
             proxy.POOL, accounts.urlopen = old_pool, old_urlopen
             error.close()
         self.assertEqual(account.active_for_model("glm-5.3"), 1,
                          "外层请求还拿着名额，不能被续写轮退掉")
+        lease.release()
+        self.assertEqual(account.active_for_model("glm-5.3"), 0)
+
+    def test_a_throttled_continuation_moves_to_another_account(self):
+        """续写轮遇到原账号 429 时换号，名额随请求转到新账号。"""
+        first = accounts.Account({"uid": "uid-a", "realm": "cn", "accessToken": "a"})
+        second = accounts.Account({"uid": "uid-b", "realm": "cn", "accessToken": "b"})
+        pool = accounts.AccountPool(tempfile.mkdtemp(prefix="cap-follow-"))
+        pool.accounts = [first, second]
+        lease = proxy.SlotLease()
+        replies = ["from-b",
+                   urllib.error.HTTPError("https://upstream.invalid", 429, "busy", {},
+                                          io.BytesIO(b"{}")),
+                   "from-a"]
+
+        def fake_urlopen(req, timeout=None, proxy=None):
+            reply = replies.pop()
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        old_pool, old_urlopen = proxy.POOL, accounts.urlopen
+        old_switch = proxy.auto_switch_product_enabled
+        proxy.POOL = pool
+        accounts.urlopen = fake_urlopen
+        proxy.auto_switch_product_enabled = lambda: False
+        try:
+            _resp, picked, _ = proxy.open_upstream(
+                {"model": "glm-5.3", "messages": [{"role": "user", "content": "hi"}]},
+                session_key="sess-follow", target_realm="cn", lease=lease)
+            self.assertIs(picked, first)
+            got, moved, _ = proxy.follow_up_with_tool_results(
+                [], {"base_body": {"model": "glm-5.3"}, "base_messages": [],
+                     "convo_messages": [], "realm": "cn"},
+                "glm-5.3", "sess-follow", 0.0, lease)
+        finally:
+            proxy.POOL, accounts.urlopen = old_pool, old_urlopen
+            proxy.auto_switch_product_enabled = old_switch
+        self.assertEqual(got, "from-b")
+        self.assertIs(moved, second)
+        self.assertEqual(first.active_requests, 0, "换号后旧账号的名额要归还")
+        self.assertEqual(second.active_for_model("glm-5.3"), 1)
+        lease.release()
+        self.assertEqual(second.active_requests, 0)
+
+    def test_a_request_without_model_hands_its_slot_back(self):
+        """不带 model 的请求，占名额与归还名额必须用同一个键。"""
+        account = self.account()
+        account.concurrency_limit = 1
+        lease = proxy.SlotLease()
+        old_urlopen = accounts.urlopen
+        accounts.urlopen = lambda *a, **k: object()
+        try:
+            self.call(account, {"messages": [{"role": "user", "content": "hi"}]},
+                      lease=lease)
+        finally:
+            accounts.urlopen = old_urlopen
+        self.assertEqual(account.active_requests, 1)
+        lease.release()
+        self.assertEqual(account.active_requests, 0)
+
+    def test_a_busy_bound_account_hands_the_conversation_over(self):
+        """绑定账号名额满时换号接手，绑定跟着接手账号走。"""
+        first = accounts.Account({"uid": "uid-a", "realm": "cn", "accessToken": "a"})
+        second = accounts.Account({"uid": "uid-b", "realm": "cn", "accessToken": "b"})
+        first.concurrency_limit = 1
+        pool = accounts.AccountPool(tempfile.mkdtemp(prefix="cap-bound-"))
+        pool.accounts = [first, second]
+        pool.affinity.bind("sess", first.uid)
+        self.assertTrue(first.acquire_request("glm-5.3"))
+        self.assertIs(pool.pick_for_session(realm="cn", session_key="sess",
+                                            model="glm-5.3"), second)
+        self.assertEqual(pool.affinity.get("sess"), second.uid,
+                         "接手账号重算了完整前缀，绑定要跟着它走")
+        first.release_request("glm-5.3")
+        self.assertIs(pool.pick_for_session(realm="cn", session_key="sess",
+                                            model="glm-5.3"), second,
+                      "原账号空出来也不回去，缓存已经不在它那里")
+
+    def test_a_busy_debug_account_answers_429(self):
+        """测试台固定的账号名额满时报 429，不能被当成请求本身有误。"""
+        account = self.account()
+        account.concurrency_limit = 1
+        self.assertTrue(account.acquire_request("glm-5.3"))
+        pool = accounts.AccountPool(tempfile.mkdtemp(prefix="cap-debug-"))
+        pool.accounts = [account]
+        self.assertEqual(pool.unavailable_reason(account.uid, realm="cn",
+                                                 model="glm-5.3"), "")
+        with self.assertRaises(proxy.RateLimited) as caught:
+            self.call(account, {"model": "glm-5.3", "messages": [
+                {"role": "user", "content": "hi"}]}, pool=pool, only_uid=account.uid)
+        self.assertIn("concurrent request limit", caught.exception.message)
 
     def test_a_failed_attempt_hands_its_slot_back(self):
         """上游报错时名额要立刻归还，否则一次失败就会永久占住一个名额。"""
@@ -223,7 +327,8 @@ class ConcurrencyLimitTests(unittest.TestCase):
         try:
             with self.assertRaises(Exception):
                 proxy.open_upstream({"model": "glm-5.3", "messages": [
-                    {"role": "user", "content": "hi"}]}, target_realm="cn")
+                    {"role": "user", "content": "hi"}]}, target_realm="cn",
+                    lease=proxy.SlotLease())
         finally:
             proxy.POOL, accounts.urlopen = old_pool, old_urlopen
             error.close()

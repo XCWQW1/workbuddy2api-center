@@ -39,10 +39,11 @@ def stub_pool(account):
         def count_ready(self, realm, model=None):
             return sum(a.ready(model=model) for a in self.accounts)
 
-        def pick_for_session(self, realm, session_key=None, exclude=(), model=None):
+        def pick_for_session(self, realm, session_key=None, exclude=(), model=None,
+                             claim=None):
             return next((a for a in self.accounts
                          if a.uid not in exclude and a.realm == realm
-                         and a.ready(model=model)), None)
+                         and a.ready(model=model) and claim(a)), None)
 
         def apply_daily_token_limit(self, value=None, usage=None):
             return value or 0
@@ -145,7 +146,8 @@ class ModelCooldownTests(unittest.TestCase):
         try:
             with self.assertRaises(proxy.RateLimited) as caught:
                 proxy.open_upstream({"model": "glm-5.3", "messages": [
-                    {"role": "user", "content": "hello"}]}, target_realm="cn")
+                    {"role": "user", "content": "hello"}]}, target_realm="cn",
+                    lease=proxy.SlotLease())
         finally:
             proxy.POOL, accounts.urlopen = old_pool, old_urlopen
             error.close()

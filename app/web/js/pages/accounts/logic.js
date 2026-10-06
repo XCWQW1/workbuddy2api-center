@@ -371,7 +371,8 @@ function remainText(seconds) {
 }
 
 /** 优先级输入框的校验。返回组装好的提交值或写给用户的原因。 */
-export function parsePriorityInput(raw) {  const text = String(raw == null ? '' : raw).trim();
+export function parsePriorityInput(raw) {
+  const text = String(raw == null ? '' : raw).trim();
   const value = text === '' ? Number.NaN : Number(text);
   if (!Number.isInteger(value) || value < 0 || value > PRIORITY_MAX) {
     return { ok: false, message: '优先级需要 0 到 ' + PRIORITY_MAX + ' 之间的整数，本次没有发送请求' };

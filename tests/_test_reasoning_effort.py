@@ -148,7 +148,7 @@ class OpenUpstreamTests(unittest.TestCase):
 
     def effort_of(self, payload):
         _resp, _account, effort = P.open_upstream(
-            payload, session_key="s-effort", target_realm="intl")
+            payload, session_key="s-effort", target_realm="intl", lease=P.SlotLease())
         return effort
 
     def test_the_camelcase_effort_comes_back(self):

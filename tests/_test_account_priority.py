@@ -288,7 +288,8 @@ class DebugAccountPinTests(unittest.TestCase):
 
     def open_pinned(self, uid, model="glm-5.3"):
         payload = {"model": model, "messages": [{"role": "user", "content": "hi"}]}
-        return P.open_upstream(payload, target_realm="intl", only_uid=uid)
+        return P.open_upstream(payload, target_realm="intl", only_uid=uid,
+                               lease=P.SlotLease())
 
     def test_the_named_account_serves_the_request(self):
         response, used, _ = self.open_pinned("uid-other")
