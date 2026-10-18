@@ -3,10 +3,12 @@
 The fork's release pipeline is ``.github/workflows/release.yml``:
 
   * a manual ``workflow_dispatch`` carrying one required ``version`` input;
-  * the full ``tests.yml`` matrix runs first (``needs: test``);
-  * the ``release`` job bumps ``VERSION`` in ``app/wb_proxy.py`` exactly once,
-    commits it to main, creates ``v<version>`` and publishes the GitHub
-    Release with generated notes (pre-release for ``-rc`` style versions);
+  * ``VERSION`` is already on main: the dispatch refuses a mismatch instead of
+    bumping and pushing anything itself;
+  * the ``release`` job reads the push-triggered ``tests.yml`` run for that
+    commit and continues only when it passed, then creates ``v<version>`` and
+    publishes the GitHub Release with generated notes (pre-release for ``-rc``
+    style versions);
   * ``docker-publish.yml`` builds the image and ``package.yml`` builds the
     green package, both from that tag.
 
@@ -205,8 +207,8 @@ def release_writer_jobs(text):
 
 
 # The only job allowed to touch the Release, and the only input a dispatch may
-# take. The writer is authorised by `needs: test`, which is the reusable
-# tests.yml workflow - a manual run cannot skip it.
+# take. `tests` runs on every push to main, so the writer checks that result
+# instead of repeating the matrix inside the release run.
 RELEASE_WRITER_JOB = "release"
 DISPATCH_INPUTS = ["version"]
 
@@ -216,8 +218,9 @@ def check_release_writers(text):
 
     The fork publishes from a manual dispatch (there is no tag-push trigger),
     so the safety property is not "only a tag push may write": it is that the
-    one writer job waits for the full test workflow, owns `contents: write`,
-    and that the dispatch offers nothing but the version number.
+    one writer job owns `contents: write`, reads the push-triggered test run
+    for the same commit before tagging, and that the dispatch offers nothing
+    but the version number.
     """
     jobs = workflow_jobs(text)
     writers = release_writer_jobs(text)
@@ -226,10 +229,20 @@ def check_release_writers(text):
         "只有 %s 这一个 job 可以写 release，实际是 %s"
         % (RELEASE_WRITER_JOB, writers))
     body = jobs[RELEASE_WRITER_JOB]
-    assert re.search(r"(?m)^\s*needs:\s*test\s*$", body), (
-        "release job 必须依赖 test（reusable tests.yml），否则可以绕过测试发版")
     assert "contents: write" in body, (
-        "release job 需要 contents: write 才能提交版本号、打标签、建 Release")
+        "release job 需要 contents: write 才能打标签、建 Release")
+    assert "actions: read" in body, (
+        "release job 需要 actions: read 才能读取测试运行结果")
+    assert 'gh run list --workflow tests.yml --commit "$SHA" --event push' in body, (
+        "release job 必须找到同一提交的 push 测试运行")
+    assert 'gh run watch "$RUN_ID" --exit-status' in body, (
+        "release job 必须等测试运行结束，并以它的结果决定是否继续")
+    assert body.index("Wait for the push tests") < body.index("Tag and publish"), (
+        "测试结果核对必须在打标签之前")
+    assert "uses: ./.github/workflows/tests.yml" not in text, (
+        "release 不应重复运行测试矩阵；直接读取 push 触发的那次结果")
+    assert not re.search(r"(?m)^\s*needs:\s*test\s*$", text), (
+        "release 不应依赖测试 job；测试由 push 触发，结果单独读取")
     inputs = dispatch_input_names(text)
     assert inputs == DISPATCH_INPUTS, (
         "workflow_dispatch 只能有 version 一个输入，实际是 %s" % inputs)
@@ -603,6 +616,7 @@ class ReleaseToolingTests(unittest.TestCase):
 
     def test_the_package_job_builds_the_portable_zip(self):
         package = read(".github", "workflows", "package.yml")
+        self.assertIn("python release/portable_runtime.py download", package)
         self.assertIn("python release/portable_runtime.py prepare", package)
         self.assertIn("python release/release_tools.py portable", package)
         self.assertIn("runs-on: windows-latest", package)
@@ -701,28 +715,27 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("prerelease=true", step)
         self.assertIn("prerelease=false", step)
         self.assertLess(self.text.index("Validate version"),
-                        self.text.index("Bump VERSION"))
+                        self.text.index("Check VERSION matches the input"))
 
-    def test_the_version_is_bumped_in_the_app_entrypoint(self):
+    def test_the_version_must_already_match_main(self):
         # app/wb_proxy.py is the single source of truth: VERSION drives
-        # server_version and the /health payload. The workflow refuses to bump
-        # when the definition is not exactly one line.
+        # server_version and the /health payload. The release tags an already
+        # tested commit, so it refuses to bump or push anything itself.
         self.assertIn("""grep -c '^VERSION = "' app/wb_proxy.py""", self.text)
-        self.assertIn('''sed -i "s/^VERSION = \\"[^\\"]*\\"/VERSION = \\"$VALUE\\"/" app/wb_proxy.py''',
-                      self.text)
-        self.assertIn("git add app/wb_proxy.py", self.text)
-        self.assertIn('git commit -m "release: $TAG"', self.text)
-        self.assertIn("git push origin HEAD:main", self.text)
+        self.assertIn(
+            """CURRENT="$(sed -n 's/^VERSION = "\\([^"]*\\)"/\\1/p' app/wb_proxy.py)\"""",
+            self.text)
+        self.assertIn("main 的 VERSION 是", self.text)
+        self.assertIn("先提交版本号并推送", self.text)
+        self.assertNotIn("git commit -m \"release: $TAG\"", self.text)
+        self.assertNotIn("git push origin HEAD:main", self.text)
 
-    def test_the_tag_is_free_and_created_after_the_bump(self):
+    def test_the_tag_is_free_and_created_after_the_test_gate(self):
         self.assertIn("git ls-remote --exit-code --tags origin", self.text)
         self.assertIn("标签 $TAG 已存在", self.text)
-        self.assertLess(self.text.index("Ensure the tag is free"),
-                        self.text.index("Bump VERSION"))
-        self.assertIn('git tag -a "$TAG" -m "$TAG"', self.text)
+        self.assertLess(self.text.index("Wait for the push tests"),
+                        self.text.index('git tag -a "$TAG" -m "$TAG"'))
         self.assertIn('git push origin "$TAG"', self.text)
-        self.assertLess(self.text.index("Bump VERSION"),
-                        self.text.index('git tag -a "$TAG"'))
 
     def test_the_release_is_published_with_generated_notes(self):
         self.assertIn('gh release create "$TAG" --verify-tag --title "$TAG" '
@@ -733,10 +746,16 @@ class ReleaseWorkflowTests(unittest.TestCase):
         # publish step that could leave a release invisible.
         self.assertNotIn("--draft", self.text)
 
-    def test_the_release_job_waits_for_the_test_workflow(self):
-        self.assertIn("uses: ./.github/workflows/tests.yml", self.jobs["test"])
-        self.assertRegex(self.jobs["release"], r"(?m)^\s*needs:\s*test\s*$")
+    def test_the_release_job_reads_the_push_test_result(self):
+        self.assertNotIn("uses: ./.github/workflows/tests.yml", self.text)
+        self.assertNotRegex(self.jobs["release"], r"(?m)^\s*needs:\s*test\s*$")
+        self.assertIn('gh run list --workflow tests.yml --commit "$SHA" --event push',
+                      self.jobs["release"])
+        self.assertIn('gh run watch "$RUN_ID" --exit-status', self.jobs["release"])
+        self.assertIn("actions: read", self.jobs["release"])
         self.assertIn("contents: write", self.jobs["release"])
+        self.assertLess(self.text.index("Wait for the push tests"),
+                        self.text.index("Tag and publish"))
 
     def test_downstream_jobs_consume_the_created_tag(self):
         self.assertIn("tag: ${{ steps.version.outputs.tag }}", self.jobs["release"])
@@ -766,7 +785,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             check_release_writers(mutated)
 
     def test_the_checker_rejects_a_release_without_the_test_gate(self):
-        mutated = self.text.replace("    needs: test\n", "", 1)
+        mutated = self.text.replace(" --event push", "", 1)
         self.assertNotEqual(mutated, self.text)
         with self.assertRaises(AssertionError):
             check_release_writers(mutated)
@@ -779,48 +798,21 @@ class ReleaseWorkflowTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_release_writers(mutated)
 
-    def test_the_checker_rejects_a_one_line_write_in_the_test_job(self):
-        # The short form is just as much a writer as the block form.
+    def test_the_checker_rejects_the_old_reusable_test_job(self):
         mutated = self.text.replace(
-            "    uses: ./.github/workflows/tests.yml\n",
-            "    steps:\n    - run: gh release delete \"$TAG\" --yes\n"
-            "    uses: ./.github/workflows/tests.yml\n", 1)
+            "  release:\n    runs-on:",
+            "  release:\n    needs: test\n    runs-on:", 1)
         self.assertNotEqual(mutated, self.text)
         with self.assertRaises(AssertionError):
             check_release_writers(mutated)
 
-    def test_the_checker_rejects_an_implicit_post_that_creates_a_release(self):
-        # gh defaults to POST as soon as a field flag is there, so this line
-        # creates a release without ever naming a method.
+    def test_the_checker_rejects_an_extra_writer_job_with_continuations(self):
         mutated = self.text.replace(
-            "    uses: ./.github/workflows/tests.yml\n",
-            "    steps:\n    - run: |\n"
-            "        gh api \"repos/$GH_REPO/releases\" -f tag_name=\"$TAG\" -f draft=true\n"
-            "    uses: ./.github/workflows/tests.yml\n", 1)
-        self.assertNotEqual(mutated, self.text)
-        self.assertIn("-f tag_name=", mutated)
-        with self.assertRaises(AssertionError):
-            check_release_writers(mutated)
-
-    def test_the_checker_rejects_an_implicit_post_split_over_continuations(self):
-        mutated = self.text.replace(
-            "    uses: ./.github/workflows/tests.yml\n",
-            "    steps:\n    - run: |\n"
+            "  publish-image:\n",
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n    - run: |\n"
             "        gh api \\\n"
             "          \"repos/$GH_REPO/releases\" \\\n"
-            "          --field tag_name=\"$TAG\" \\\n"
-            "          --raw-field draft=true\n"
-            "    uses: ./.github/workflows/tests.yml\n", 1)
-        self.assertNotEqual(mutated, self.text)
-        with self.assertRaises(AssertionError):
-            check_release_writers(mutated)
-
-    def test_the_checker_rejects_a_write_split_over_continuations(self):
-        mutated = self.text.replace(
-            "    uses: ./.github/workflows/tests.yml\n",
-            "    steps:\n    - run: |\n"
-            "        gh release \\\n          create \"$TAG\" --draft\n"
-            "    uses: ./.github/workflows/tests.yml\n", 1)
+            "          --field tag_name=\"$TAG\"\n\n  publish-image:\n", 1)
         self.assertNotEqual(mutated, self.text)
         with self.assertRaises(AssertionError):
             check_release_writers(mutated)
@@ -839,11 +831,17 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "        required: true\n"
             "jobs:\n"
             "  release:\n"
-            "    needs: test\n"
+            "    runs-on: ubuntu-latest\n"
             "    permissions:\n"
             "      contents: write\n"
+            "      actions: read\n"
             "    steps:\n"
-            "    - run: gh release create \"$TAG\" --verify-tag\n"
+            "    - name: Wait for the push tests\n"
+            "      run: |\n"
+            "        gh run list --workflow tests.yml --commit \"$SHA\" --event push\n"
+            "        gh run watch \"$RUN_ID\" --exit-status\n"
+            "    - name: Tag and publish\n"
+            "      run: gh release create \"$TAG\" --verify-tag\n"
             "    - run: gh api -X GET \"repos/$GH_REPO/releases\" -f per_page=1\n"
             "    - run: gh api --method=GET \"repos/$GH_REPO/releases/tags/$TAG\"\n")
         check_release_writers(synthetic)
@@ -870,8 +868,12 @@ class PackageWorkflowTests(unittest.TestCase):
         # The version comes from the tag, never a second hand-maintained
         # literal that could disagree with it.
         self.assertIn("value=${TAG#v}", package)
+        self.assertIn("python release/portable_runtime.py download", package)
         self.assertIn("python release/portable_runtime.py prepare", package)
         self.assertIn("python release/release_tools.py portable", package)
+        self.assertLess(package.index("portable_runtime.py download"),
+                        package.index("portable_runtime.py prepare"))
+        self.assertNotIn("$RUNTIME_URL", package)
         self.assertIn("dist/wb-proxy-center-v$VERSION.zip", package)
         self.assertIn("path: dist/*.zip", package)
         self.assertIn('gh release view "$TAG"', package)

@@ -40,10 +40,7 @@ jobs:
         TAG: ${{ inputs.tag || github.event.release.tag_name }}
       run: echo "value=${TAG#v}" >> "$GITHUB_OUTPUT"
     - name: Fetch pinned runtime
-      shell: bash
-      run: |
-        python release/portable_runtime.py info >> "$GITHUB_ENV"
-        curl -fL "$RUNTIME_URL" -o "$RUNNER_TEMP/runtime.tar.gz"
+      run: python release/portable_runtime.py download --out "${{ runner.temp }}/runtime.tar.gz"
     - name: Prepare trimmed runtime
       run: python release/portable_runtime.py prepare --tarball "${{ runner.temp }}/runtime.tar.gz" --dest python
     - name: Build portable package

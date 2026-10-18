@@ -1,8 +1,9 @@
 name: release
 
-# 发版流程：在 Actions 页面运行本工作流并输入版本号（例如 0.2.0），它会：
-#   1. 运行全部测试套件
-#   2. 更新 app/wb_proxy.py 里的 VERSION 并提交到 main
+# 发版流程：先在 main 提交版本号并推送，push 触发的 tests 跑完后，在 Actions
+# 页面运行本工作流并输入同一个版本号，它会：
+#   1. 核对 main 的 VERSION 与输入一致、标签未被占用
+#   2. 读取该提交的 tests 结果，通过才继续
 #   3. 打上 v<版本号> 标签并创建 Release
 #   4. 构建并推送 GHCR 多架构镜像
 #   5. 构建绿色包并附加到 Release 资源
@@ -16,18 +17,15 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
-  test:
-    permissions:
-      contents: read
-    uses: ./.github/workflows/tests.yml
-
   release:
-    needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: write
+      actions: read
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
@@ -54,15 +52,7 @@ jobs:
       with:
         ref: main
         fetch-depth: 0
-    - name: Ensure the tag is free
-      env:
-        TAG: ${{ steps.version.outputs.tag }}
-      run: |
-        if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
-          echo "::error::标签 $TAG 已存在，请换一个版本号"
-          exit 1
-        fi
-    - name: Bump VERSION
+    - name: Check VERSION matches the input
       env:
         VALUE: ${{ steps.version.outputs.value }}
       run: |
@@ -71,25 +61,49 @@ jobs:
           echo "::error::app/wb_proxy.py 里的 VERSION 定义不是恰好一处"
           exit 1
         fi
-        sed -i "s/^VERSION = \"[^\"]*\"/VERSION = \"$VALUE\"/" app/wb_proxy.py
-        grep -n '^VERSION = "' app/wb_proxy.py
-    - name: Commit, tag and publish
+        CURRENT="$(sed -n 's/^VERSION = "\([^"]*\)"/\1/p' app/wb_proxy.py)"
+        if [ "$CURRENT" != "$VALUE" ]; then
+          echo "::error::main 的 VERSION 是 $CURRENT，与 $VALUE 不一致。先提交版本号并推送，等 tests 通过后再发版"
+          exit 1
+        fi
+    - name: Ensure the tag is free
+      env:
+        TAG: ${{ steps.version.outputs.tag }}
+      run: |
+        if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+          echo "::error::标签 $TAG 已存在，请换一个版本号"
+          exit 1
+        fi
+    - name: Wait for the push tests
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        SHA="$(git rev-parse HEAD)"
+        RUN_ID=""
+        for _ in $(seq 1 30); do
+          RUN_ID="$(gh run list --workflow tests.yml --commit "$SHA" --event push \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+          if [ -n "$RUN_ID" ]; then
+            break
+          fi
+          sleep 10
+        done
+        if [ -z "$RUN_ID" ]; then
+          echo "::error::没有找到 $SHA 的 tests 运行记录。先推送 main，等 tests 跑完再发版"
+          exit 1
+        fi
+        echo "核对 tests 运行 $RUN_ID（提交 $SHA）"
+        gh run watch "$RUN_ID" --exit-status --interval 10
+    - name: Tag and publish
       env:
         GH_TOKEN: ${{ github.token }}
         TAG: ${{ steps.version.outputs.tag }}
-        VALUE: ${{ steps.version.outputs.value }}
         PRERELEASE: ${{ steps.version.outputs.prerelease }}
       run: |
         set -euo pipefail
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git add app/wb_proxy.py
-        if git diff --cached --quiet; then
-          echo "app/wb_proxy.py 的 VERSION 已经是 $VALUE，按当前 main 打标签"
-        else
-          git commit -m "release: $TAG"
-          git push origin HEAD:main
-        fi
         git tag -a "$TAG" -m "$TAG"
         git push origin "$TAG"
         if [ "$PRERELEASE" = "true" ]; then

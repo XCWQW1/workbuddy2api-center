@@ -16,6 +16,7 @@ root files. ``Lib/multiprocessing`` is part of that difference, and the README
 documents the consequence ("绿色包那份精简 Python 里根本没有这个模块，用它会直接
 报错"), so dropping it is the shipped behaviour rather than an accident.
 
+    python release/portable_runtime.py download --out runtime.tar.gz
     python release/portable_runtime.py prepare --tarball <tar.gz> --dest python
     python release/portable_runtime.py verify  --root python
 """
@@ -27,6 +28,7 @@ import os
 import shutil
 import sys
 import tarfile
+import urllib.request
 
 # ---- pinned release input -------------------------------------------------
 #
@@ -204,14 +206,16 @@ def _utf8_stdio():
             pass
 
 
-def info():
-    """KEY=VALUE lines, so the workflow reads the pin from one place."""
-    return [
-        "RUNTIME_PYTHON=%s" % RUNTIME_VERSION,
-        "RUNTIME_ASSET=%s" % RUNTIME_ASSET,
-        "RUNTIME_URL=%s" % RUNTIME_URL,
-        "RUNTIME_SHA256=%s" % RUNTIME_SHA256,
-    ]
+def download(out, expect_sha=RUNTIME_SHA256):
+    """Fetch the pinned tarball and refuse a checksum mismatch."""
+    with urllib.request.urlopen(RUNTIME_URL, timeout=120) as resp:
+        with open(out, "wb") as fh:
+            shutil.copyfileobj(resp, fh)
+    got = sha256(out)
+    if expect_sha and got != expect_sha:
+        raise SystemExit("运行时校验和不符：\n  期望 %s\n  实际 %s\n（%s）"
+                         % (expect_sha, got, out))
+    return got
 
 
 def main(argv=None):
@@ -220,7 +224,10 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd")
 
-    sub.add_parser("info", help="print the pinned runtime as KEY=VALUE lines")
+    d = sub.add_parser("download", help="download the pinned runtime tarball")
+    d.add_argument("--out", required=True)
+    d.add_argument("--sha256", default=RUNTIME_SHA256,
+                   help="expected checksum ('' to skip, for local experiments)")
 
     p = sub.add_parser("prepare", help="extract + trim the pinned runtime")
     p.add_argument("--tarball", required=True)
@@ -233,9 +240,9 @@ def main(argv=None):
 
     args = ap.parse_args(argv)
 
-    if args.cmd == "info":
-        for line in info():
-            print(line)
+    if args.cmd == "download":
+        download(args.out, args.sha256 or None)
+        print("runtime: %s（Python %s）" % (args.out, RUNTIME_VERSION))
         return 0
 
     if args.cmd == "prepare":

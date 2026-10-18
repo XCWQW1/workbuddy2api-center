@@ -60,7 +60,16 @@ PR 正文至少写清下面五件事：
 - **合并之后**：main 的 CI 必须保持通过。main 出错时，优先用确定的方式撤销，再修复问题。
 - **测试失败**：先判断是自己的改动出错，还是测试本身写错。删除断言或修改预期时，必须在 PR 说明里写明理由。
 
-## 五、同步上游
+## 五、发布
+
+发版分两步，测试只跑一次：
+
+1. 在 main 提交 `app/wb_proxy.py` 的 `VERSION`，推送。
+2. push 触发的 tests 通过后，在 Actions 页面运行 release 工作流，输入同一个版本号。
+
+release 工作流核对同一提交的 tests 运行结果，通过后打 `v<版本号>` 标签并创建 Release，不重复运行测试矩阵。`VERSION` 与输入不一致时，工作流直接失败。
+
+## 六、同步上游
 
 本仓库从 [ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub) 同步代码。同步时逐个评估上游的改动，按需要重新实现，遵守下面的规则：
 
