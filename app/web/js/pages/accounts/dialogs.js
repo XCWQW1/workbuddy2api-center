@@ -9,6 +9,7 @@ import { busyClick, notice, segmented } from '../../ui/widgets.js';
 import { toast, toastError } from '../../ui/toast.js';
 import { copyWithToast } from '../../ui/copy.js';
 import * as acct from './actions.js';
+import { PRODUCTS, productLabel, modelSelection, deniedModels } from './logic.js';
 
 const REALM_LABEL = { cn: '国内版 (www.workbuddy.cn)', intl: '国际版 (www.workbuddy.ai)' };
 
@@ -28,12 +29,13 @@ function qrSvg(text) {
 }
 
 /**
- * 添加账号 (OAuth)：默认选中当前查看的版本，链接生成后展示二维码与可复制链接，
- * 每 2 秒轮询一次登录状态，关闭弹窗时通知服务端取消本次登录。
+ * 添加账号 (OAuth)：默认选中当前查看的版本与 WorkBuddy 桌面端，链接生成后展示二维码与可复制链接，
+ * 每 2 秒轮询一次登录状态，关闭弹窗时通知服务端取消本次登录。登录所用的客户端就是新账号的出站身份。
  */
 export function openAddAccountDialog(options = {}) {
   const initial = options.realm === 'cn' || options.realm === 'intl' ? options.realm : getState().viewRealm;
   let realm = initial;
+  let product = 'workbuddy';
   let phase = 'idle';        // idle | starting | waiting | ok | failed
   let state = '';
   let authUrl = '';
@@ -44,7 +46,7 @@ export function openAddAccountDialog(options = {}) {
 
   const ctl = openDialog({
     title: '添加账号 (OAuth)',
-    desc: () => '先选择要登录的版本，再打开链接或用手机扫码完成授权。授权完成后账号会自动加入账号池，不需要回来点确认。',
+    desc: () => '先选择要登录的版本和客户端，再打开链接或用手机扫码完成授权。授权完成后账号会自动加入账号池，所选客户端就是这个账号的出站身份。',
     width: 460,
     body: () => html`
       <div class="realm-choice">
@@ -53,6 +55,11 @@ export function openAddAccountDialog(options = {}) {
           { id: 'cn', label: REALM_LABEL.cn },
           { id: 'intl', label: REALM_LABEL.intl },
         ], realm, switchRealm)}
+      </div>
+      <div class="realm-choice">
+        <span class="field-label">以哪个官方客户端登录</span>
+        ${segmented(PRODUCTS.map((item) => ({ id: item.id, label: item.short })), product, switchProduct)}
+        <span class="text-2xs muted">${productLabel(product)}</span>
       </div>
       <div class="step-list">
         <div class="step ${stepClass(1)}">
@@ -128,6 +135,12 @@ export function openAddAccountDialog(options = {}) {
     await startLogin();
   }
 
+  async function switchProduct(next) {
+    if (next === product) return;
+    product = next;
+    await startLogin();
+  }
+
   async function startLogin() {
     stopPolling();
     await cancelCurrent();
@@ -137,7 +150,7 @@ export function openAddAccountDialog(options = {}) {
     phase = 'starting';
     ctl.update();
     try {
-      const started = await acct.startLogin(realm);
+      const started = await acct.startLogin(realm, product);
       state = started.state;
       authUrl = started.authUrl;
       phase = 'waiting';
@@ -395,6 +408,89 @@ export function openNoteDialog(account, { onDone } = {}) {
     }
   }
 
+  return ctl;
+}
+
+export function openModelExcludeDialog(account, { onDone } = {}) {
+  const name = account.nickname || String(account.uid || '').slice(0, 8);
+  let ids = null;
+  let picked = new Set();
+  let error = '';
+  let busy = false;
+
+  const ctl = openDialog({
+    title: '模型排除',
+    desc: '「' + name + '」不会接这些模型的请求，其他账号不受影响。取消勾选即排除，全部勾选表示不排除任何模型。',
+    width: 560,
+    body: () => html`
+      ${error ? notice('warn', error) : nothing}
+      ${ids === null
+        ? html`<p class="text-xs muted">正在读取模型目录…</p>`
+        : html`
+          <div class="row-wrap" style="margin-bottom:10px">
+            <span class="text-xs muted">共 ${ids.length} 个模型，已排除 ${ids.length - picked.size} 个</span>
+            <span class="grow"></span>
+            <button class="btn btn-outline btn-sm" @click=${() => setAll(true)}>全选</button>
+            <button class="btn btn-outline btn-sm" @click=${() => setAll(false)}>全不选</button>
+          </div>
+          <div class="model-picker scroll-slim">
+            ${ids.map((id) => html`
+              <label title=${id}>
+                <input type="checkbox" .checked=${picked.has(id)}
+                       @change=${(event) => toggle(id, event.target.checked)}>
+                <code>${id}</code>
+              </label>`)}
+          </div>`}`,
+    foot: () => html`
+      <button class="btn btn-ghost" @click=${() => ctl.close()}>取消</button>
+      <button class="btn btn-primary" ?disabled=${busy || ids === null || !!error}
+              @click=${busyClick(save)}>${icon('Check')}保存排除</button>`,
+  });
+
+  async function load() {
+    try {
+      const payload = await acct.loadRealmModels(account.realm);
+      const list = ((payload && payload.data) || []).map((item) => item.id).filter(Boolean);
+      const view = modelSelection(list, account.disabledModels);
+      ids = view.ids;
+      picked = view.picked;
+      error = '';
+    } catch (err) {
+      error = '模型目录没有读取成功：' + err.message;
+    }
+    ctl.update();
+  }
+
+  function toggle(id, on) {
+    if (on) picked.add(id);
+    else picked.delete(id);
+    ctl.update();
+  }
+
+  function setAll(on) {
+    picked = on ? new Set(ids || []) : new Set();
+    ctl.update();
+  }
+
+  async function save() {
+    busy = true;
+    ctl.update();
+    try {
+      const deny = deniedModels(ids, picked);
+      await acct.setDisabledModels(account.uid, deny);
+      toast.success(deny.length ? '已排除 ' + deny.length + ' 个模型' : '已取消模型排除', name);
+      acct.notifyAccountsChanged();
+      if (onDone) onDone();
+      ctl.close();
+    } catch (err) {
+      toastError('保存模型排除失败', err);
+    } finally {
+      busy = false;
+      ctl.update();
+    }
+  }
+
+  load();
   return ctl;
 }
 

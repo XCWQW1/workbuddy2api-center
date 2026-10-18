@@ -20,7 +20,7 @@ export function messagesFormatOptions(stored, fallback) {
 }
 
 /**
- * 测试使用的模型下拉：首项是「默认」，随后是该出口目录里的模型。
+ * 接口测试模型下拉：首项是「默认」，随后是该出口目录里的模型。
  * 服务端存着的模型如果已经不在目录里，补一条并标注「当前设置」，免得保存时被悄悄换掉。
  */
 export function testModelOptions(ids, stored) {
@@ -81,6 +81,30 @@ export function parseNonNegativeNumber(text, { label = '数值', max = 1e15 } = 
     return { ok: false, error: label + '需要填写 0 到 ' + max + ' 之间的数。' };
   }
   return { ok: true, value };
+}
+
+/** 排程时段：逗号或空格分隔的整点（0-23）；空串表示这一组不跑。 */
+export function parseHours(text, { label = '时段' } = {}) {
+  const raw = String(text == null ? '' : text).trim();
+  if (!raw) return { ok: true, value: [] };
+  const parts = raw.split(/[,;，、\s]+/).filter(Boolean);
+  const out = [];
+  for (const part of parts) {
+    if (!/^\d{1,2}$/.test(part)) {
+      return { ok: false, error: label + '只能填 0 到 23 的整点，用逗号分隔。' };
+    }
+    const hour = Number(part);
+    if (hour < 0 || hour > 23) {
+      return { ok: false, error: label + '只能填 0 到 23 的整点，用逗号分隔。' };
+    }
+    if (!out.includes(hour)) out.push(hour);
+  }
+  return { ok: true, value: out.sort((a, b) => a - b) };
+}
+
+/** 时段数组的展示文本。 */
+export function hoursText(hours) {
+  return (hours || []).map((hour) => String(hour)).join(', ');
 }
 
 /** 面板密码修改前的本地校验；错误文案为空串表示通过。 */

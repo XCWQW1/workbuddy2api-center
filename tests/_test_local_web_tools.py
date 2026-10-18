@@ -23,17 +23,11 @@ gate and the DNS / IP guards. Engine runs and HTTP responses are injected, so
 the file stays offline. No network access required.
 """
 
-import contextlib
-import http.server
 import ipaddress
 import json
 import os
-import socket
 import sys
 import tempfile
-import threading
-import time
-import tracemalloc
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app"))

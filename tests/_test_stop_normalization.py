@@ -1,29 +1,9 @@
-"""Regression tests for the `stop` string -> []string normalization (code 11101).
-
-Reported symptom: a Go client sent `"stop": "END"` — legal, because OpenAI
-declares the field as `string | array` — and every single call came back
-
-    upstream 400: {"code":11101,"msg":"Unmarshal chat params failed with error:
-    json: cannot unmarshal string into Go struct field Request.stop of type
-    []string"}
-
-Measured against the live upstream (deepseek-v4.1-flash, same prompt, same
-account) before the fix:
-
-    "stop": "END"     -> 400 / code 11101
-    "stop": ["END"]   -> 200
-
-The gateway forwarded the field untouched, so a client that followed the OpenAI
-spec could not use it at all. These tests pin the outbound shape: a single
-string becomes a one-element array, and empty / null / non-string values are
-dropped instead of being forwarded for upstream to reject a second time.
-"""
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
-# Its own directories, removed when this process exits.
+# 独立目录，进程退出时删除。
 _TMP = isolated_data_dirs("wb-stop-normalization-")
 
 import wb_proxy as P

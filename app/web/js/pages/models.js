@@ -6,16 +6,21 @@ import { fmtAgo, fmtDateTime, realmLabel } from '../core/format.js';
 import { toast, toastError } from '../ui/toast.js';
 import { pageHeader, statCard, chip, emptyState, loadErrorPage, loadErrorInline,
          skeletonStats, skeletonRows, switchControl, badge, busyClick } from '../ui/widgets.js';
-import { CAPABILITIES, LONG_CONTEXT_TOKENS, capabilityBadges, capabilityLabel, contextText, contextTitle,
+import { CAPABILITIES, LONG_CONTEXT_TOKENS, accountAvailableCount, accountCanUse,
+         capabilityBadges, capabilityLabel, contextText, contextTitle, coverageFor,
          creditInfo, disabledIds, fmtTokens, hasCredits, hiddenExcludedCount,
-         outputText, panelModelsUrl, reasoningLevels, selectModels, sourceLabel, summary, withEnabled } from './models/logic.js';
+         outputText, panelModelsUrl, realmAccounts, reasoningLevels, selectModels,
+         sourceLabel, summary, withEnabled } from './models/logic.js';
 
 // 模型页：目录来自 GET /panel/models，勾选状态写回 settings 的 disabled_models；目录按 5 分钟缓存，只在手动点击时重新读取。
+// 账号选择器把所有账号聚合成一列覆盖率，也可以只看单个账号能用的模型。
 
 export function mount(host, ctx) {
   const realm = getState().viewRealm;
   const state = {
     data: null,          // null 表示首屏还没读到数据
+    accounts: [],
+    scope: 'all',        // all = 聚合视图；其他值是账号 uid
     source: '',
     fetchedAt: null,
     error: '',
@@ -31,8 +36,15 @@ export function mount(host, ctx) {
   async function load(force) {
     const url = panelModelsUrl(realm, force);
     try {
-      const reply = await getJSON(url);
+      const [reply, accountsReply] = await Promise.all([
+        getJSON(url),
+        getJSON('/accounts?realm=all').catch(() => null),
+      ]);
       state.data = reply.data || [];
+      if (accountsReply && Array.isArray(accountsReply.accounts)) {
+        state.accounts = accountsReply.accounts;
+      }
+      if (state.scope !== 'all' && !currentAccount()) state.scope = 'all';
       state.source = reply.source || '';
       state.fetchedAt = reply.fetched_at || null;
       state.error = '';
@@ -47,6 +59,15 @@ export function mount(host, ctx) {
       if (force) toastError('重新获取失败', err);
     }
     draw();
+  }
+
+  function realmAccountList() {
+    return realmAccounts(state.accounts, realm);
+  }
+
+  function currentAccount() {
+    if (state.scope === 'all') return null;
+    return realmAccountList().find((a) => a.uid === state.scope) || null;
   }
 
   const refresh = () => load(true);
@@ -95,10 +116,16 @@ export function mount(host, ctx) {
 
   function stats() {
     const s = summary(state.data);
+    const account = currentAccount();
+    const available = account ? accountAvailableCount(state.data, account) : s.enabled;
     const maxOutHint = s.maxOutput ? `单次最多输出 ${fmtTokens(s.maxOutput)}` : nothing;
     return html`
       <div class="grid-stats cols-4">
-        ${statCard({ label: '可用模型', value: s.total, icon: 'Boxes', hint: `网关处理中 ${s.enabled} 个`, hintTone: s.enabled < s.total ? 'warning' : '', delay: 0 })}
+        ${statCard(account
+          ? { label: '该账号可用模型', value: available, icon: 'Boxes',
+              hint: `共 ${s.total} 个 · 全局开启 ${s.enabled} 个`, delay: 0 }
+          : { label: '可用模型', value: s.total, icon: 'Boxes',
+              hint: `网关处理中 ${s.enabled} 个`, hintTone: s.enabled < s.total ? 'warning' : '', delay: 0 })}
         ${statCard({ label: '支持推理', value: s.reasoning, icon: 'Brain', hint: '目录里带思考档位的模型', delay: 0.05 })}
         ${statCard({ label: '长上下文模型', value: s.longContext, icon: 'Maximize2', hint: `上下文不少于 ${fmtTokens(LONG_CONTEXT_TOKENS)} 的模型`, delay: 0.1 })}
         ${statCard({ label: '最长上下文', value: fmtTokens(s.maxContext), icon: 'Gauge', hint: maxOutHint, delay: 0.15 })}
@@ -110,6 +137,18 @@ export function mount(host, ctx) {
     const creditSort = hasCredits(state.data);
     return html`
       <div class="card card-tight models-filter">
+        <label class="row" style="gap:6px">
+          <span class="chips-label">${icon('Users')}查看</span>
+          <select class="select input-sm" title="全部账号是聚合视图，显示每个模型在多少个已启用账号里可用"
+                  .value=${state.scope}
+                  @change=${(event) => { state.scope = event.target.value; draw(); }}>
+            <option value="all" .selected=${state.scope === 'all'}>全部账号（聚合）</option>
+            ${realmAccountList().map((account) => html`
+              <option value=${account.uid} .selected=${state.scope === account.uid}>
+                ${account.nickname || String(account.uid || '').slice(0, 8)}${account.enabled === false ? '（已停用）' : ''}
+              </option>`)}
+          </select>
+        </label>
         <label class="input-search models-search">
           ${icon('Search')}
           <input class="input" type="search" placeholder="搜索模型名 / 模型 ID / 说明"
@@ -183,7 +222,24 @@ export function mount(host, ctx) {
     return html`<span class="row-wrap" style="gap:4px">${levels.map((level) => html`<span class="effort">${level}</span>`)}</span>`;
   }
 
+  function accountCell(m, account) {
+    if (!m.enabled) {
+      return badge('全局停用', 'danger', { small: true, title: '网关已停止处理这个模型，任何账号都不会接单' });
+    }
+    if (!accountCanUse(m, account)) {
+      return badge('已排除', 'warning', { small: true, title: '这个账号不接这个模型，请求会交给其他账号' });
+    }
+    return badge('可用', 'success', { small: true });
+  }
+
+  function coverageCell(m) {
+    const coverage = coverageFor(m, realmAccountList());
+    return html`<span class="nums ${coverage.can === 0 ? 'tone-warning' : ''}"
+                      title="已启用账号中可以接这个模型的数量">${coverage.text}</span>`;
+  }
+
   function table(rows) {
+    const account = currentAccount();
     return html`
       <div class="table-wrap desktop-only">
         <table class="table">
@@ -194,7 +250,8 @@ export function mount(host, ctx) {
               <th>最大输出</th>
               <th>思考档位</th>
               <th>积分倍率</th>
-              <th class="center">启用</th>
+              ${account ? html`<th class="center">该账号</th>` : html`<th>账号可用</th>`}
+              ${account ? nothing : html`<th class="center">启用</th>`}
             </tr>
           </thead>
           <tbody>
@@ -205,7 +262,9 @@ export function mount(host, ctx) {
                 <td class="nums">${outputText(m)}</td>
                 <td>${effortCell(m)}</td>
                 <td>${creditCell(m)}</td>
-                <td class="center">${enableSwitch(m)}</td>
+                ${account ? html`<td class="center">${accountCell(m, account)}</td>`
+                          : html`<td>${coverageCell(m)}</td>`}
+                ${account ? nothing : html`<td class="center">${enableSwitch(m)}</td>`}
               </tr>`)}
           </tbody>
         </table>
@@ -215,8 +274,9 @@ export function mount(host, ctx) {
           <div class="mobile-item ${m.enabled ? '' : 'row-off'}">
             <div class="row-between">
               <div class="grow">${modelCell(m)}</div>
-              ${enableSwitch(m)}
+              ${account ? accountCell(m, account) : enableSwitch(m)}
             </div>
+            ${account ? nothing : html`<div class="kv"><span>账号可用</span><span>${coverageCell(m)}</span></div>`}
             <div class="kv"><span>上下文</span><span>${contextText(m)}</span></div>
             <div class="kv"><span>最大输出</span><span>${outputText(m)}</span></div>
             <div class="kv"><span>思考档位</span><span>${effortCell(m)}</span></div>
@@ -252,7 +312,7 @@ export function mount(host, ctx) {
         ${pageHeader({
           path: 'models',
           title: '模型中心',
-          desc: `${realmLabel(realm)}账号可用的模型、上下文长度与思考档位；取消勾选后，网关会直接拒绝这个模型的请求`,
+          desc: `${realmLabel(realm)}账号可用的模型、上下文长度与思考档位；选择单个账号查看它能接的模型，全部账号显示每个模型的账号覆盖率。取消勾选后，网关会直接拒绝这个模型的请求`,
           actions,
         })}
         ${state.error ? loadErrorPage('读取模型目录失败：' + state.error, () => load(false))

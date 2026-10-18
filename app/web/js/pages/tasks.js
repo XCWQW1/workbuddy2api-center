@@ -1,4 +1,4 @@
-// 任务页：调度器状态、国内版成长任务与日常福利、国际版每日活跃打卡、积分变动记录；心跳 30 秒，任何操作都不会改动右上角「查看的版本」，页面始终只读 getState().viewRealm。
+// 任务页：调度器状态、国内版成长任务与 Buddy 加油站、国际版今日活跃打卡、积分变动记录；心跳 30 秒，任何操作都不会改动右上角「查看的版本」，页面始终只读 getState().viewRealm。
 
 import { html, nothing, render } from '../core/dom.js';
 import { icon } from '../core/icons.js';
@@ -11,6 +11,7 @@ import {
   badge, busyClick, emptyState, loadErrorInline, loadErrorPage, pageHeader, pager, segmented, skeletonBlock, skeletonRows, statCard,
 } from '../ui/widgets.js';
 import * as logic from './tasks/logic.js';
+import * as activity from './accounts/activity.js';
 import * as acct from './accounts/actions.js';
 import { anyOk, summarizeResults } from './accounts/logic.js';
 
@@ -21,6 +22,8 @@ const CREDIT_PAGE_SIZE = 20;
 export function mount(host) {
   const S = {
     scheduler: null,
+    accounts: [],
+    activity: {},
     growth: null,
     growthUid: 'all',
     mobileTab: 'scheduler',
@@ -63,6 +66,13 @@ export function mount(host) {
       } catch (err) {
         problems.push('成长任务没有读取成功：' + err.message);
       }
+    }
+    try {
+      const [accounts, today] = await Promise.all([acct.loadAccounts(), acct.loadActivityToday()]);
+      S.accounts = accounts.accounts || [];
+      S.activity = activity.latestByUid(today.rows || []);
+    } catch (err) {
+      problems.push('今日活动没有读取成功：' + err.message);
     }
     if (!schedulerOk && !eventsOk && S.loading) {
       S.error = problems.join(' ');
@@ -159,16 +169,38 @@ export function mount(host) {
     }
   }
 
-  async function doCheckin() {
+  async function doCheckin(uid) {
     try {
-      const result = await acct.checkin();
+      const result = await acct.checkin(uid || undefined);
       const results = result.results || [];
-      if (!results.length) toast.warn('没有可签到的国内版账号');
-      else if (anyOk(results)) toast.success('每日签到', summarizeResults(results, { okText: '签到成功' }));
-      else toast.warn('每日签到', summarizeResults(results));
+      if (!results.length) toast.warn('没有可领的国内版账号');
+      else if (anyOk(results)) toast.success(activity.BUDDY_LABEL + '签到', summarizeResults(results, { okText: '已领取' }));
+      else toast.warn(activity.BUDDY_LABEL + '签到', summarizeResults(results));
       await refresh();
     } catch (err) {
       toastError('签到失败', err);
+    }
+  }
+
+  function checkinSelection() {
+    return S.growthUid && S.growthUid !== 'all' ? S.growthUid : undefined;
+  }
+
+  async function doDailyChatPending() {
+    const pending = activity.pendingDailyChat(S.accounts, S.activity);
+    if (!pending.length) {
+      toast.success('国际版账号今天都已打卡');
+      return;
+    }
+    try {
+      const result = await acct.dailyChatPending(pending.map((account) => account.uid));
+      const results = result.results || [];
+      if (!results.length) toast.warn('名单里的账号没有执行');
+      else if (anyOk(results)) toast.success('未活跃打卡', summarizeResults(results, { okText: '打卡成功' }));
+      else toast.warn('未活跃打卡', summarizeResults(results));
+      await refresh();
+    } catch (err) {
+      toastError('打卡失败', err);
     }
   }
 
@@ -257,16 +289,20 @@ export function mount(host) {
     return html`
       <div class="card">
         <div class="card-head">
-          <div>
-            <h2 class="card-title">${icon('Sparkles')}成长任务与日常福利</h2>
-            <p class="card-sub">批量接取任务、上报事件并领取官方成长积分，最多 1450 分；猫猫日常每天可以出发一次。</p>
+          <div class="grow">
+            <h2 class="card-title">${icon('Sparkles')}国内版任务与福利</h2>
+            <p class="card-sub">Buddy 加油站与成长任务一起执行；选单个账号时，下面的按钮只对该账号生效。</p>
           </div>
-          <div class="row-wrap">
-            <select class="select input-sm" title="选择要执行任务的账号，选「全部国内账号」会依次为每个已启用的国内版账号执行"
+          <div class="row-wrap card-actions">
+            <select class="select input-sm" title="选择要执行的账号，选「全部国内账号」会依次为每个已启用的国内版账号执行"
                     .value=${options.selected}
                     @change=${(event) => { S.growthUid = event.target.value; refresh(); }}>
-              ${options.options.map((option) => html`<option value=${option.value}>${option.label}</option>`)}
+              ${options.options.map((option) => html`<option value=${option.value} .selected=${option.value === options.selected}>${option.label}</option>`)}
             </select>
+            <button class="btn btn-primary btn-sm" title="领取所选账号的 Buddy 加油站积分；选「全部」时逐个账号领取"
+                    @click=${busyClick(() => doCheckin(checkinSelection()))}>
+              ${icon('Fuel')}Buddy 加油站签到
+            </button>
             <button class="btn btn-primary btn-sm" title="接取任务、上报事件并领取已经达成的奖励"
                     ?disabled=${S.running} @click=${busyClick(runGrowthTasks)}>
               ${S.running ? icon('LoaderCircle', 'spin') : icon('Sparkles')}${S.running ? '任务执行中' : '执行任务领积分'}
@@ -276,10 +312,10 @@ export function mount(host) {
           </div>
         </div>
         ${data.msg ? loadErrorInline(data.msg, refresh) : nothing}
-        <div class="grid-3">
-          ${statCard({ label: '连续打卡天数', value: (summary.streak_days || 0) + ' 天', icon: 'CalendarDays' })}
-          ${statCard({ label: '成长能量余额', value: fmtNumber(summary.energy || 0), icon: 'Zap', tone: 'success' })}
-          ${statCard({ label: '猫猫日常状态', value: travel.text, icon: 'Cat', tone: travel.tone, hint: travel.desc })}
+        <div class="grid-stats cols-4">
+          ${activityStatCards(realm, true, summary)}
+          ${statCard({ label: '成长能量余额', value: fmtNumber(summary.energy || 0), icon: 'Zap', tone: 'success', compact: true })}
+          ${statCard({ label: '猫猫日常状态', value: travel.text, icon: 'Cat', tone: travel.tone, hint: travel.desc, compact: true })}
         </div>
         <div class="table-wrap">
           <table class="table table-compact">
@@ -316,33 +352,64 @@ export function mount(host) {
       </div>`;
   }
 
-  function dailyCard(realm) {
+  function activityStatCards(realm, compact = false, growth = null) {
+    const summary = activity.todaySummary(S.accounts, S.activity, realm);
+    const hint = summary.pending.length
+      ? '待处理：' + activity.namesOf(summary.pending).join('、')
+      : '今天全部完成';
     if (realm === 'cn') {
-      return html`
-        <div class="card">
-          <div class="card-head">
-            <div>
-              <h2 class="card-title">${icon('CalendarCheck')}每日签到</h2>
-              <p class="card-sub">为每个国内版账号签到一次，领取当天的签到积分。签到结果与上游自动任务记录之后会一并出现在积分变动记录里。</p>
-            </div>
-            <button class="btn btn-primary btn-sm" @click=${busyClick(doCheckin)}>${icon('CalendarCheck')}开始签到</button>
-          </div>
-        </div>`;
+      const days = Number(growth && growth.streak_days) || 0;
+      return [
+        statCard({
+          label: '本期 Buddy 加油站活动',
+          value: activity.summaryText(summary, '已领', '未领'),
+          icon: 'Fuel',
+          tone: summary.total && summary.done === summary.total ? 'success' : 'warning',
+          hint,
+          compact,
+        }),
+        statCard({
+          label: '成长计划连登',
+          value: growth ? days + ' 天' : '—',
+          icon: 'Flame',
+          tone: days > 0 ? 'success' : 'warning',
+          hint: '连续登录活跃天数，由调度器每天上报',
+          compact,
+        }),
+      ];
     }
+    return [statCard({
+      label: '今日活跃打卡状态',
+      value: activity.summaryText(summary, '已打卡', '未打卡'),
+      icon: 'CalendarCheck',
+      tone: summary.total && summary.done === summary.total ? 'success' : 'warning',
+      hint,
+      compact,
+    })];
+  }
+
+  function activityStats(realm) {
+    return html`<div class="grid-stats">${activityStatCards(realm)}</div>`;
+  }
+
+  function dailyCard(realm) {
     return html`
       <div class="card">
         <div class="card-head">
           <div>
-            <h2 class="card-title">${icon('CalendarCheck')}每日活跃打卡</h2>
+            <h2 class="card-title">${icon('CalendarCheck')}今日活跃</h2>
             <p class="card-sub">每日活跃只认网页端对话：桌面身份打卡发送一条轻量对话，网页通道打卡只建立一个网页端会话。两者都会消耗少量积分，用于计入官方「每日活跃」。</p>
           </div>
           <div class="row-wrap">
             <button class="btn btn-primary btn-sm" title="为每个已启用的国际版账号发送一条轻量对话"
                     @click=${busyClick(doDailyChat)}>${icon('CalendarCheck')}每日活跃打卡</button>
+            <button class="btn btn-outline btn-sm" title="今天还没打卡的已启用国际版账号；已经打过的不再打第二遍"
+                    @click=${busyClick(doDailyChatPending)}>${icon('CalendarCheck')}未活跃打卡一键打卡</button>
             <button class="btn btn-outline btn-sm" title="只建网页端会话，不发送桌面端对话；会消耗少量积分"
                     @click=${doDailyChatWeb}>${icon('Globe')}网页通道打卡</button>
           </div>
         </div>
+        ${activityStats(realm)}
       </div>`;
   }
 
@@ -402,8 +469,8 @@ export function mount(host) {
           path: 'tasks',
           title: '任务',
           desc: realm === 'cn'
-            ? '国内版的每日签到、成长任务与猫猫日常，以及后台调度器状态与积分变动记录'
-            : '国际版的每日活跃打卡，以及后台调度器状态与积分变动记录',
+            ? '国内版的 Buddy 加油站、成长任务与猫猫日常，以及后台调度器状态与积分变动记录'
+            : '国际版的今日活跃打卡，以及后台调度器状态与积分变动记录',
           actions: html`<button class="btn btn-outline btn-sm" @click=${busyClick(refresh)}>${icon('RefreshCw')}刷新</button>`,
         })}
         ${S.error ? loadErrorPage(S.error, refresh) : nothing}
@@ -411,20 +478,20 @@ export function mount(host) {
         ${S.error ? nothing : html`
           <div class="tasks-switch">${segmented(sections(realm), S.mobileTab, switchSection, 'seg-sm')}</div>
           ${taskBlock('scheduler', schedulerCard(realm))}
-          ${taskBlock('daily', dailyCard(realm))}
+          ${realm === 'intl' ? taskBlock('daily', dailyCard(realm)) : nothing}
           ${taskBlock('growth', growthCard(realm))}
           ${taskBlock('credits', creditEventsCard(realm))}`}
       </div>`;
   }
 
-  // 移动端一次只显示一块，桌面端四块同时可见（与参考项目一致）。
+  // 移动端一次只显示一块，桌面端同时可见（与参考项目一致）。
   function sections(realm) {
-    return [
-      { id: 'scheduler', label: '调度器' },
-      { id: 'daily', label: realm === 'cn' ? '每日签到' : '每日打卡' },
-      { id: 'growth', label: '成长任务' },
-      { id: 'credits', label: '积分记录' },
-    ];
+    const items = [{ id: 'scheduler', label: '调度器' }];
+    if (realm === 'intl') items.push({ id: 'daily', label: '今日活跃' });
+    items.push({ id: 'growth', label: realm === 'cn' ? '任务与福利' : '成长任务' });
+    items.push({ id: 'credits', label: '积分记录' });
+    if (!items.some((item) => item.id === S.mobileTab)) S.mobileTab = 'scheduler';
+    return items;
   }
 
   function switchSection(id) {

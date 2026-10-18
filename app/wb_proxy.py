@@ -1,18 +1,3 @@
-#!/usr/bin/env python3
-"""WorkBuddy (workbuddy.ai) -> OpenAI-compatible reverse proxy.
-Reuses the credentials the WorkBuddy desktop app already stored on this machine
-(%%LOCALAPPDATA%%\\CodeBuddyExtension\\Data\\Public\\auth\\*.info), so no separate
-login is needed. Exposes:
-    GET  /v1/models
-    POST /v1/chat/completions     (stream=true and stream=false)
-    GET  /health
-Only the Python standard library is required.
-    python3 wb_proxy.py                    # bind 127.0.0.1:8788
-    python3 wb_proxy.py --port 9000
-    python3 wb_proxy.py --api-key sk-local # require a bearer token
-Launchers: start-wb-proxy.bat / start-wb-proxy-lan.bat on Windows,
-start-wb-proxy.command (or ./start-wb-proxy.sh) on macOS/Linux.
-"""
 import argparse
 import bisect
 import email.utils
@@ -23,26 +8,17 @@ from collections import deque
 import re
 import json
 import os
-# 单请求体上限。默认值从 50MB 收紧到 16MB，是「内存护栏」：body 先整体读成 bytes、
-# 再 decode 成 str、再 json.loads 成对象，实测 50MB body 的 decode+parse 峰值约
-# 109MB、单请求峰值约 160MB；而读 body 发生在 chat 信号量 acquire 之前、线程数又
-# 没有上限，路由器（可用内存约 480MB）上几个并发大 body 就能把机器打穿。
-# 权衡：另一条路是把 body 读取也纳入 chat 信号量，但那会改动 401/404/413 早退与
-# 503 的先后语义、并让慢客户端占着 slot 拖住信号量；只收紧默认值保守得多——16MB
-# 对正常客户端绰绰有余（Codex 1M token 上下文的 JSON 也只有几 MB），确需更大可
-# 显式设 WB_MAX_PAYLOAD_BYTES，内存代价由运维者自己拍板。
-MAX_PAYLOAD_BYTES = int(os.environ.get("WB_MAX_PAYLOAD_BYTES", 16 * 1024 * 1024))  # 16MB limit
-# Upstream chat calls may hold a handler thread for up to 600s, and every
-# request gets its own thread, so an unbounded pool lets a handful of slow
-# clients pin hundreds of threads and the memory behind them. Bound the number
-# of chat/responses requests in flight; dashboard and management calls are not
-# affected. Excess callers wait briefly, then get a 503 instead of queueing
-# forever.
+# 单请求体上限。body 会先整体读成 bytes、再 decode 成 str、最后 json.loads，
+# 峰值内存约为 body 的数倍；读取发生在 chat 信号量之前，处理线程数没有上限，
+# 几个并发大 body 就可能耗尽小内存设备。16MB 足够正常客户端使用，需要更大时
+# 显式设置 WB_MAX_PAYLOAD_BYTES，内存代价由部署方承担。
+MAX_PAYLOAD_BYTES = int(os.environ.get("WB_MAX_PAYLOAD_BYTES", 16 * 1024 * 1024))
+# 一次 chat 上游调用最长占用处理线程 600 秒，每个请求各占一个线程。
+# 并发 chat 与 responses 请求必须有上限，否则少量慢客户端就能占住大量线程
+# 与内存；面板与管理接口不受限制。超出的调用短暂等待后返回 503。
 #
-# The ceiling is a fixed 32 by default, which has nothing to do with how many
-# accounts the pool holds: a 200-account gateway and a 5-account gateway share
-# it. Set WB_MAX_CONCURRENT_CHAT=auto to size it from the pool instead - one
-# slot per ready account, never below 32. See resize_chat_slots().
+# 默认上限固定为 32，与账号池规模无关。设置 WB_MAX_CONCURRENT_CHAT=auto 时
+# 改按就绪账号数计算，每账号一个槽位，最低 32。见 resize_chat_slots。
 _CHAT_SLOTS_ENV = os.environ.get("WB_MAX_CONCURRENT_CHAT", "32").strip().lower()
 CHAT_SLOTS_AUTO = _CHAT_SLOTS_ENV in ("auto", "pool", "dynamic")
 CHAT_SLOTS_FLOOR = 32
@@ -85,17 +61,16 @@ response_to_message = wb_messages_responses.response_to_message
 stream_responses_to_message = wb_messages_responses.stream_responses_to_message
 IS_WINDOWS = os.name == "nt"
 
-# ---- 一键配置客户端（wb_agents）的可用性判定（issue #246）----
-# 这个功能写的是「网关进程所在机器」的客户端配置，所以只有在浏览器和网关
-# 同一台机器上打开看板时才成立。服务端 / Docker / OpenWrt 部署下看板都是
-# 远程打开的，改了也到不了用户自己的电脑，还会白白付出探测与常驻的开销。
-# 因此 wb_agents 改成懒加载：只有下面这道闸门放行、路由真的命中才 import。
+# 一键配置客户端只在看板与网关同机打开时可用。
+# 该功能写的是网关进程所在机器的客户端配置，服务端、Docker 与 OpenWrt 部署下
+# 看板是远程打开的，改动到不了用户电脑，还会白付探测与常驻开销。
+# wb_agents 因此懒加载：只有下面这道检查放行、路由真正命中时才 import。
 _AGENTS_MODULE = None
 _SERVER_DEPLOYMENT = None
 
 
 def agents_module():
-    """按需 import wb_agents；用不到它的部署连模块都不载入。"""
+    """按需 import wb_agents；用不到它的部署不载入该模块。"""
     global _AGENTS_MODULE
     if _AGENTS_MODULE is None:
         import wb_agents
@@ -104,10 +79,10 @@ def agents_module():
 
 
 def server_deployment_form():
-    """进程是否明显跑在服务端形态（容器 / OpenWrt）。
+    """进程是否以服务端形态运行，只认容器与 OpenWrt 标记。
 
-    只认环境标记；「看板是不是本机打开的」由 agents_client_allowed 按请求
-    来源地址判断。结果缓存——进程活着期间答案不会变。
+    看板是否本机打开由 agents_client_allowed 按请求来源地址判断。
+    结果缓存，进程存活期间不变。
     """
     global _SERVER_DEPLOYMENT
     if _SERVER_DEPLOYMENT is None:
@@ -135,10 +110,10 @@ def server_deployment_form():
 
 
 def agents_client_allowed(client_address):
-    """这个来源地址能不能用一键配置：只认回环。
+    """这个来源地址能否使用一键配置，只接受回环地址。
 
-    非回环说明看板是远程打开的（手机、另一台电脑、容器端口映射），此时
-    apply 改的是容器 / 服务器里的配置目录，需求不成立，直接按不可用处理。
+    非回环说明看板是远程打开的，例如手机、另一台电脑或容器端口映射；
+    此时 apply 改的是容器或服务器里的配置目录，按不可用处理。
     """
     if server_deployment_form():
         return False
@@ -152,10 +127,10 @@ def agents_client_allowed(client_address):
 def enrich_agent_models(models, specs):
     """把只有 id 的模型条目补上网关自己的目录规格。
 
-    看板送过来的是一串模型 id，而 DSH / Crush 这类客户端要把规格写进自己的
-    配置（上下文窗口、输出上限、思考档位）才会生成对应控件——只写 id 时它们
-    只能吃自己的内置默认值，档位选择器根本不会出现。`specs` 是
-    {"模型 id": 规格}；条目里显式带来的字段优先（空值不算显式）。
+    看板送来的是一串模型 id，而 DSH、Crush 这类客户端要把规格写进自己的配置，
+    包括上下文窗口、输出上限与思考档位，才会生成对应控件；只写 id 时它们
+    只能使用内置默认值，档位选择器不会出现。`specs` 是模型 id 到规格的映射，
+    条目里显式带来的字段优先，空值不算显式。
     """
     if not specs:
         return models
@@ -172,57 +147,47 @@ def enrich_agent_models(models, specs):
 
 
 def launcher_hint(port):
-    """Platform-appropriate launcher command for starting on another port."""
+    """在另一个端口启动网关时使用的启动命令。"""
     if IS_WINDOWS:
         return "start-wb-proxy.bat %d" % port
     return "./start-wb-proxy.sh %d" % port
 def port_owner_hint(port):
-    """Command that lists the process holding a local TCP port."""
+    """列出占用本地 TCP 端口的进程的命令。"""
     if IS_WINDOWS:
         return "netstat -ano | findstr :%d" % port
     return "lsof -nP -iTCP:%d -sTCP:LISTEN" % port
 CURRENT_REALM = os.environ.get("WB_PROXY_DEFAULT_REALM", "intl")
-def detect_model_realm(model_id):
-    if not model_id:
-        return CURRENT_REALM
-    m = str(model_id).lower()
-    intl_only = {
-        "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-        "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash",
-        "grok-4.7"
-    }
-    if m in intl_only or any(m.startswith(p) for p in ("gpt-", "gemini-")):
-        return "intl"
-    cn_only = {
-        "deepseek-v4-pro", "minimax-m3", "minimax-m2.7", "minimax-m2.5",
-        "glm-5.1", "glm-5.0-turbo", "glm-4.6v",
-        "kimi-k3-1", "kimi-k2.7", "kimi-k2-thinking",
-        "hy3-x", "hy4-preview-dev", "hy4-preview-x"
-    }
-    if m in cn_only or any(m.startswith(p) for p in ("minimax-", "deepseek-v4-pro")):
-        return "cn"
-    return CURRENT_REALM
-# glm-5.3-flash was listed as cn-only, but the international exit serves it:
-# an official intl account posting to www.workbuddy.ai gets HTTP 200, and the
-# intl desktop client ships it in its own model list. Only deepseek-v4-pro
-# still answers "service info not found" there.
-# Models that exist on one side only. Everything else (deepseek-v4.1-flash,
-# hy3, glm-5.3 ...) is served by both exits, so it must not be treated as a
-# conflict.
 INTL_EXCLUSIVE_PREFIXES = ("gpt-", "gemini-")
-CN_EXCLUSIVE_PREFIXES = ("minimax-", "deepseek-v4-pro")
 INTL_EXCLUSIVE = {
     "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
     "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash",
     "grok-4.7",
 }
+_CN_DETECT_ONLY = {
+    "deepseek-v4-pro", "minimax-m3", "minimax-m2.7", "minimax-m2.5",
+    "glm-5.1", "glm-5.0-turbo", "glm-4.6v",
+    "kimi-k3-1", "kimi-k2.7", "kimi-k2-thinking",
+    "hy3-x", "hy4-preview-dev", "hy4-preview-x",
+}
+def detect_model_realm(model_id):
+    if not model_id:
+        return CURRENT_REALM
+    m = str(model_id).lower()
+    if m in INTL_EXCLUSIVE or m.startswith(INTL_EXCLUSIVE_PREFIXES):
+        return "intl"
+    if m in _CN_DETECT_ONLY or m.startswith(("minimax-", "deepseek-v4-pro")):
+        return "cn"
+    return CURRENT_REALM
+# 只在单侧出口提供的模型。deepseek-v4.1-flash、hy3、glm-5.3 等两侧都提供，
+# 不能按冲突处理。glm-5.3-flash 由国际出口提供，也不在单侧列表里。
+CN_EXCLUSIVE_PREFIXES = ("minimax-", "deepseek-v4-pro")
 CN_EXCLUSIVE = {
     "deepseek-v4-pro", "glm-5.1", "glm-5v-turbo",
     "kimi-k3-1", "kimi-k2.7", "minimax-m3",
     "hy3-x", "hy4-preview-dev", "hy4-preview-x",
 }
 def exclusive_realm(model_id):
-    """"intl"/"cn" when only that exit serves the model, else ""."""
+    """只有单侧出口提供时返回 "intl" 或 "cn"，否则返回空串。"""
     if not model_id:
         return ""
     m = str(model_id).lower()
@@ -234,15 +199,12 @@ def exclusive_realm(model_id):
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 def install_console_close_handler():
-    """Release the port when the console window is closed by the user.
-    Windows does not kill child processes when a console window closes, so
-    the proxy (started by the .bat as a child of cmd.exe) would survive and
-    keep the port bound - the next launch then wrongly reports "another
-    proxy is already running".
-    Closing the window raises CTRL_CLOSE_EVENT in every process attached to
-    that console, which is exactly the signal we want. Registering a handler
-    for it is event-driven, so unlike polling a parent pid there is no
-    chance of a false positive. Harmless when started without a console.
+    """控制台窗口被关闭时释放端口。
+
+    Windows 关闭控制台不会杀掉子进程，由 .bat 启动的网关会继续运行并占着
+    端口，下一次启动就会误报已有实例在运行。关闭窗口会向同一控制台的所有
+    进程发送 CTRL_CLOSE_EVENT，注册处理函数即可在事件发生时退出，不必轮询
+    父进程号。没有控制台时注册无副作用。
     """
     if os.name != "nt":
         return None
@@ -269,21 +231,20 @@ def install_console_close_handler():
         return None
 
 # ---------------------------------------------------------------------------
-# 日志终端查看器（双进程模型）
+# 日志终端查看器采用双进程模型。
 #
-# 服务进程以 pythonw 静默后台运行（无窗口、关闭任何窗口都不停）。用户看到的
-# "终端"是一个独立的 console_tail.py 进程——它只连本地 /logs 接口实时打印日志，
-# 关掉它不影响服务。启动脚本会弹一个；面板眼睛按钮可以再开/关一个。
+# 服务进程由 pythonw 静默后台运行，没有窗口，关闭窗口也不会停止。用户看到的
+# 终端是独立的 console_tail.py 进程，只连本地 /logs 接口实时打印日志，关掉它
+# 不影响服务。启动脚本会打开一个，面板的眼睛按钮可以再开或关一个。
 # ---------------------------------------------------------------------------
 CONSOLE_VIEWER_PROC = None
 _LISTEN_PORT = 8788
 
 def _console_python():
-    """Find a console (windowed) python next to the running interpreter.
+    """找到当前解释器旁边带控制台的 python。
 
-    The service is launched with pythonw (GUI subsystem, no console), so
-    sys.executable is pythonw.exe. To open a visible viewer window we need the
-    console sibling (python.exe) in the same directory.
+    服务由 pythonw 启动，sys.executable 指向 pythonw.exe；要打开可见窗口，
+    需要同目录下的 python.exe。找不到时返回当前解释器。
     """
     exe = sys.executable or "python"
     d = os.path.dirname(exe)
@@ -300,11 +261,10 @@ def _console_viewer_running():
     return bool(CONSOLE_VIEWER_PROC and CONSOLE_VIEWER_PROC.poll() is None)
 
 def _launch_console_viewer():
-    """Launch console_tail.py in its own NEW console window.
+    """在独立的新控制台窗口启动 console_tail.py。
 
-    Returns True on launch, False if already running, None if the script is
-    missing. A server-generated panel token is passed so the viewer works even
-    if the panel password was changed from the default.
+    启动成功返回 True，已在运行返回 False，脚本不存在返回 None。
+    传入服务端生成的面板令牌，面板密码被修改后查看器仍可用。
     """
     global CONSOLE_VIEWER_PROC
     if _console_viewer_running():
@@ -321,7 +281,7 @@ def _launch_console_viewer():
     try:
         proc = subprocess.Popen(
             [py, "-u", script, "--port", str(_LISTEN_PORT), "--token", token],
-            creationflags=0x00000010,  # CREATE_NEW_CONSOLE
+            creationflags=0x00000010,  # 新建控制台窗口
             stdin=subprocess.DEVNULL,
         )
         CONSOLE_VIEWER_PROC = proc
@@ -347,17 +307,13 @@ MODELS_PATH = "/v2/enterprises/personal/models"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 
 # ---------------------------------------------------------------------------
-# Background-model redirection (desktop clients).
+# 桌面客户端的后台模型改写。
 #
-# A desktop client's model picker only governs the MAIN chat thread. Its
-# built-in "model routing config" (codex-apps/protocol/src/model-routing-config.ts)
-# sends background work - memory generation, ambient suggestions, ephemeral
-# generation, automations - to its own hard-coded models. Those requests hit
-# this gateway on the same key as normal traffic, so they keep burning paid
-# credits even when a free model is selected in the UI.
+# 客户端的模型选择只作用于主对话线程。内置的 model routing config 会把记忆
+# 生成、环境建议、临时生成与自动化等后台任务发到它硬编码的模型；这些请求
+# 同样走网关并消耗付费积分，即使用户在界面里选了免费模型。
 #
-# Rewrite them to a free target so the client features keep working without
-# spending credits. Override without editing code:
+# 这里把它们改写到免费目标，客户端功能照常工作但不花积分。可用环境变量覆盖：
 #   WB_BACKGROUND_MODEL_NAMES="gpt-5.6-terra,gpt-5.6-luna,gpt-5.3-codex"
 #   WB_BACKGROUND_MODEL_TARGET="deepseek-v4.1-flash"
 # ---------------------------------------------------------------------------
@@ -373,7 +329,7 @@ BACKGROUND_MODEL_NAMES = tuple(
 
 
 def _apply_background_model_alias(payload):
-    """Rewrite known client background-task models to a free target model."""
+    """把客户端已知的后台任务模型改写为免费目标模型。"""
     if not isinstance(payload, dict):
         return
     name = payload.get("model")
@@ -385,21 +341,20 @@ def _apply_background_model_alias(payload):
     log("alias: background model %s -> %s" % (name, BACKGROUND_MODEL_TARGET))
 
 
-# The WorkBuddy AI desktop app caches its account product config here on every
-# launch. That file carries the real model catalog the app shows in its picker
-# (21 models, incl. deepseek-v4.1-flash / gpt-6-astra) - the CLI-facing
-# /v2/enterprises/personal/models endpoint returns a narrower list, so prefer
-# the cache and fall back to the endpoint.
+# WorkBuddy AI 桌面应用每次启动会把账号产品配置缓存到这里。该文件带有应用
+# 模型选择器展示的真实目录，共 21 个模型，含 deepseek-v4.1-flash 与
+# gpt-6-astra；CLI 使用的 /v2/enterprises/personal/models 端点返回的列表更窄，
+# 因此优先读缓存，读取失败再回退到端点。
 PRODUCT_CONFIG_CACHE = os.path.join(os.path.expanduser("~"), ".workbuddy-ai", "cache", "acc-product-config-v3.json")
 NOISE_KEYS = ("extra_fields", "refusal", "reasoning_content")
 _CHUNK_SIZE_RE = re.compile(rb"[0-9A-Fa-f]{1,16}")
 
 
 def _chunk_size(line):
-    """Chunk size from a chunked-encoding size line, None when malformed.
+    """从 chunked 编码长度行取出块大小，格式不合法返回 None。
 
-    int(x, 16) alone also takes "-30d40" or "+1f"; a negative size would
-    lower the running total under the payload cap.
+    直接用 int(x, 16) 还会接受 "-30d40" 与 "+1f"；负数会让累计长度落到
+    请求体上限之下。
     """
     field = line.split(b";", 1)[0].strip()
     if not _CHUNK_SIZE_RE.fullmatch(field):
@@ -408,23 +363,36 @@ def _chunk_size(line):
 
 
 class BodyTooLarge(Exception):
-    """Raised when a request body exceeds the configured cap."""
+    """请求体超过配置上限时抛出。"""
     def __init__(self, length):
         super(BodyTooLarge, self).__init__(length)
         self.length = length
 class BadJSON(Exception):
-    """Raised when a request body is present but not a JSON object."""
-# CORS is only needed by browser-based chat clients that call the OpenAI-style
-# API from another origin. Management routes (accounts, settings, usage,
-# scheduler, panel) serve the dashboard, which is same-origin, so they get no
-# ACAO header - that keeps a stray page on the LAN from reading their replies.
+    """请求体存在但不是 JSON 对象时抛出。"""
+# CORS 只用于浏览器里的聊天客户端跨源调用 OpenAI 风格接口。
+# 管理路由由看板同源访问，不返回 ACAO 头，局域网里的其他页面因此读不到响应。
+# 位于 /v1 下的管理路径不能被当作 API，例如 /v1/usage 报告账号支出并受面板会话保护。
 CORS_PATH_PREFIXES = ("/v1", "/chat", "/completions", "/models", "/responses")
-# Management paths that happen to live under /v1 must not be treated as API:
-# /v1/usage reports account-level spend and is gated by the panel session.
 MANAGEMENT_PATH_PREFIXES = ("/v1/usage", "/usage", "/accounts", "/settings",
                             "/tasks", "/scheduler", "/panel", "/logs")
+
+#: 账号被上游限制、网关停止时仍然拒绝的 POST 路径。只放行本机管理动作
+#: （启停账号、导入导出、设置），凡是会带账号令牌访问上游的入口都返回 503。
+STAND_DOWN_POST_PATHS = frozenset((
+    "/v1/chat/completions", "/chat/completions",
+    "/v1/completions", "/completions",
+    "/v1/responses", "/responses",
+    "/v1/messages", "/messages",
+    "/v1/messages/count_tokens", "/messages/count_tokens",
+    "/accounts/checkin", "/accounts/credits",
+    "/accounts/daily-chat", "/accounts/daily-chat-web",
+    "/accounts/test", "/accounts/test-all", "/accounts/refresh",
+    "/accounts/login/start",
+    "/tasks/run", "/tasks/travel", "/tasks/streak-bonus",
+    "/scheduler/trigger", "/catalog/refresh",
+))
 def cors_origin_allowed(path):
-    """True when the OpenAI-style API path should advertise CORS."""
+    """OpenAI 风格 API 路径是否需要返回 CORS 头。"""
     path = (path or "").split("?")[0]
     if path.startswith(MANAGEMENT_PATH_PREFIXES):
         return False
@@ -433,20 +401,12 @@ _lock = threading.Lock()
 _login_lock = threading.Lock()
 _chat_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CHAT)
 def resize_chat_slots(ready_accounts):
-    """Size the chat concurrency ceiling from the pool, when asked to.
+    """按账号池规模调整 chat 并发上限，仅在配置为 auto 时生效。
 
-    With WB_MAX_CONCURRENT_CHAT=auto the ceiling becomes one slot per ready
-    account (never below CHAT_SLOTS_FLOOR), so the gateway scales with the pool
-    it actually has instead of a constant that fits neither a 5-account nor a
-    200-account deployment. A fixed numeric WB_MAX_CONCURRENT_CHAT keeps the
-    1.6.x behaviour and makes this a no-op.
-
-    Only ever grows the ceiling. Requests already holding a slot keep theirs -
-    replacing the semaphore cannot revoke a permit - so a shrink would let the
-    in-flight count exceed the new ceiling and the surplus releases would raise
-    ValueError from BoundedSemaphore. Growing is the direction that matters:
-    the pool is loaded once at startup, so in practice this runs before the
-    listener accepts anything.
+    WB_MAX_CONCURRENT_CHAT=auto 时，上限等于就绪账号数，最低 CHAT_SLOTS_FLOOR；
+    固定数字配置下本函数不做任何事。上限只增不减：已在执行的请求持有旧信号量
+    的许可，缩小上限会让在途数量超过新上限，多余的释放会让 BoundedSemaphore
+    抛出 ValueError。账号池在启动时加载一次，实际调用发生在监听开始之前。
     """
     global _chat_slots, MAX_CONCURRENT_CHAT
     if not CHAT_SLOTS_AUTO:
@@ -462,10 +422,10 @@ def resize_chat_slots(ready_accounts):
     log("chat slots : %d (one per ready account; WB_MAX_CONCURRENT_CHAT=auto)"
         % wanted)
     return wanted
-_login_attempts = {}  # ip -> list of timestamp
+_login_attempts = {}  # ip -> 时间戳列表
 def _prune_login_attempts(now=None, window=60):
-    """Drop stale per-IP entries so the dict cannot grow without bound.
-    Caller must hold _login_lock.
+    """清理过期的按 IP 记录，避免字典无界增长。
+    调用方必须持有 _login_lock。
     """
     now = now or time.time()
     for ip in list(_login_attempts.keys()):
@@ -474,19 +434,15 @@ def _prune_login_attempts(now=None, window=60):
             _login_attempts[ip] = recent
         else:
             del _login_attempts[ip]
-# --------------------------------------------------- 面板登录限流的来源判定
-# 限流按「客户端 IP」分桶（每 IP 5 次失败 / 60 秒），但反代部署下 socket 对端
-# 永远不是真实客户端：路由器上 nginx 把 ai.home 转给 127.0.0.1:8788，所有请求
-# 的对端都是 127.0.0.1。若照旧拿对端地址当键，任意一个人连错 5 次密码，就会把
-# 所有经反代的用户、连同跑在同一台机器上的缓存预热器一起锁死 60 秒——实测里
-# 预热器被 429 打掉后直接打印"登录失败（http=429），跳过本轮"，缓存转冷，
-# 用户点开统计页要付一次全表扫描。所以键要取「真实来源」，且只在对端可信时
-# 才读代理头：对端是回环地址（本机代理）或显式列进 WB_TRUSTED_PROXIES 的代理
-# 时，按 X-Real-IP（优先）或 X-Forwarded-For 的第一个地址分桶；其余对端一律
-# 忽略这两个头、仍按对端地址分桶——公网客户端不能靠伪造头换个桶绕过限流。
+# 面板登录限流按客户端 IP 分桶，每个 IP 60 秒内允许 5 次失败。
+# 反向代理部署下 socket 对端不是真实客户端：路由器上的 nginx 转发到
+# 127.0.0.1:8788 时，所有请求的对端都是 127.0.0.1。分桶键要取真实来源，
+# 且只在对端可信时读取代理头：对端是回环地址或显式列入 WB_TRUSTED_PROXIES 时，
+# 按 X-Real-IP 优先，其次取 X-Forwarded-For 的第一个地址；其余对端忽略这两个
+# 头，仍按对端地址分桶，公网客户端无法伪造头绕过限流。
 def parse_trusted_proxies(raw):
-    """解析 WB_TRUSTED_PROXIES：逗号分隔的 IP 或 CIDR（如 10.0.0.1,fd00::/8）。
-    解析不了的条目直接丢弃：一个笔误不该让网关起不来。
+    """解析 WB_TRUSTED_PROXIES，逗号分隔的 IP 或 CIDR，例如 10.0.0.1,fd00::/8。
+    无法解析的条目直接丢弃，拼写错误不应阻止网关启动。
     """
     entries = []
     for item in str(raw or "").split(","):
@@ -500,14 +456,14 @@ def parse_trusted_proxies(raw):
     return tuple(entries)
 TRUSTED_PROXIES = parse_trusted_proxies(os.environ.get("WB_TRUSTED_PROXIES", ""))
 def peer_is_trusted(peer_ip):
-    """对端是否有资格代表它的客户端说话：回环（本机反代）或显式配置的代理。"""
+    """对端是否有资格代表客户端：回环地址或显式配置的代理。"""
     try:
         addr = ipaddress.ip_address(str(peer_ip))
     except ValueError:
         return False
-    # Windows 双栈下连 127.0.0.1 的对端会显示成 ::ffff:127.0.0.1。ipaddress 在
-    # Python 3.13 之前不把 IPv4-mapped 地址算作回环（.is_loopback 为 False），
-    # 于是本机反代的请求会被当成不可信来源，限流桶退化成所有客户端共用一个。
+    # Windows 双栈下连 127.0.0.1 的对端会显示为 ::ffff:127.0.0.1。Python 3.13
+    # 之前的 ipaddress 不把 IPv4 映射地址视为回环，本机反代会被当成不可信来源，
+    # 限流桶退化成所有客户端共用一个。
     mapped = addr.ipv4_mapped if addr.version == 6 else None
     if addr.is_loopback or (mapped is not None and mapped.is_loopback):
         return True
@@ -515,12 +471,12 @@ def peer_is_trusted(peer_ip):
         if addr.version == net.version and addr in net:
             return True
     return False
-_PROXY_HEADER_IP_MAX = 64  # 最长的 IPv6 文本也到不了 46 字符，再长就是垃圾
+_PROXY_HEADER_IP_MAX = 64  # 最长的 IPv6 文本也不到 46 字符，再长就是垃圾
 def _proxy_header_ip(value):
-    """从代理头里取一个合法 IP 的规范文本；取不到返回 None（绝不抛异常）。
+    """从代理头取出合法 IP 的规范文本，取不到返回 None，不抛异常。
 
-    接受裸 IPv4/IPv6，也接受 nginx 变体可能写出的 host:port / [v6]:port；
-    多值（含逗号）、超长、其余畸形串一律判为不可用，由调用方决定回退。
+    接受裸 IPv4 或 IPv6，也接受 nginx 可能写出的 host:port 与 [v6]:port；
+    含逗号的多值、超长及其他畸形串一律判为不可用，由调用方决定回退。
     """
     text = str(value or "").strip()
     if not text or len(text) > _PROXY_HEADER_IP_MAX or "," in text:
@@ -542,9 +498,9 @@ def _proxy_header_ip(value):
 def login_rate_limit_key(peer_ip, headers):
     """限流键：对端可信时取代理头里的真实客户端 IP，否则取对端地址。
 
-    X-Real-IP 优先（nginx 里放的就是真实来源），其次 X-Forwarded-For 的
-    第一个（链上最左是最初的客户端）。头不可用就退回对端地址：宁可让经
-    反代的客户端共用一个桶（退化为旧行为），也不能拿解析不出来的串当键。
+    X-Real-IP 优先，nginx 里放的就是真实来源；其次取 X-Forwarded-For 的
+    第一个地址，链上最左是最初的客户端。头不可用时回退到对端地址，不能拿
+    解析不出来的串当键。
     """
     if not peer_is_trusted(peer_ip):
         return peer_ip
@@ -558,29 +514,26 @@ def login_rate_limit_key(peer_ip, headers):
         return via_chain
     return peer_ip
 _models_cache = {"intl": {"at": 0.0, "data": None}, "cn": {"at": 0.0, "data": None}}
-#: 目录来源追踪（面板展示用）：每个 realm 最近一次构建/刷新清单的出处。
-#: source 取值见 catalog_meta()；fetched_at 是网关拿到这批数据的时刻；
-#: file_mtime 是桌面缓存文件自己的写入时刻（仅配置文件来源，可能远早于
-#: fetched_at——那正是「清单是不是新鲜」的证据）。与 _models_cache 同批更新。
+#: 目录来源追踪，供面板展示：每个 realm 最近一次构建或刷新清单的出处。
+#: source 取值见 catalog_meta；fetched_at 是网关拿到数据的时刻；file_mtime 是
+#: 桌面缓存文件的写入时刻，仅配置文件来源有，可能远早于 fetched_at，正是
+#: 清单新鲜度的证据。与 _models_cache 同批更新。
 _catalog_meta = {}
-# Raw catalogue names the curation rules dropped, per realm. The panel shows
-# them as switched-off rows instead of losing them silently.
+# 每个 realm 被筛选规则丢弃的原始目录名称，面板把它们显示为关闭行。
 _catalog_excluded = {}
-# Raw model ids from the last source, before curation, so the panel can show
-# the names the rules dropped.
+# 上一次来源的原始模型 id，未经筛选，面板据此显示被规则丢弃的名称。
 _catalog_raw = {}
 _catalog_raw_meta = {}
-#: 目录落盘存档：每次成功从上游 /v3/config 拉到清单就写一份响应体副本，纯留档
-#: （网关自己不读它）。与 usage 一样运行时产生、在 .gitignore 里，不参与提交
-#: 与更新；覆盖目录用 WB_PROXY_CATALOG_DIR。
+#: 目录落盘存档：每次成功从上游 /v3/config 拉到清单就写一份响应体副本，仅留档，
+#: 网关自己不读。与 usage 一样运行时产生并列入 .gitignore；目录用
+#: WB_PROXY_CATALOG_DIR 覆盖。
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(APP_DIR)
 VERSION = "0.2.0"
 CATALOG_CACHE_DIR = os.environ.get("WB_PROXY_CATALOG_DIR") \
     or os.path.join(PROJECT_DIR, "catalog")
-# Usage accounting: every upstream response carries a usage block, and the
-# proxy also records one JSONL line per request. Defaults to a folder next to
-# this script; override with --usage-dir or WB_PROXY_USAGE_DIR.
+# 用量记账：每个上游响应都带 usage 块，网关同时为每个请求写一行 JSONL。
+# 默认目录在本脚本旁边，可用 --usage-dir 或 WB_PROXY_USAGE_DIR 覆盖。
 USAGE_DIR = os.environ.get("WB_PROXY_USAGE_DIR") \
     or os.path.join(PROJECT_DIR, "usage")
 USAGE_LOG = os.path.join(USAGE_DIR, "usage.jsonl")
@@ -597,43 +550,39 @@ WEB_CONTENT_TYPES = {
 }
 USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
                 "cached_tokens", "total_tokens", "credit")
-# Web-panel access control. The panel is gated by its own password (default
-# "admin"), independent of the /v1 API key. Sessions live in memory only, so a
-# restart forces browsers to log in again.
+# 看板访问控制：看板使用独立密码，默认 admin，与 /v1 API key 无关。
+# 会话只存在内存里，重启后浏览器需要重新登录。
 PANEL = wb_settings.PanelSessions()
 API_KEY_FILE_SET = False
 def configured_keys():
-    """Panel-managed API keys, always read fresh so panel edits apply at once."""
+    """面板管理的 API key，每次重新读取，面板修改立即生效。"""
     try:
         return wb_settings.api_keys(ACCOUNTS_DIR)
     except Exception as exc:
         log("could not read api keys: %s" % exc)
         return []
 def auth_required():
-    """Whether /v1 calls must present a key at all."""
+    """调用 /v1 接口是否必须提供 key。"""
     if wb_settings.auth_disabled(ACCOUNTS_DIR):
         return False
     if any(entry.get("enabled") for entry in configured_keys()):
         return True
     return bool(API_KEY)
 def identify_key(supplied):
-    """Return the key entry a caller used, or None when nothing matches.
-    Once the panel has at least one key, those keys are the only accepted
-    credentials - otherwise a launcher key left in a .bat file would silently
-    keep working after the panel was locked down.
+    """返回调用方使用的 key 条目，没有匹配时返回 None。
+
+    面板配置了至少一个 key 后，这些 key 是唯一接受的凭据，启动参数里的
+    本地 key 不能继续生效。
     """
     extra = () if configured_keys() else (API_KEY,)
     return wb_settings.match_api_key(ACCOUNTS_DIR, supplied, extra_keys=extra)
 # ---------------------------------------------------------------------------
-# API Key 的日志显示名（issue #397）
+# API Key 在日志里的显示名。
 # ---------------------------------------------------------------------------
-# 请求日志原本只到账号粒度（`acct=`）。多人共用一个网关时，看到异常流量分不清
-# 「是哪个人发起的」——只能事后去用量页倒推。这里把 key 的 name（没填 name 就
-# 回退 id）拼进日志行。
-#
-# 只做「id -> 显示名」的只读查表：key 本身仍由调用方显式传入（理由见
-# record_usage 的说明），不引入线程局部的隐式通道。名单带短 TTL 缓存，
-# 避免每条请求都读一次 settings.json。
+# 请求日志按账号记录时，多人共用网关无法分辨发起人。这里把 key 的 name 拼进
+# 日志行，未填 name 时使用 id。只做 id 到显示名的只读查表，key 本身仍由调用方
+# 显式传入，见 record_usage 的说明；名单带短 TTL 缓存，避免每条请求都读
+# settings.json。
 _KEY_LABEL_TTL = 5.0
 _KEY_LABEL_FALLBACK = "(切换前)"
 _key_label_cache = {"at": 0.0, "map": {}}
@@ -641,10 +590,10 @@ _key_label_lock = threading.Lock()
 
 
 def key_label(key_id):
-    """key 的 settings id -> 日志里显示的名字；name 为空就回退 id。
+    """key 的 settings id 到日志显示名；name 为空时回退 id。
 
-    空 id（未带 key / 面板会话 / 未配置 key 的部署）返回空串 —— 调用方据此
-    决定要不要拼这一段；未知 id 原样返回，日志里仍能对上一个具体的 key。
+    空 id 包括未带 key、面板会话与未配置 key 的部署，返回空串，调用方据此
+    决定是否拼接这一段；未知 id 返回「已删除的 Key」，日志里仍能对应到具体 key。
     """
     if not key_id:
         return ""
@@ -677,27 +626,23 @@ def _empty_stats():
             "reasoning_tokens": 0, "cached_tokens": 0, "total_tokens": 0,
             "credit": 0.0, "cost_cny": 0.0, "cost_missing": {},
             "started": time.time(), "by_model": {},
-            # Same aggregation keyed by (model, realm), so the metrics table
-            # can show one row per exit for a model that ran through both.
+            # 按 (model, realm) 再聚合一份，指标表可以按出口分行。
             "by_model_realm": {},
-            # And again keyed by (model, realm, account), so a model served
-            # by two accounts on the same exit can be split per account.
+            # 再按 (model, realm, account) 聚合，同一出口上的多个账号可以分开显示。
             "by_model_acct": {},
-            # latency accumulators (averages; percentiles come from the JSONL)
+            # 延迟累加器，用于平均值；分位仍从 JSONL 原始样本计算。
             "ttft_ms_sum": 0, "ttft_samples": 0,
             "gen_ms_sum": 0, "gen_samples": 0,
             "wall_ms_sum": 0, "wall_samples": 0}
-# 进程启动时刻。快照的 "started"/"since" 从这里取（_usage_snapshot_uncached
-# 是它唯一的读者）；requests/ttft/by_model 那些累计字段没有任何读者——每个
-# 聚合都重读 usage.jsonl——所以请求路径不再维护它们。
+# 进程启动时刻。快照的 "started" 与 "since" 从这里取，_usage_snapshot_uncached
+# 是唯一读者；requests、ttft、by_model 等累计字段没有读者，请求路径不维护。
 _usage = {"started": time.time()}
 def normalize_usage_cache_aliases(usage):
-    """Write the best cache-hit value into every alias.
+    """把最可信的缓存命中值写入所有别名。
 
-    Some responses carry the real hit in prompt_tokens_details.cached_tokens
-    while also emitting cache_read_input_tokens: 0 / cached_tokens: 0
-    compatibility aliases; strict downstream parsers may prefer the zero
-    aliases and lose the hit. Mutates and returns the usage dict.
+    有些响应在 prompt_tokens_details.cached_tokens 里给出真实命中，同时输出
+    值为 0 的兼容别名 cache_read_input_tokens 与 cached_tokens；严格的下游
+    解析器可能优先取 0 别名而丢掉命中。函数原地修改并返回 usage。
     """
     if not isinstance(usage, dict):
         return usage
@@ -710,7 +655,7 @@ def normalize_usage_cache_aliases(usage):
     prompt_details = dict(usage.get("prompt_tokens_details") or {})
     prompt_details["cached_tokens"] = best
     usage["prompt_tokens_details"] = prompt_details
-    # Also ensure input_tokens_details carries it when present
+    # input_tokens_details 存在时一并写入
     if isinstance(usage.get("input_tokens_details"), dict):
         input_details = dict(usage["input_tokens_details"])
         input_details["cached_tokens"] = best
@@ -719,7 +664,7 @@ def normalize_usage_cache_aliases(usage):
 
 
 def _extract_usage(usage):
-    """Normalize the upstream usage block into the fields we track."""
+    """把上游 usage 块归一为网关跟踪的字段。"""
     if not usage:
         return {}
     details = usage.get("completion_tokens_details") or {}
@@ -732,12 +677,10 @@ def _extract_usage(usage):
         "credit": usage.get("credit") or 0,
     }
 def row_realm(row):
-    """The realm a log row belongs to.
+    """日志行所属的 realm。
 
-    Rows written since the field was added carry it directly. Older rows are
-    attributed by their account, then by the model's home realm - the same
-    order row_matches_realm used, so a filter and a per-realm breakdown can
-    never disagree about the same row.
+    带 realm 字段的行直接返回该字段。老行先按账号归属，再按模型所属区域归属，
+    顺序与 row_matches_realm 一致，过滤与按区域汇总不会对同一行给出不同答案。
     """
     r = row.get("realm")
     if r:
@@ -754,21 +697,16 @@ def row_realm(row):
 
 
 def row_matches_realm(row, realm):
-    # None means every realm. "all" is accepted here as well so that a caller
-    # that forwards the literal cannot silently match nothing: the previous
-    # behaviour compared every row's realm against the string "all".
+    # None 表示全部 realm。"all" 也按全部处理，调用方直接传字面量时不会匹配空。
     if not realm or realm == "all": return True
     return row_realm(row) == realm
 def realm_scope(realm, fallback=None):
-    """Map a caller-supplied realm onto a log filter.
+    """把调用方给的 realm 映射为日志过滤条件。
 
-    "all" means every realm, so it becomes None and disables filtering
-    entirely: passing the literal through would make row_matches_realm
-    compare every row against "all" and match nothing at all. An empty
-    or missing value falls back to the second argument: CURRENT_REALM for
-    the endpoints whose clients expect the global switch, None (everything)
-    for the analytics payload, which has always reported both realms
-    combined.
+    "all" 表示全部 realm，映射为 None 并关闭过滤；直接传字面量会让
+    row_matches_realm 把每行与 "all" 比较，结果什么都不匹配。空值或缺省值
+    回退到第二个参数：全局开关类接口用 CURRENT_REALM，分析载荷用 None，
+    后者始终统计两个区域。
     """
     if realm == "all":
         return None
@@ -776,34 +714,30 @@ def realm_scope(realm, fallback=None):
 
 
 def _local_midnight(ts=None, days_back=0):
-    """Local midnight `days_back` days before `ts` (default: now).
+    """ts 之前 days_back 天的本地午夜，ts 缺省为当前时刻。
 
-    mktime normalises an out-of-range day, so stepping back past the 1st of a
-    month still lands on a real local midnight instead of raising.
+    mktime 会规范化越界的日号，回退跨月时仍落在真实存在的本地午夜，不会抛错。
     """
     lt = time.localtime(ts if ts is not None else time.time())
     return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday - days_back, 0, 0, 0, 0, 0, -1))
 
 
 def _local_hour_start(ts):
-    """ts 所属的本地整点（分/秒归零）的 epoch。
+    """ts 所属本地整点的 epoch，分与秒归零。
 
-    与 _local_midnight 同一套构造：mktime 把本地墙上时间换算回 epoch，
-    分/秒归零就是「本地整点」。夏令时切换小时里的时间会被 mktime 规整到
-    相邻的真实时刻，所以调用方还要比对返回值是否等于原值——只有能原样
-    还原的 ts 才是真的落在整点上（见 _hour_window_key）。
+    与 _local_midnight 同一套构造：mktime 把本地墙上时间换算回 epoch。
+    夏令时切换小时里的时间会被规整到相邻时刻，所以调用方需要比对返回值是否
+    等于原值，只有原样还原的 ts 才真正落在整点上，见 _hour_window_key。
     """
     lt = time.localtime(ts)
     return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour, 0, 0, 0, 0, -1))
 
 
 def _epoch_or_none(value):
-    """A panel-supplied epoch second, or None when it cannot be trusted.
+    """面板传入的 epoch 秒；无法信任时返回 None。
 
-    A negative or unparseable bound is dropped rather than clamped. The panel
-    rejects those before they are ever sent, so one arriving here means a
-    hand-written URL, and "no bound on this side" is a much smaller surprise
-    than silently slicing the log at 1970.
+    负数或无法解析的边界直接丢弃，不做截断。面板发送前会拒绝这些值，
+    出现在这里说明是手写 URL；该侧不设边界比按 1970 年切日志更符合预期。
     """
     if value in (None, "", False):
         return None
@@ -815,25 +749,14 @@ def _epoch_or_none(value):
 
 
 def range_window(value, since=None, until=None):
-    """Resolve the dashboard's time-range selector into a (since, until) pair.
+    """把看板的 range 选择器解析为 since 与 until 两个边界。
 
-    Both bounds are cutoffs on a row's `at`; None means "unbounded on that
-    side", and (None, None) - an unknown, empty or missing range - disables
-    filtering entirely, which is what every caller did before windows existed,
-    so an older panel keeps receiving the full history it used to get.
-
-    today/week/month are calendar windows anchored to local midnight, matching
-    the definition the analytics payload has always used for its Today
-    figures: two different meanings of "today" on one page would be worse than
-    either. The week starts on Monday. Rolling aliases ("7d", "30d") are
-    deliberately absent - they would mean "the last seven days", which is a
-    different window from "this week" and would make the button's label wrong
-    on six days out of seven.
-
-    custom takes the two epochs the panel sends. Either side may be missing
-    ("from this date onwards" / "up to this date"), and reversed bounds are
-    swapped rather than rejected, because the two inputs are independent and
-    an empty end is the normal case.
+    两个边界都是行 at 的截断点；None 表示该侧不设边界，两个都是 None 表示
+    关闭过滤。today、week、month 是以本地午夜为锚的日历窗口，与看板 Today
+    数字的口径一致；一周从周一开始。不提供 7d、30d 这类滚动别名，它们表示
+    最近七天，与本周不是同一个窗口，按钮标签会在多数日期上出错。
+    custom 使用面板送来的两个 epoch，任一侧可以缺省；两个边界顺序颠倒时交换，
+    不拒绝。空结束时间是正常情况。
     """
     v = str(value or "").strip().lower()
     if v in ("today", "day", "1d"):
@@ -852,22 +775,20 @@ def range_window(value, since=None, until=None):
 
 
 def range_query(query):
-    """Pull the three range parameters out of a parsed query string.
+    """从解析后的查询串取出三个 range 参数。
 
-    parse_qs hands every key back as a list, and an older panel that sends
-    none of them at all is the normal case, so every lookup falls back to
-    None - which range_window() reads as "no filter on that side".
+    parse_qs 把每个键返回为列表，面板可能一个参数都不发，所以每次取值都回退
+    到 None，range_window 将其视为该侧不设边界。
     """
     def first(name):
         values = query.get(name) or [None]
         return values[0] if values else None
     return first("range"), first("since"), first("until")
 def row_outcome(row):
-    """Terminal state of a request row.
+    """请求行的终态。
 
-    Rows written before the outcome field existed only carry error/status,
-    so they fall back to that: an error row is a failure, anything else is a
-    completed request. One helper keeps every reader agreeing on the answer.
+    没有 outcome 字段的老行只有 error 与 status，错误行按失败处理，其余按完成
+    处理。所有读者共用这一个函数，答案不会分叉。
     """
     o = row.get("outcome")
     if o:
@@ -876,11 +797,10 @@ def row_outcome(row):
 
 
 def audit_columns(audit):
-    """The per-request audit fields a usage row carries.
+    """用量行携带的逐请求审计字段。
 
-    Captured once when the request arrives (Handler._begin_audit): a streaming
-    tail or a web-tool follow-up round finishes long after the request line
-    was parsed, and by then the connection may serve the next request.
+    请求到达时由 Handler._begin_audit 捕获一次：流式尾部或网页工具后续轮次
+    可能在请求行解析很久之后才结束，那时连接可能已在处理下一个请求。
     """
     audit = audit or {}
     return {
@@ -894,13 +814,13 @@ _REQUEST_AUDIT = threading.local()
 
 
 def bind_audit(audit):
-    """Make `audit` the current thread's request context."""
+    """把 audit 设为当前线程的请求上下文。"""
     _REQUEST_AUDIT.value = audit
     return audit
 
 
 def current_audit():
-    """The audit context of the request this thread is serving, or None."""
+    """当前线程正在处理的请求的审计上下文，没有时返回 None。"""
     return getattr(_REQUEST_AUDIT, "value", None)
 
 
@@ -917,15 +837,15 @@ CHAT_API_NAMES = {
 
 
 def chat_api_name(path):
-    """The api column for a /v1 request path."""
+    """/v1 请求路径对应的 api 列。"""
     return CHAT_API_NAMES.get(str(path or ""), "chat")
 def _best_cached_tokens(usage):
-    """Best cache-hit value across every alias the upstreams emit (E3).
+    """从上游输出的所有别名里取最可信的缓存命中值。
 
-    Order mirrors the panel: prompt_tokens_details.cached_tokens >
-    prompt_cache_hit_tokens > cache_read_input_tokens > cached_tokens >
-    input_tokens_details.cached_tokens > completion_tokens_details.
-    First positive value wins; zero aliases never shadow a real hit.
+    顺序与面板一致：prompt_tokens_details.cached_tokens、prompt_cache_hit_tokens、
+    cache_read_input_tokens、cached_tokens、input_tokens_details.cached_tokens、
+    completion_tokens_details.cached_tokens。第一个正值胜出，0 别名不会遮住
+    真实命中。
     """
     if not isinstance(usage, dict):
         return 0
@@ -954,9 +874,9 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
                 requested_model=None, audit=None):
     """Record one finished request as exactly one JSONL row.
 
-    A request without a usage block still gets a row (flagged usage_missing):
-    skipping it entirely used to drop the request from the request count,
-    success rate and latency samples, not just from the token totals.
+    A request without a usage block still gets a row (flagged usage_missing),
+    so it counts toward the request count, success rate and latency samples,
+    not just the token totals.
 
     outcome is the terminal state: completed / client_aborted /
     upstream_aborted / failed. It is deliberately not called status, because
@@ -996,10 +916,8 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
         row["account"] = account
     acc = POOL.get(account) if (account and POOL) else None
     row["realm"] = acc.realm if acc else CURRENT_REALM
-    # Always written, even when the caller presented no key. The empty value is
-    # what separates "ran without a key" from rows written before the field
-    # existed; the dashboard reports those as two different buckets, and a
-    # missing field is the only evidence of the cutover that survives.
+    # 没有提供 key 时也写入空值：空值与老行的缺失字段区分了未带 key 和
+    # 字段出现之前写入，看板把它们统计为两个不同的桶。
     row["key"] = key or ""
     if audit is None:
         audit = current_audit()
@@ -1007,9 +925,8 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
     if not row["key_id"]:
         row["key_id"] = row["key"]
     row["status"] = int((audit or {}).get("status") or 200)
-    # The price policy this request is measured against, stored as a reference
-    # so the table can be de-duplicated and swept. A row written before the
-    # table existed has no reference and falls back to the timeline.
+    # 本次请求使用的价格策略，以引用形式保存，便于表去重与清扫。
+    # 没有引用的行回退到时间线计价。
     row["cost_policy"] = wb_pricing.current_policy_id(model)
     # Only when the request had one: the panel shows a chip for rows that carry
     # the field, and a model without reasoning controls has nothing to report.
@@ -1046,11 +963,8 @@ def record_upstream_usage(upstream, requested_model, usage, **kwargs):
 def _persist_usage(row, fail_label):
     """Append one usage row as a JSONL line.
 
-    usage-summary.json used to be rewritten on every single request - a full
-    json.dumps of the running totals, a uniquely named temp file and an
-    os.replace, plus the deep copy that fed it. Nothing in the tree ever
-    loads that file (every aggregate re-reads usage.jsonl), so the work was
-    pure overhead on the request path. One append per request now.
+    One append per request. No summary file is rewritten on the request
+    path: every aggregate re-reads usage.jsonl.
     """
     try:
         os.makedirs(USAGE_DIR, exist_ok=True)
@@ -1237,9 +1151,9 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
     back to guessing from the model name.
 
     The usage argument carries whatever the upstream had already reported when
-    a stream broke. An aborted stream used to write an error row AND a usage
-    row, so one request counted as both a failure and a success; the token
-    totals stay accurate here without inflating the request count.
+    a stream broke. An aborted stream writes only this error row, so one
+    request never counts as both a failure and a success; the token totals
+    stay accurate here without inflating the request count.
 
     status stays the HTTP status code; outcome is the terminal state, so the
     two never disagree about what the field means.
@@ -2315,13 +2229,11 @@ def apply_daily_guards(refresh=False):
     """Push all three daily guards into the pool in one pass.
 
     The guards share their inputs - one settings file and the same folded day
-    counters - and the request path used to call them back to back, so each
-    one re-read the settings, re-scanned (and re-copied) the same counters and
-    re-walked the pool. Here it is one settings read, one fold, three
-    publishes; each guard's own semantics are untouched: per-realm limits, the
-    free-model exemption on the credit guard, and the "no limit configured ->
-    unknown count, never park" rule (an unreadable log leaves the counts None
-    for all three, exactly as the separate calls did).
+    counters - so this does one settings read, one fold and three publishes
+    instead of re-reading and re-walking per guard. Each guard's own semantics
+    are untouched: per-realm limits, the free-model exemption on the credit
+    guard, and the "no limit configured -> unknown count, never park" rule
+    (an unreadable log leaves the counts None for all three).
 
     `refresh` forces the counter fold to bypass its TTL (the settings-save
     path uses it so a limit change is visible immediately). The three
@@ -3738,8 +3650,8 @@ def _fold_cost(bucket, cost, model):
 # ---------------------------------------------------------------------------
 # Incremental all-time aggregates
 #
-# The dashboard's all-time panels used to re-read the whole usage.jsonl on
-# every cache miss, and the log grows by thousands of rows a day. Those totals
+# The log grows by thousands of rows a day, so the dashboard's all-time panels
+# must not re-read the whole usage.jsonl on every cache miss. Those totals
 # only change when a row is appended, so each aggregate keeps the byte offset
 # it has already folded and a refresh reads just the rows past it - the shape
 # daily_usage_stats() already uses for today's counters, truncation guard
@@ -4267,8 +4179,8 @@ def _scan_usage_from(offset, fold, stop_at=None, skip=None, skip_raw=None, path=
     expects; a line `skip_raw` drops never gets that far.
 
     `error` is the exception that stopped the read, or None. A row the fold
-    cannot swallow ends the pass exactly where it used to - the readers have
-    always kept what they had folded so far - and the caller reports it with
+    cannot swallow ends the pass there, keeping what was folded so far, and
+    the caller reports it with
     its own label. The offset handed back with an error is the end of that
     row: the fold may have half applied it before it raised, so the caller
     starts its own fold over instead of resuming after it, while a windowed
@@ -5077,8 +4989,8 @@ _series_lock = threading.Lock()
 def _usage_timeseries_scope(realm, range, since, until, bucket_seconds):
     """(realm, lo, hi, step, 缓存键) —— usage_timeseries() 与它的 ETag 共用。
 
-    lo/hi 是这次真正要扫的窗口（未钉住的边界在这里补成"现在/往前 24 小时"），
-    键只收**钉住的**边界，理由见下面 wrapper 里的注释。
+    lo/hi 是这次真正要扫的窗口（未固定的边界在这里补成"现在/往前 24 小时"），
+    键只收**固定的**边界，理由见下面 wrapper 里的注释。
     """
     r = realm_scope(realm, CURRENT_REALM)
     lo, hi = range_window(range, since, until)
@@ -5147,7 +5059,7 @@ def usage_timeseries_etag(realm=None, range=None, since=None, until=None,
                           bucket_seconds=None):
     """usage_timeseries() 当前缓存条目的 ETag；没有条目时返回 None。
 
-    配对调用由 _json_cached() 负责。注意键里只有钉住的边界，所以"滚动窗口"这一类
+    配对调用由 _json_cached() 负责。注意键里只有固定的边界，所以"滚动窗口"这一类
     请求始终落在同一条目上：条目没重建，响应体（含它自己的 until / 桶边界）就逐
     字节不变，这正是可以放心回 304 的原因。
     """
@@ -6869,10 +6781,9 @@ def _analytics_scope(realm, range, since, until):
 def compute_usage_analytics(ttl=None, realm=None, range=None, since=None, until=None):
     """Cached analytics payload.
 
-    Unlike perf_stats/usage_snapshot/usage_by_account this used to run
-    uncached, re-reading the whole JSONL on every call while the metrics tab
-    polls it every 5 seconds. Same shared TTL as its siblings now, and the
-    rebuild runs under the lock so parallel pollers do not each scan the log.
+    The metrics tab polls this every 5 seconds, so it shares the TTL cache of
+    perf_stats/usage_snapshot/usage_by_account, and the rebuild runs under the
+    lock so parallel pollers do not each scan the log.
 
     The window joins the cache key for the same reason it does in the other
     readers: the payload's window bucket is what the KPI cards print, and this
@@ -6948,9 +6859,8 @@ def _new_analytics_maps():
 def _analytics_row_values(row):
     """The per-row numbers the folds below need, read once per row.
 
-    feed()/bump_models() used to call row.get() for each of them on every
-    invocation - eight stat objects per row, all walking the same handful of
-    fields - which was the single biggest cost of a cold analytics pass.
+    Reading them once here keeps the eight stat objects per row from each
+    walking the same handful of fields, which dominates a cold analytics pass.
     """
     return (row.get("prompt_tokens") or 0,
             row.get("completion_tokens") or 0,
@@ -6970,8 +6880,7 @@ def _feed_analytics(stat_obj, vals, is_err, cost_cny):
     upstream had already billed for tokens still shows them; only the
     request/error counters depend on the outcome. An unpriced model passes
     cost_cny = 0.0, which adds nothing: the accumulator starts as a float in
-    _new_analytics_stat(), so the sum is exactly what the guarded
-    `if cost["known"]` used to leave behind.
+    _new_analytics_stat(), so no `cost["known"]` guard is needed.
     """
     if is_err:
         stat_obj["errors"] += 1
@@ -7195,30 +7104,29 @@ def _analytics_state_cold(realm, pricing_on=None):
 
 
 def _analytics_state_ready(realm, pricing_on=None):
-    """把 `realm` 的 all-time 折叠推进到文件尾；返回 (state, offset, error)。
+    """把 `realm` 的 all-time 折叠推进到文件尾，返回 state、offset 与 error。
 
     调用方必须已持有 _analytics_state_lock。日桶、小时子表与 all-time 折叠
-    共用这一次扫描（见 _fold_usage_analytics 的 also），窗口半与 all-time 半
-    因此描述同一段字节。
+    共用一次扫描，见 _fold_usage_analytics 的 also 参数；窗口半与 all-time
+    半因此描述同一段字节。
 
-    `hours_keep` 标记这份状态要维护小时子表（剪枝线比日桶短，见
-    _prune_day_buckets）；`max_at` 是折过的最大 at（含 realm 不匹配的行），
+    `hours_keep` 标记这份状态要维护小时子表，其剪枝线比日桶短，见
+    _prune_day_buckets。`max_at` 是折过的最大 at，含 realm 不匹配的行；
     小时窗口靠它判断窗口上界有没有切掉桶里的行。
 
-    状态指纹是「折叠行真正用到的价」记录（T15，见「用到的价」状态指纹一节）：
-    折叠时逐行更新（state["pricing"]），扫描成功后刷时间线投影摘要
-    （_pricing_record_close），判废走 _pricing_used_unchanged。
-
-    采纳 checkpoint 与判废归零在 _analytics_state_advance 里（窗口路径的
-    冷热判定也用那一段），这里只管折到文件尾。
+    状态指纹记录折叠行真正用到的价，见「用到的价」状态指纹一节。折叠时
+    逐行更新 state["pricing"]，扫描成功后刷时间线投影摘要，判废走
+    _pricing_used_unchanged。采纳 checkpoint 与判废归零都在
+    _analytics_state_advance 里，窗口路径的冷热判定也用那一段；这里只管
+    折到文件尾。
     """
     pricing = _analytics_state_advance(realm, pricing_on)
     state = _analytics_state[realm]
     priced = state["pricing"]
 
     def fold(row):
-        # 一行折三处：all-time 半 + 它所属那天的窗口半 + 那天里它所属那小时
-        # 的窗口半（过滤与算价只做一次）。
+        # 一行折三处：all-time 半、它所属那天的窗口半，以及那天里它所属
+        # 那小时的窗口半；过滤与算价只做一次。
         at = row.get("at") or 0
         if at > state["max_at"]:
             state["max_at"] = at
@@ -7243,21 +7151,21 @@ def _analytics_state_ready(realm, pricing_on=None):
 
 
 def _analytics_window_from_days(realm, day_key, until, pricing_on):
-    """窗口半 maps = 窗口内的日桶之和；日桶不可用时返回 None。
+    """窗口半 maps 等于窗口内的日桶之和；日桶不可用时返回 None。
 
     先确保 all-time 折叠推进到文件尾：日桶与它同一次扫描推进，窗口半与
-    all-time 半因此描述同一段字节（旧实现用 stop_at 保证的同一件事）。
+    all-time 半因此描述同一段字节。
 
-    until 给出时（闭窗口）它必须是本地午夜（调用方已按格点判过，这里再
-    校验一次），窗口只取 at < until 的那批日桶：恰好落在 until 上的行归
-    until 那天那一桶（桶按 at 严格切分，见 _usage_hour_bucket），桶切不出
-    那一刻的行，所以那一刻有整秒行时整条路退回 None（见
-    _closed_window_edge_ok），调用方接着整段扫描，结果不变。
+    until 给出时构成闭窗口，它必须是本地午夜，调用方已按格点判过，这里再
+    校验一次。窗口只取 at < until 的那批日桶：恰好落在 until 上的行归
+    until 那天那一桶，桶按 at 严格切分，见 _usage_hour_bucket；桶切不出
+    那一刻的行，所以那一刻有整秒行时整条路退回 None，见
+    _closed_window_edge_ok，调用方接着整段扫描，结果不变。
 
-    状态冷（从没折过/刚被价表、realm、日志判废/采纳失败）时直接返回 None：
-    那条路要先付一次全量重折，窗口请求不背它——调用方退回按日分组的冷扫描
-    （同一批行、同一个求和口径，逐字节相同），重折留给 all-time 半与预热器
-    （见 _analytics_state_cold）。
+    状态冷时直接返回 None，冷状态包括从没折过、刚被价表、realm 或日志判废、
+    以及采纳失败。那条路要先付一次全量重折，窗口请求不承担它：调用方退回
+    按日分组的冷扫描，同一批行、同一个求和口径，逐字节相同；重折留给
+    all-time 半与预热器，见 _analytics_state_cold。
     """
     with _analytics_state_lock:
         if _analytics_state_cold(realm, pricing_on):
@@ -7289,44 +7197,44 @@ def _analytics_window_from_days(realm, day_key, until, pricing_on):
 
 
 # ---------------------------------------------------------------------------
-# analytics 的小时层：自定义区间窗口的就近取值
+# analytics 的小时层：自定义区间窗口的快速取值
 #
-# 日桶只拆得开「起点是本地午夜 + until 开放」的窗口；面板的自定义区间起点是
-# 任意时刻，那条路径一直整段扫描（路由器上冷 49.4s）。而 analytics 的 token
-# 口径含失败行（见 _feed_analytics），与 snapshot/series 不同，借不了别人的
-# 层——所以这里在 analytics 自己的日桶里再挂一层小时子表（analytics 算价，
-# 小时桶跟着带成本字段），起点落在「本地午夜 + k*3600」格点上的窗口就是窗口
-# 内小时桶之和，O(小时数)。
+# 日桶只拆得开起点为本地午夜且 until 开放的窗口。面板的自定义区间起点是
+# 任意时刻，那条路径只能整段扫描。analytics 的 token 口径含失败行，见
+# _feed_analytics，与 snapshot、series 不同，借不了别人的层。因此这里在
+# analytics 自己的日桶里再挂一层小时子表：analytics 算价，小时桶跟着带成本
+# 字段；起点落在「本地午夜 + k*3600」格点上的窗口等于窗口内小时桶之和，
+# 复杂度随小时数线性增长。
 #
-# 与日桶同一条纪律：同一窗口的求和统一用「按小时分组」的口径，冷扫描
-# （_scan_usage_analytics_window_hours）、小时桶、加载 checkpoint 三条路径
-# 给出的字节完全一致；非整小时的起点（面板按分钟选的时间）拆不开，仍然整段
-# 扫描，正确性优先。WB_USAGE_DAY_BUCKETS=0 一并关掉小时层。
+# 与日桶同一条纪律：同一窗口的求和统一用按小时分组的口径，
+# _scan_usage_analytics_window_hours、小时桶与加载 checkpoint 三条路径给出
+# 的字节完全一致。非整小时的起点拆不开，仍然整段扫描，优先保证正确。
+# WB_USAGE_DAY_BUCKETS=0 一并关掉小时层。
 #
-# 保留比日桶短得多（WB_USAGE_HOUR_KEEP_HOURS，默认 48h）：小时桶只为近期的
-# 自定义窗口服务，每个桶的形状与日桶一样（summary + 每账号/每模型/每 key），
-# 跟着 32 天的日桶全留会让 checkpoint 膨胀十几倍。剪枝线以外的天由查询侧按
-# 「这一天还有没有 hours」自己表达（没有就退回扫描），所以不另存 floor。
+# 保留期比日桶短得多，由 WB_USAGE_HOUR_KEEP_HOURS 控制，默认 48h：小时桶只
+# 为近期的自定义窗口服务，每个桶的形状与日桶一样，跟着 32 天的日桶全留会
+# 让 checkpoint 膨胀十几倍。剪枝线以外的天由查询侧按「这一天还有没有
+# hours」自行表达，没有就退回扫描，所以不另存 floor。
 # ---------------------------------------------------------------------------
 
 
 def _analytics_window_from_hours(realm, since, until, pricing_on):
-    """窗口半 maps = 窗口内的小时桶之和；小时层不可用时返回 None。
+    """窗口半 maps 等于窗口内的小时桶之和；小时层不可用时返回 None。
 
-    成立条件（缺一不可，任何一条不成立就退回扫描——正确性优先）：
-      * 窗口起点落在本地午夜起算的小时格点上（调用方已判过，这里再按桶校验）；
-      * until 开放，或 until 不低于折过的最大 at（否则窗口上界会切掉桶里的行），
-        或 until 落在同一套小时格点上且直到那一刻没有整秒行（见
-        _closed_window_edge_ok）——这时窗口只取 at < until 的那批桶，恰好
-        落在 until 上的行由边沿账挡回整段扫描；
-      * days_floor 覆盖窗口起点所在的天（更早的天没有桶）；
-      * 窗口起点所在的天及其后每一天都有 hours 子表（被剪枝线剪掉、或本地
-        午夜落在不存在的小时里而摘掉的那天，都会让窗口整体退回扫描）。
+    成立条件缺一不可，任何一条不成立就退回扫描，优先保证正确：
+      * 窗口起点落在本地午夜起算的小时格点上，调用方已判过，这里再按桶校验；
+      * until 开放，或 until 不低于折过的最大 at，否则窗口上界会切掉桶里的
+        行；或 until 落在同一套小时格点上且直到那一刻没有整秒行，见
+        _closed_window_edge_ok。这时窗口只取 at < until 的那批桶，恰好落在
+        until 上的行由边沿账挡回整段扫描；
+      * days_floor 覆盖窗口起点所在的天，更早的天没有桶；
+      * 窗口起点所在的天及其后每一天都有 hours 子表；被剪枝线剪掉、或本地
+        午夜落在不存在的小时里而摘掉的那天，都会让窗口整体退回扫描。
 
-    状态冷（从没折过/刚被价表、realm、日志判废/采纳失败）时直接返回 None：
-    那条路要先付一次全量重折，窗口请求不背它——调用方退回按小时分组的冷
-    扫描（同一批行、同一个求和口径，逐字节相同），重折留给 all-time 半与
-    预热器（见 _analytics_state_cold）。
+    状态冷时直接返回 None，冷状态包括从没折过、刚被价表、realm 或日志判废、
+    以及采纳失败。那条路要先付一次全量重折，窗口请求不承担它：调用方退回
+    按小时分组的冷扫描，同一批行、同一个求和口径，逐字节相同；重折留给
+    all-time 半与预热器，见 _analytics_state_cold。
     """
     with _analytics_state_lock:
         if _analytics_state_cold(realm, pricing_on):
@@ -7341,7 +7249,7 @@ def _analytics_window_from_hours(realm, since, until, pricing_on):
         cut_at = None
         if until is not None:
             if until < state["max_at"]:
-                # 闭窗口切进桶里：until 必须落在同一套小时格点上、且直到
+                # 闭窗口切进桶里：until 必须落在同一套小时格点上，且直到
                 # 那一刻没有整秒行，桶才切得出这个窗口。
                 if (_window_hour_key_safe(until) is None
                         or not _closed_window_edge_ok(state, until)):
@@ -7366,17 +7274,17 @@ def _analytics_window_from_hours(realm, since, until, pricing_on):
                 sub = hours[hour]
                 if int(sub["at"]) != day_at + int(hour) * 3600:
                     return None
-                # 格点校验对起点所在那天的每个桶都做（含 at < since 的桶）：
-                # 时区偏移不是整小时的夏令时（极少数时区）会让格点整体错开
-                # 半小时，错开的桶可能横跨起点、把 at >= since 的行关在里面
-                # ——跳过它就会漏行，所以宁可整个窗口退回扫描。
+                # 格点校验对起点所在那天的每个桶都做，含 at < since 的桶：
+                # 时区偏移不是整小时的夏令时会让格点整体错开半小时，错开的
+                # 桶可能横跨起点、把 at >= since 的行关在里面；跳过它就会
+                # 漏行，所以宁可整个窗口退回扫描。
                 if (int(sub["at"]) - lo_i) % 3600:
                     return None
                 if int(sub["at"]) < lo_i:
                     continue
                 if cut_at is not None and int(sub["at"]) >= cut_at:
-                    # 闭窗口：until 那一刻归后一桶（桶按 at 严格切分），
-                    # 只取 at < until 的桶；那一刻有整秒行时上面已经退回。
+                    # 闭窗口：until 那一刻归后一桶，桶按 at 严格切分；
+                    # 只取 at < until 的桶。那一刻有整秒行时上面已经退回。
                     break
                 _add_analytics_window_maps(maps, sub)
     _usage_cache_maybe_save("analytics", offset)
@@ -7384,13 +7292,14 @@ def _analytics_window_from_hours(realm, since, until, pricing_on):
 
 
 def _analytics_window(realm, since, until, stop_at, pricing_on):
-    """窗口半 analytics：同一窗口由日桶/小时桶相加，其余保持整段扫描。
+    """窗口半 analytics：同一窗口由日桶或小时桶相加，其余保持整段扫描。
 
-    与 _usage_snapshot_window 同一条规矩，外加一层小时桶：起点是本地午夜、
-    终点开放或也是本地午夜的窗口拆得成整天的并集；起点落在整小时的其它窗口
-    （自定义区间）拆得成整小时的并集，由 analytics 自己的小时层回答（见
-    「小时层」一节）；其余一律保持整段扫描。闭窗口的右边界按「at < until
-    的桶」切，那一刻有整秒行时退回扫描（见 _closed_window_edge_ok）。
+    与 _usage_snapshot_window 同一条规矩，外加一层小时桶。起点是本地午夜、
+    终点开放或也是本地午夜的窗口拆得成整天的并集；起点落在整小时的其它
+    窗口，也就是自定义区间，拆得成整小时的并集，由 analytics 自己的小时层
+    回答，见「小时层」一节；其余一律保持整段扫描。闭窗口的右边界按
+    at < until 的桶切，那一刻有整秒行时退回扫描，见
+    _closed_window_edge_ok。
     """
     day_key = _window_day_key_safe(since)
     until_day = None if until is None else _window_day_key_safe(until)
@@ -7414,21 +7323,20 @@ def _analytics_window(realm, since, until, stop_at, pricing_on):
 
 
 def _scan_usage_analytics_window(realm, since, until, stop_at=None, pricing_on=None):
-    """One pass over the log, folding only the rows inside the window.
+    """整段扫描日志，只折叠窗口内的行。
 
-    The all-time half is not rebuilt here - it comes from the incremental fold
-    - and the read stops where that fold stopped, so both halves of the
-    payload describe the same bytes even when a row lands mid-rebuild.
+    all-time 半不在这里重建，它来自增量折叠；读取停在增量折叠停下的位置，
+    所以即使折叠中途有新行落盘，载荷的两半仍描述同一段字节。
 
-    价表在这里取一次（与 all-time 折叠同一条口径），传给折叠当行级记忆的
-    代次：这次窗口扫描里的行可以和 all-time 半共享定价结果。
+    价表在这里取一次，与 all-time 折叠同一条口径，作为行级记忆的代次传给
+    折叠：这次窗口扫描里的行可以与 all-time 半共享定价结果。
     """
     pricing = _pricing_inputs(pricing_on)
     maps = _new_analytics_maps()
 
     def fold(row):
-        # Same bounds as /usage and /usage/perf, so the three readers agree on
-        # what the selected range contains.
+        # 与 /usage 和 /usage/perf 使用同一组边界，三个读者对选中区间
+        # 包含哪些行保持一致。
         at = row.get("at", 0)
         if since is not None and at < since:
             return
@@ -7447,17 +7355,16 @@ def _scan_usage_analytics_window(realm, since, until, stop_at=None, pricing_on=N
 
 
 def _copy_analytics_models(models):
-    """Copy one {model: {...}} bucket; its inner dicts are only ever read."""
+    """复制一份 model 到桶的映射；内层字典只读。"""
     return {mid: dict(entry) for mid, entry in models.items()}
 
 
 def _copy_analytics_all_time(maps):
-    """A private copy of the cached all-time maps.
+    """缓存 all-time maps 的私有副本。
 
-    The payload build decorates what it is given (finalize writes the
-    derived ratios into the stat dicts) and the cached fold keeps growing
-    under a concurrent refresh, so the caller gets a copy taken while the
-    state lock is held rather than a live view of it.
+    载荷构建会装饰传入的对象，finalize 把派生比例写进 stat 字典；缓存的
+    折叠又会在并发刷新下继续增长。所以调用方拿到的是持状态锁期间取得的
+    副本，不是活视图。
     """
     out = {"summary": dict(maps["summary"]), "accts": {}, "models": {}, "keys": {}}
     for uid, entry in maps["accts"].items():
@@ -7476,17 +7383,14 @@ def _copy_analytics_all_time(maps):
 
 
 def _merge_analytics_halves(all_maps, win_maps):
-    """Combine the cached all-time fold with the windowed one.
+    """把缓存的 all-time 折叠与窗口折叠合并成一份载荷。
 
-    `win_maps` is `all_maps` itself when no range was selected - every row is
-    inside an open window, so the windowed half is the all-time fold over
-    again. The halves are copied apart in that case, which is what a second
-    pass would have produced without the second pass, and it keeps a caller
-    that mutates one half out of the other (and out of the cache).
+    没有选择区间时 `win_maps` 就是 `all_maps` 本身：每一行都在开放窗口里，
+    窗口半等于再做一遍 all-time 折叠。此时两半会被复制开，效果与再扫一遍
+    相同，并保证调用方修改一半时不会影响另一半与缓存。
 
-    An entry only the windowed half knows cannot exist: the windowed pass
-    stops where the all-time fold stopped, so every row it saw is already in
-    there.
+    只存在于窗口半的条目不会出现：窗口扫描停在 all-time 折叠停下的位置，
+    它见过的每一行都已经在 all-time 半里。
     """
     shared = win_maps is all_maps
     acct_map = {}
@@ -7551,7 +7455,7 @@ def _merge_analytics_halves(all_maps, win_maps):
 
 
 def _add_analytics_stat(dst, src):
-    """Field-wise sum of two _new_analytics_stat() dicts, in place."""
+    """把两份 _new_analytics_stat 字典逐字段就地相加。"""
     for field, value in src.items():
         if isinstance(value, (int, float)):
             dst[field] += value
@@ -7560,75 +7464,72 @@ def _add_analytics_stat(dst, src):
 # ---------------------------------------------------------------------------
 # 按日分桶：窗口半的增量
 #
-# all-time 半已经是增量（按字节偏移折叠 + 落盘 checkpoint），但窗口半
-# （range=today / week / month）仍然是「从头扫到窗口」：窗口越宽扫得越多，
-# 路由器上一次 range=week 要 5 秒。窗口的边界全是本地午夜（range_window()），
-# 而每行只属于一天，所以只要在折叠时顺手把每一行折进「它所属那天的桶」，
-# 任何窗口就退化成「把窗口内的日桶相加」——O(天数)，checkpoint 带着日桶
-# 时冷缓存也是瞬间。
+# all-time 半已经按字节偏移折叠并落盘 checkpoint，但 range=today、week 与
+# month 的窗口半仍要从前向后扫描，窗口越宽扫得越多。窗口边界全是本地午夜，
+# 见 range_window，而每行只属于一天；折叠时顺手把每一行折进它所属那天的
+# 桶，任何窗口就退化成把窗口内的日桶相加，复杂度随天数线性增长，checkpoint
+# 带着日桶时冷缓存也能立即回答。
 #
-# 时间边界只认一个规则：行的本地日由行自己的 at 决定（_local_day_key），
-# 与 range_window() 的 today/week/month 用的是同一套本地午夜。折叠时刻不
-# 参与切天——迟写/补写的行必须落进它时间戳所属的那天，按折叠时刻切会让
-# 窗口相加错位。跨夏令时同理：日桶的键是本地日历日，只要窗口起点是本地
-# 午夜，「日键 >= 窗口日键」就是「at >= since」的等价写法（见 _window_day_key）。
+# 时间边界只认一条规则：行的本地日由行自己的 at 决定，见 _local_day_key，
+# 与 range_window 的 today、week、month 使用同一套本地午夜。折叠时刻不参与
+# 切天，迟写或补写的行必须落进它时间戳所属的那天；按折叠时刻切会让窗口
+# 相加错位。跨夏令时同理：日桶的键是本地日历日，只要窗口起点是本地午夜，
+# 日键不早于窗口日键就等价于 at 不早于 since，见 _window_day_key。
 #
-# 已封口的日桶不会再变（新行只落进今天那一桶），窗口相加时旧桶原样复用；
-# 状态只在新建桶时剪枝（_prune_day_buckets），剪掉的只是任何窗口都够不到
-# 的天。剪枝会抬高 days_floor，任何够不到的天都因此退回整段扫描——宁可多
-# 扫一次，不能少算一天。
+# 已封口的日桶不会再变，新行只落进今天那一桶，窗口相加时旧桶原样复用；
+# 状态只在新建桶时剪枝，见 _prune_day_buckets，剪掉的只是任何窗口都够不到
+# 的天。剪枝会抬高 days_floor，够不到的天因此退回整段扫描：宁可多扫一次，
+# 不能少算一天。
 #
-# analytics 的日桶还挂一层小时子表（保留线更短，只给自定义区间用，见
-# 「analytics 的小时层」一节）：那不是日桶的一部分，日桶求和原样忽略它。
+# analytics 的日桶还挂一层小时子表，保留线更短，只给自定义区间用，见
+# 「analytics 的小时层」一节。它不是日桶的一部分，日桶求和原样忽略它。
 #
-# 浮点求和的口径：窗口 = 日桶逐日相加，与旧实现「整段扫描逐行累加」的区别
-# 只是浮点的结合顺序（credit / cost_cny / speed_sum 可能差最后一两个 ulp，
-# 整数字段逐位相同）。逐行顺序无法从日聚合还原，这是日桶推导的固有代价；
-# 本文件里所有同一窗口的路径统一用「按日分组」的口径（冷扫描、日桶、加载
-# checkpoint 三条路径给出的字节完全一致），把「像没有缓存一样正确」保成
-# 路径之间的一致性；analytics 的小时窗口同理，只是分组的粒度换成小时。
-# WB_USAGE_DAY_BUCKETS=0 可整体退回旧的逐行口径。
+# 浮点求和的口径：窗口等于日桶逐日相加。整段扫描逐行累加与它只差浮点结合
+# 顺序，credit、cost_cny 与 speed_sum 可能差最后一两个 ulp，整数字段逐位
+# 相同。逐行顺序无法从日聚合还原，这是日桶推导的固有代价；本文件里同一
+# 窗口的所有路径统一用按日分组的口径，冷扫描、日桶与加载 checkpoint 三条
+# 路径给出的字节完全一致。analytics 的小时窗口同理，只把分组粒度换成小时。
+# WB_USAGE_DAY_BUCKETS=0 可整体退回逐行口径。
 #
-# 小时层（T9）：日桶只服务「起点是本地午夜」的窗口，而面板的自定义区间
-# （range=custom）起点是任意时刻——最常见的形态就是整点（datetime-local
-# 输入框给的是分钟粒度，操作者选整点的概率远高于选 37 分）。于是每个日桶
-# 里再挂一张小时子表（_usage_hour_bucket），起点落在本地整点上的窗口由
-# 「整小时桶之和」回答：token/requests/credit 与成本字段（cost_cny /
-# cost_missing / by_model_acct）全部来自同一份桶，口径与整段扫描一致，不
-# 需要像「借时间序列的小时桶」那样丢掉成本列（series 不算价，D3）。
-# 小时层比日桶短命（_usage_hour_keep_days），覆盖不到就退回按小时分组的
-# 冷路径——两条路径的字节逐字节相同，语义与改动前一致（只是浮点结合顺序
-# 按小时而不是按行）。
+# 小时层：日桶只服务起点为本地午夜的窗口，而面板的自定义区间起点是任意
+# 时刻，最常见的是整点。datetime-local 输入框给到分钟粒度，操作者选整点的
+# 概率远高于选 37 分。于是每个日桶里再挂一张小时子表，见 _usage_hour_bucket；
+# 起点落在本地整点上的窗口由整小时桶之和回答：token、requests、credit 与
+# 成本字段 cost_cny、cost_missing、by_model_acct 全部来自同一份桶，口径与
+# 整段扫描一致，不需要像时间序列的小时桶那样丢掉成本列，因为 series 不算价。
+# 小时层比日桶保留期短，见 _usage_hour_keep_days，覆盖不到就退回按小时分组
+# 的冷路径；两条路径的字节逐字节相同，只是浮点结合顺序按小时而不是按行。
 # ---------------------------------------------------------------------------
 
-# 日桶保留天数：月窗口最多回溯 30 天（当月 1 号），32 天留两天余量。更早的
-# 天没有任何窗口够得到，留着只让 checkpoint 白白变大——路由器上每次写盘都
-# 要重写整份文件。调小它（WB_USAGE_DAY_KEEP_DAYS）会让更宽的窗口退回整段
-# 扫描（结果仍然正确，只是慢）：对 flash 写入敏感的部署可以调到 8，只保周。
+# 日桶保留天数：月窗口最多回溯 30 天，32 天留两天余量。更早的天没有任何
+# 窗口够得到，留着只让 checkpoint 白白变大，路由器上每次写盘都要重写整份
+# 文件。调小 WB_USAGE_DAY_KEEP_DAYS 会让更宽的窗口退回整段扫描，结果仍然
+# 正确，只是慢；对 flash 写入敏感的部署可以调到 8，只保周。
 _USAGE_DAY_KEEP_DAYS = 32
 
-# 小时桶保留天数：小时层只服务面板的自定义整点窗口（操作者回头看最近一两
-# 天的某个整点），保留 2 天 = 最少 48 小时、最多 72 小时（剪枝按天走，见
-# _prune_hour_buckets）。再往前的小时桶没有任何现实窗口够得到，而每个小时
-# 桶都是完整的一份窗口半快照（含 by_model_acct 三层结构，实测约 2KB/桶）
-# ——路由器上 checkpoint 每多一份都要跟着重写，flash 写入慢且费寿命。覆盖
-# 不到的窗口退回冷路径，结果正确，只是慢。WB_USAGE_HOUR_KEEP_DAYS 可调；
-# 对 flash 特别敏感的部署可以调到 1（只保今天，24~48 小时）。
+# 小时桶保留天数：小时层只服务面板的自定义整点窗口，保留 2 天即最少 48
+# 小时、最多 72 小时，剪枝按天走，见 _prune_hour_buckets。再往前的小时桶
+# 没有现实窗口够得到，而每个小时桶都是完整的一份窗口半快照，含三层
+# by_model_acct 结构，实测约 2KB/桶；路由器上 checkpoint 每多一份都要跟着
+# 重写，flash 写入慢且费寿命。覆盖不到的窗口退回冷路径，结果正确，只是慢。
+# WB_USAGE_HOUR_KEEP_DAYS 可调；对 flash 特别敏感的部署可以调到 1，只保
+# 今天，24 到 48 小时。
 _USAGE_HOUR_KEEP_DAYS = 2
 
 # 日桶求和要跳过的字段：started 是每份快照各自的创建时刻，不是累计量。
-# 与 _USAGE_CACHE_SNAPSHOT_NUMBERS 同源（同一份构造函数的数字字段），只是
-# 在模块加载顺序上不能引用它（那段常量在文件更靠后），所以这里自己推导。
+# 与 _USAGE_CACHE_SNAPSHOT_NUMBERS 同源，都是同一份构造函数的数字字段；
+# 那段常量在文件更靠后，这里不能引用，所以自己推导。
 _USAGE_DAY_SNAPSHOT_FIELDS = tuple(
     k for k, v in _empty_stats().items()
     if isinstance(v, (int, float)) and not isinstance(v, bool) and k != "started")
 
 
 def _usage_keep_setting(key):
-    """面板设的聚合保留值（没设过 / 读不出来返回 None）。
+    """面板设置的聚合保留值；没设过或读不出来返回 None。
 
-    环境变量始终优先（现场调、测试里来回切），面板设置只在没有环境变量时
-    生效——与 upstream_timeouts() 读 header_timeout_seconds 同一条路子。
+    环境变量始终优先，便于现场调整与测试来回切换；面板设置只在没有环境
+    变量时生效，与 upstream_timeouts 读取 header_timeout_seconds 同一条
+    路子。
     """
     try:
         cfg = wb_settings.usage_config(ACCOUNTS_DIR)
@@ -7643,7 +7544,8 @@ def _usage_keep_setting(key):
 def _usage_day_keep_days():
     """日桶保留天数，默认 32；WB_USAGE_DAY_KEEP_DAYS 优先，其次面板设置。
 
-    每次调用都读环境变量，理由与 WB_USAGE_CACHE 相同（现场调、测试里来回切）。
+    每次调用都读环境变量，理由与 WB_USAGE_CACHE 相同：现场调整与测试来回
+    切换都要即时生效。
     """
     raw = os.environ.get("WB_USAGE_DAY_KEEP_DAYS")
     if raw is not None:
@@ -7656,12 +7558,11 @@ def _usage_day_keep_days():
 
 def _usage_hour_keep_days():
     """小时桶保留天数，默认 2；WB_USAGE_HOUR_KEEP_DAYS 优先，其次由面板的
-    「小时层保留」折算（向上取整到整天）。
+    「小时层保留」向上取整到整天。
 
-    两个状态各有一条小时层保留线（snapshot 按天，analytics 按小时），面板只
-    暴露一个「小时层保留（小时）」，所以这里跟着它走，免得调了一个另一个不动。
-    取值再小也保留一天（max(1, ...)）：小时层至少要能服务「今天的整点窗口」，
-    否则等于没建。
+    两个状态各有一条小时层保留线，snapshot 按天、analytics 按小时；面板只
+    暴露一个「小时层保留」，单位小时，所以这里跟着它走，避免调了一个另一个
+    不动。取值最低为 1 天：小时层至少要能服务今天的整点窗口，否则等于没建。
     """
     raw = os.environ.get("WB_USAGE_HOUR_KEEP_DAYS")
     if raw is not None:
@@ -7678,29 +7579,30 @@ def _usage_hour_keep_days():
 def _usage_day_buckets_enabled():
     """日桶总开关，默认开；WB_USAGE_DAY_BUCKETS=0 退回逐行扫描口径。
 
-    与 WB_USAGE_CACHE 同样的用法：现场紧急关掉、测试在一个进程里来回切。
-    关掉时既不折日桶也不用它们，窗口路径与改动前逐字节一致。小时层挂在
-    日桶上（每个日桶里的 hours 子表），所以这个开关一并管住小时层：关掉
-    时既不折小时桶，整点窗口也退回逐行口径。
+    与 WB_USAGE_CACHE 同样的用法：现场紧急关掉，测试在一个进程里来回切。
+    关掉时既不折日桶也不使用它们，窗口路径与逐行口径逐字节一致。小时层挂在
+    日桶上，即每个日桶里的 hours 子表，所以这个开关一并管住小时层：关掉时
+    既不折小时桶，整点窗口也退回逐行口径。
     """
     return os.environ.get("WB_USAGE_DAY_BUCKETS", "1").strip().lower() not in (
         "0", "false", "no", "off")
 
 
-# analytics 小时子表的保留小时数：小时层只为近期的自定义窗口服务，而每个小时
-# 桶的形状与日桶一样重（summary + 每账号/每模型/每 key），跟着 32 天的日桶
-# 全留会让 checkpoint 膨胀十几倍。48 小时覆盖「从昨天某个整点起」这类最常用
-# 的手动窗口，剪枝又在每天新建日桶时跑一次，实际保留 48~72 小时。调大只是让
-# checkpoint 变大（层覆盖更宽），调小只是让更早的自定义窗口退回整段扫描
-# （结果仍然正确，只是慢）。
+# analytics 小时子表的保留小时数：小时层只为近期的自定义窗口服务，而每个
+# 小时桶的形状与日桶一样重，含 summary 与每账号、每模型、每 key；跟着 32
+# 天的日桶全留会让 checkpoint 膨胀十几倍。48 小时覆盖「从昨天某个整点起」
+# 这类最常用的手动窗口，剪枝又在每天新建日桶时跑一次，实际保留 48 到 72
+# 小时。调大只是让 checkpoint 变大，层覆盖更宽；调小只是让更早的自定义
+# 窗口退回整段扫描，结果仍然正确，只是慢。
 _USAGE_HOUR_KEEP_HOURS = 48
 
 
 def _usage_hour_keep_hours():
-    """小时子表保留小时数，默认 48；WB_USAGE_HOUR_KEEP_HOURS 优先，其次面板设置。
+    """小时子表保留小时数，默认 48；WB_USAGE_HOUR_KEEP_HOURS 优先，其次
+    面板设置。
 
-    每次调用都读环境变量，理由与 WB_USAGE_DAY_KEEP_DAYS 相同（现场调、测试
-    里来回切）。
+    每次调用都读环境变量，理由与 _usage_day_keep_days 相同：现场调整与
+    测试来回切换都要即时生效。
     """
     raw = os.environ.get("WB_USAGE_HOUR_KEEP_HOURS")
     if raw is not None:
@@ -7712,15 +7614,15 @@ def _usage_hour_keep_hours():
 
 
 def _local_day_key(ts):
-    """ts 所属的本地日历日，"YYYY-MM-DD"。
+    """ts 所属的本地日历日，形如 "YYYY-MM-DD"。
 
-    用字符串而不是午夜 epoch 当日桶的键：窗口与日桶的比较就是一次字符串
-    比较（ISO 日期天然有序），查询不必再算一遍本地午夜，也不会被夏令时的
-    日长变化影响——同一套本地日历日规则在折叠与查询两侧都成立。
+    日桶的键用字符串而不是午夜 epoch：窗口与日桶的比较就是一次字符串比较，
+    ISO 日期天然有序；查询不必再算一遍本地午夜，也不会被夏令时的日长变化
+    影响。同一套本地日历日规则在折叠与查询两侧都成立。
 
-    结果按 ts 记忆（见「行级结果记忆」）：一次冷启动里三个视图各扫一遍日志，
-    每一行都要问一次日键，第二、第三遍直接取。时区被 tzset() 换过时表整体
-    作废；不可哈希的 ts（坏行）不进表，照旧真算、照旧抛同样的异常。
+    结果按 ts 记忆，见「行级结果记忆」：一次冷启动里三个视图各扫一遍日志，
+    每一行都要问一次日键，第二、第三遍直接取。时区被 tzset 换过时表整体
+    作废；不可哈希的 ts，即坏行，不进表，照旧真算并抛出同样的异常。
     """
     memo = _row_day_memo
     if _row_memo_tz is not time.tzname:
@@ -7735,7 +7637,7 @@ def _local_day_key(ts):
     cap = _ROW_MEMO_MAX
     if cap > 0:
         if len(memo) >= cap:
-            # 满了：只收「不比表里最旧那条更旧」的 ts。扫描从头往尾走，表里
+            # 满了：只收不比表里最旧那条更旧的 ts。扫描从头往尾走，表里
             # 留住的因此总是最近的一批行，第二遍走到尾部照样命中。
             oldest = next(iter(memo))
             if _row_memo_at(ts) < _row_memo_at(oldest):
@@ -7754,9 +7656,9 @@ def _day_key_start(key):
 def _window_day_key(since):
     """窗口起点能由日桶推导时返回它的日键，否则 None。
 
-    只有「起点正好是本地午夜」的窗口才拆得成整天的并集：at >= 本地午夜
-    等价于「日键 >= 那天的键」。自定义区间的起点是任意时刻，拆不开——那条
-    路径保持整段扫描（正确性优先）。
+    只有起点正好是本地午夜的窗口才拆得成整天的并集：at 不早于本地午夜
+    等价于日键不早于那天的键。自定义区间的起点是任意时刻，拆不开，那条
+    路径保持整段扫描，优先保证正确。
     """
     if since is None:
         return None
@@ -7766,17 +7668,16 @@ def _window_day_key(since):
 
 
 def _hour_window_key(since):
-    """窗口起点能由小时桶推导时返回 (日键, 小时序号)，否则 None。
+    """窗口起点能由小时桶推导时返回日键与小时序号的元组，否则 None。
 
-    只有「起点正好是本地整点」的窗口才拆得成整小时桶的并集：小时桶按
-    「离那天本地午夜多少个 3600 秒」切格点（见 _usage_hour_bucket），所以
-    起点必须同时满足两条——本地墙上时间落在整点（_local_hour_start 能原样
-    还原），并且离本地午夜的距离是 3600 的整数倍。夏令时把日边界挪动、
-    或时区按半小时偏移的情形，只要 since 不落在格点上就返回 None（退回
-    扫描，正确性优先）。
+    只有起点正好是本地整点的窗口才拆得成整小时桶的并集。小时桶按离那天
+    本地午夜多少个 3600 秒切格点，见 _usage_hour_bucket，所以起点必须同时
+    满足两条：本地墙上时间落在整点，_local_hour_start 能原样还原；并且离
+    本地午夜的距离是 3600 的整数倍。夏令时把日边界挪动，或时区按半小时
+    偏移时，只要 since 不落在格点上就返回 None，退回扫描，优先保证正确。
 
-    整点起点也可能是本地午夜（两者同时成立）：调用方先问日桶，所以这条
-    只在「不是午夜」时兜住自定义区间的整点窗口。
+    整点起点也可能是本地午夜，两者同时成立；调用方先问日桶，所以这条只在
+    起点不是午夜时接住自定义区间的整点窗口。
     """
     if since is None:
         return None
@@ -7791,35 +7692,36 @@ def _hour_window_key(since):
 
 
 def _window_hour_aligned(since):
-    """窗口起点是否落在「本地午夜 + k*3600」的小时格点上。
+    """窗口起点是否落在本地午夜加 k*3600 的小时格点上。
 
-    小时桶的格点是「离那天的本地午夜多少秒」（见 _analytics_hour_bucket），
-    所以起点减它所属那天的本地午夜必须是 3600 的整数倍。自定义区间的起点是
-    任意分钟时拆不开——那条路径保持整段扫描（正确性优先）；起点正好是本地
-    午夜时恒成立（0 是 3600 的整数倍），与 _window_day_key 相容。
+    小时桶的格点是离那天的本地午夜多少秒，见 _analytics_hour_bucket，所以
+    起点减它所属那天的本地午夜必须是 3600 的整数倍。自定义区间的起点是
+    任意分钟时拆不开，那条路径保持整段扫描，优先保证正确；起点正好是本地
+    午夜时恒成立，因为 0 是 3600 的整数倍，与 _window_day_key 相容。
     """
     if since is None:
         return False
     return (_local_midnight(since) - since) % 3600 == 0
 
 
-# 闭窗口边沿账的上限：只有「at 恰好落在整秒上」的行进账，真实日志里几乎为
-# 零（at 是 time.time() 的浮点秒，落在整秒上的概率约百万分之一）。手改过的
-# 日志可能有很多，超过上限就停记并留痕——闭窗口退回整段扫描，正确性优先。
+# 闭窗口边沿账的上限：只有 at 恰好落在整秒上的行进账，真实日志里几乎为
+# 零，因为 at 是 time.time 的浮点秒，落在整秒上的概率约百万分之一。手改过
+# 的日志可能有很多，超过上限就停记并留痕，闭窗口退回整段扫描，优先保证
+# 正确。
 _CLOSED_WINDOW_HITS_MAX = 256
 
 
 def _closed_window_hit_record(state, at):
-    """行恰好落在整秒上时记一笔（闭窗口走桶求和的边沿账）。
+    """行恰好落在整秒上时记一笔，供闭窗口的桶求和核对边沿。
 
-    桶按 at 严格切分（见 _usage_hour_bucket）：闭窗口 [since, until] 与
-    「at < until 的那批桶」只差「恰好落在 until 上的行」，所以直到那一刻
-    没有整秒行时，桶的和就是窗口的全部（见 _closed_window_edge_ok）。这份
-    账只收真正进了桶的那些行（realm/剪枝线与折叠同一套判定），记录点因此
-    在 _usage_day_bucket 的过滤之后。
+    桶按 at 严格切分，见 _usage_hour_bucket：闭窗口 [since, until] 与
+    at < until 的那批桶只差恰好落在 until 上的行。所以直到那一刻没有整秒行
+    时，桶的和就是窗口的全部，见 _closed_window_edge_ok。这份账只收真正
+    进了桶的那些行，realm 与剪枝线与折叠同一套判定，记录点因此在
+    _usage_day_bucket 的过滤之后。
 
-    at 不是有限数（手改日志的 Infinity/NaN）时整秒判定不成立就跳过——
-    `at // 1` 对这些值不抛异常，不把一次折叠打断在这里。
+    at 不是有限数时，手改日志可能写出 Infinity 或 NaN，整秒判定不成立就
+    跳过；`at // 1` 对这些值不抛异常，不会把一次折叠打断在这里。
     """
     if at != at // 1:
         return
@@ -7833,10 +7735,10 @@ def _closed_window_hit_record(state, at):
 def _closed_window_edge_ok(state, until):
     """闭窗口的右边界能否由存量桶回答：直到 until 为止没有行落在整秒上。
 
-    直到那一刻没有整秒行时，「[since, until] 的行」与「at < until 的桶」是
-    同一批（桶按 at 严格切分，恰好落在 until 上的行归后一桶）；真有一行
-    恰好落在 until 上时桶切不出它，只能退回整段扫描。账记满（见
-    _closed_window_hit_record）同样退回。
+    满足时，「[since, until] 的行」与「at < until 的桶」是同一批；桶按 at
+    严格切分，恰好落在 until 上的行归后一桶。真有一行恰好落在 until 上时
+    桶切不出它，只能退回整段扫描。账记满时同样退回，见
+    _closed_window_hit_record。
     """
     if state["hits_overflow"]:
         return False
@@ -7846,9 +7748,10 @@ def _closed_window_edge_ok(state, until):
 def _window_day_key_safe(ts):
     """_window_day_key 的取值安全版：取值离谱时返回 None。
 
-    手写的极大 since/until（例如 6e18）会让 _local_midnight 里的
-    time.localtime 抛 OSError——那只是「这个窗口服务不了」的一种，按退回
-    整段扫描处理，不该把端点打成 500（与 _series_window_day_key 同一个用意）。
+    手写的极大 since 或 until，例如 6e18，会让 _local_midnight 里的
+    time.localtime 抛出 OSError。那只是这个窗口服务不了的一种情形，按退回
+    整段扫描处理，不该把端点打成 500，与 _series_window_day_key 同一个
+    用意。
     """
     try:
         return _window_day_key(ts)
@@ -7857,7 +7760,7 @@ def _window_day_key_safe(ts):
 
 
 def _window_hour_key_safe(ts):
-    """_hour_window_key 的取值安全版：取值离谱时返回 None（同上）。"""
+    """_hour_window_key 的取值安全版：取值离谱时返回 None，理由同上。"""
     try:
         return _hour_window_key(ts)
     except (OSError, OverflowError, ValueError):
@@ -7865,12 +7768,12 @@ def _window_hour_key_safe(ts):
 
 
 def _new_window_snapshot_bucket(at):
-    """一份带格点 at 的窗口半快照桶（日桶与小时桶共用这个形状）。
+    """一份带格点 at 的窗口半快照桶，日桶与小时桶共用这个形状。
 
-    started 不参与求和（见 _add_usage_snapshot），形状保留只是让校验与
+    started 不参与求和，见 _add_usage_snapshot，形状保留只是让校验与
     all-time 半共用同一套 _usage_cache_snapshot_ok。at 是这个桶的本地格点
-    （日的午夜 / 小时的整点）epoch：小时桶按它切 3600 的格点，求和侧按它
-    做格点校验——与时间序列的桶同一套做法（_new_series_bucket）。
+    epoch，取自日的午夜或小时的整点：小时桶按它切 3600 的格点，求和侧按它
+    做格点校验，与时间序列的桶同一套做法，见 _new_series_bucket。
     """
     bucket = _empty_stats()
     bucket["at"] = at
@@ -7878,15 +7781,16 @@ def _new_window_snapshot_bucket(at):
 
 
 def _day_snapshot_bucket(key, day_start):
-    """一天一份的窗口半快照桶；形状与 _empty_stats() 一致。"""
+    """一天一份的窗口半快照桶；形状与 _empty_stats 一致。"""
     return _new_window_snapshot_bucket(day_start)
 
 
 def _day_analytics_bucket(key, day_start):
-    """一天一份的窗口形状 analytics maps（带 at 与小时子表，见「小时层」一节）。
+    """一天一份的窗口形状 analytics maps，带 at 与小时子表，见「小时层」
+    一节。
 
-    at 是那天的本地午夜：小时子表按「离本地午夜多少秒」切，行的归属因此
-    不依赖折叠时刻（迟写/补写的行落回它时间戳所属的那天那小时）。
+    at 是那天的本地午夜：小时子表按离本地午夜多少秒切，行的归属因此不
+    依赖折叠时刻，迟写或补写的行落回它时间戳所属的那天那小时。
     """
     bucket = _new_analytics_maps()
     bucket["at"] = day_start
@@ -7895,19 +7799,19 @@ def _day_analytics_bucket(key, day_start):
 
 
 def _new_analytics_hour_bucket(at):
-    """一小时一份的窗口形状 analytics maps（带 at；见「小时层」一节）。"""
+    """一小时一份的窗口形状 analytics maps，带 at，见「小时层」一节。"""
     bucket = _new_analytics_maps()
     bucket["at"] = at
     return bucket
 
 
 def _analytics_hour_bucket(day, at):
-    """这一行该折进的小时桶（day 桶的 hours 子表）；不该折时返回 None。
+    """这一行该折进的小时桶，来自 day 桶的 hours 子表；不该折时返回 None。
 
-    小时键是「离那天的本地午夜多少秒」的整小时数（字符串，与 JSON 往返后的
-    形状一致，同时间序列的小时子表）。本地午夜落在不存在的小时里（夏令时在
-    午夜切换的极少数时区）时这一行放不进格点：把整天的 hours 摘掉，让覆盖
-    这一天的小时窗口整体退回扫描（日桶本身照常，不受影响）。
+    小时键是离那天的本地午夜多少个整小时的字符串，与 JSON 往返后的形状
+    一致，同时间序列的小时子表。本地午夜落在不存在的小时里时，即夏令时在
+    午夜切换的极少数时区，这一行放不进格点：把整天的 hours 摘掉，让覆盖
+    这一天的小时窗口整体退回扫描；日桶本身照常，不受影响。
     """
     if day is None:
         return None
@@ -7926,18 +7830,18 @@ def _analytics_hour_bucket(day, at):
 
 
 def _day_series_bucket(key, day_start):
-    """一天一份的时间序列桶（带小时子表，见 _fold_usage_series）。"""
+    """一天一份的时间序列桶，带小时子表，见 _fold_usage_series。"""
     bucket = _new_series_bucket(day_start)
     bucket["hours"] = {}
     return bucket
 
 
 def _usage_day_bucket(state, row, r, factory):
-    """这一行该折进哪个日桶；必要时新建（顺带剪枝），不该折时返回 None。
+    """这一行该折进哪个日桶；必要时新建并顺带剪枝，不该折时返回 None。
 
-    行的归属只看它自己的 at：补写/迟到的行必须落进它时间戳所属的那天。
+    行的归属只看它自己的 at：补写或迟到的行必须落进它时间戳所属的那天。
     realm 不匹配的行折叠本来就会跳过，这里也不为它建桶；总开关关掉时连
-    日桶都不折（窗口路径也不会用它们，见 _usage_day_buckets_enabled）。
+    日桶都不折，窗口路径也不会用它们，见 _usage_day_buckets_enabled。
     """
     if not _usage_day_buckets_enabled():
         return None
@@ -7948,7 +7852,7 @@ def _usage_day_bucket(state, row, r, factory):
     floor = state.get("days_floor")
     if floor is not None and key < floor:
         # 剪枝线以下的天：那些桶已经被丢掉，而且任何可服务的窗口都从
-        # days_floor 那天起，这一行不在其中——跳过不影响窗口。
+        # days_floor 那天起，这一行不在其中，跳过不影响窗口。
         return None
     _closed_window_hit_record(state, at)
     days = state["days"]
@@ -7962,15 +7866,15 @@ def _usage_day_bucket(state, row, r, factory):
 def _prune_day_buckets(state, days, newest_key):
     """丢掉任何窗口都够不到的旧日桶，并把 days_floor 抬到剪枝线。
 
-    days_floor 的语义是「这份状态从哪天起是完整的」：它就是剪枝线（最新那天
-    往前 _usage_day_keep_days() 天），没剪过时第一次折到新的一天也会把它记
-    下来——比这条线更早的窗口一律退回整段扫描（时钟大幅回拨、日志里有远古
-    补写行这类情况），宁可多扫一次，不能少算一天。
+    days_floor 的语义是这份状态从哪天起是完整的：它就是剪枝线，即最新那天
+    往前 _usage_day_keep_days 天。没剪过时第一次折到新的一天也会把它记下
+    来；比这条线更早的窗口一律退回整段扫描，例如时钟大幅回拨或日志里有
+    远古补写行，宁可多扫一次，不能少算一天。
 
-    analytics 状态还挂着一条更短的小时子表保留线（state["hours_keep"]）：
+    analytics 状态还挂着一条更短的小时子表保留线，即 state["hours_keep"]：
     小时层只为近期的自定义窗口服务，只摘旧天的 "hours" 子表，日桶本身照常
-    留满保留天数。被摘掉的天由查询侧按「这一天还有没有 hours」自己表达
-    （见 _analytics_window_from_hours），所以这里不用另存一个 floor。
+    留满保留天数。被摘掉的天由查询侧按「这一天还有没有 hours」自己表达，
+    见 _analytics_window_from_hours，所以这里不用另存一个 floor。
     """
     horizon = _local_day_key(_day_key_start(newest_key)
                              - _usage_day_keep_days() * 86400)
@@ -7979,12 +7883,12 @@ def _prune_day_buckets(state, days, newest_key):
     floor = state.get("days_floor")
     if floor is None or floor < horizon:
         state["days_floor"] = horizon
-    # 带小时层的状态（snapshot，见 _usage_hour_bucket）顺带剪小时表：小时层
-    # 的保留期比日桶短，剪枝线要跟着一起抬。analytics / series 的状态没有
-    # hours_floor_at 这个键，不会被这条带到。
+    # 带小时层的状态，即 snapshot，见 _usage_hour_bucket，顺带剪小时表：
+    # 小时层的保留期比日桶短，剪枝线要跟着一起抬。analytics 与 series 的
+    # 状态没有 hours_floor_at 这个键，不会被这条带到。
     if "hours_floor_at" in state:
         _prune_hour_buckets(state, days, newest_key)
-    # analytics 状态还挂着一条更短的小时子表保留线（state["hours_keep"]）：
+    # analytics 状态还挂着一条更短的小时子表保留线，即 state["hours_keep"]：
     # 小时层只为近期的自定义窗口服务，只摘旧天的 "hours" 子表，日桶本身照常
     # 留满保留天数。
     if state.get("hours_keep"):
@@ -7999,8 +7903,8 @@ def _days_cover(state, day_key):
     """这份状态的日桶能否服务以 day_key 为起点的窗口。
 
     days_floor 是剪枝线：比它早的窗口可能少了被剪掉的天，只能退回扫描。
-    它最早也要折到第一个新的一天才会记下（没折过就是 None，此时谁都不服务
-    ——调用方总是先折到文件尾，所以实际不会遇到）。
+    它要等第一次折到新的一天才会记下；没折过就是 None，此时谁都不服务，
+    调用方总是先折到文件尾，所以实际不会遇到。
     """
     floor = state.get("days_floor")
     return floor is not None and day_key >= floor
@@ -8009,21 +7913,21 @@ def _days_cover(state, day_key):
 def _usage_hour_bucket(state, row, day):
     """这一行该折进哪个小时桶；不该折时返回 None。
 
-    小时桶挂在日桶里（`hours` 子表），键是「离当天本地午夜的 3600 秒个数」
-    的字符串——与时间序列的小时子桶同一套格点规则（见 _fold_usage_series）：
-    桶的 at = 日桶 at + 序号*3600，所以每个桶恰好覆盖一个整点区间，跨桶
-    求和不会重复也不会漏。
+    小时桶挂在日桶里的 `hours` 子表，键是离当天本地午夜多少个 3600 秒的
+    字符串，与时间序列的小时子桶同一套格点规则，见 _fold_usage_series：
+    桶的 at 等于日桶 at 加序号乘 3600，所以每个桶恰好覆盖一个整点区间，
+    跨桶求和不会重复也不会漏。
 
-    at 早于日桶 at 的行（极少数时区在本地午夜切换夏令时，午夜那一刻不存在）
-    放不进格点：整张小时表摘掉并留痕（`hours` 记为 None），求和侧看到没有表
-    就退回按小时分组的冷路径（日桶本身照常，日窗口不受影响）。留痕是为了
-    挡住「摘掉之后又来了这一天的行、把表重建出来」——重建的表缺了被摘掉的
+    at 早于日桶 at 的行放不进格点：极少数时区在本地午夜切换夏令时，午夜
+    那一刻不存在。此时整张小时表摘掉并留痕，`hours` 记为 None，求和侧看到
+    没有表就退回按小时分组的冷路径，日桶本身照常，日窗口不受影响。留痕是
+    为了挡住摘掉之后又来了这一天的行、把表重建出来：重建的表缺了被摘掉的
     那批行，一旦被求和侧选中就是少算。
 
-    hours_floor_at 是小时层的剪枝线：比它早的天不再折小时表。迟写/补写的
-    行可能落回很久以前那天（日桶还留着），但那张表早被剪掉，重新建起来
-    只会得到一张缺了其余小时的表——求和侧一旦用它就会少算，所以这里直接
-    不折（求和侧另有 _hours_cover 兜底）。
+    hours_floor_at 是小时层的剪枝线：比它早的天不再折小时表。迟写或补写的
+    行可能落回很久以前那天，日桶还留着，但那张表早被剪掉；重新建起来只会
+    得到一张缺了其余小时的表，求和侧一旦用它就会少算，所以这里直接不折。
+    求和侧另有 _hours_cover 挡住更早的窗口。
     """
     floor = state.get("hours_floor_at")
     if floor is None or day["at"] < floor:
@@ -8032,7 +7936,7 @@ def _usage_hour_bucket(state, row, day):
     day_at = day["at"]
     hours = day.get("hours")
     if hours is None and "hours" in day:
-        # 这天的小时表被摘过（午夜兜底）：不再重建，见 docstring。
+        # 这天的小时表被摘过，午夜那一刻不存在，不再重建，见 docstring。
         return None
     if at < day_at:
         day["hours"] = None
@@ -8049,19 +7953,19 @@ def _usage_hour_bucket(state, row, day):
 def _prune_hour_buckets(state, days, newest_key):
     """丢掉保留窗口之外的日桶里的小时表，并把 hours_floor_at 抬到剪枝线。
 
-    小时层比日桶短命：它只服务最近几天的整点窗口（见 _USAGE_HOUR_KEEP_DAYS）。
-    剪枝按天走（与 _prune_day_buckets 同一套算术），所以实际保留在
-    keep_days 与 keep_days+1 天之间。hours_floor_at 的语义与 days_floor 相同
-    ——「这份状态的小时层从哪个时刻起是完整的」——更早的整点窗口一律退回
-    冷路径，宁可多扫一次，不能少算一个桶。
+    小时层比日桶保留期短，只服务最近几天的整点窗口，见
+    _USAGE_HOUR_KEEP_DAYS。剪枝按天走，与 _prune_day_buckets 同一套算术，
+    所以实际保留在 keep_days 与 keep_days 加 1 天之间。hours_floor_at 的
+    语义与 days_floor 相同：这份状态的小时层从哪个时刻起是完整的；更早的
+    整点窗口一律退回冷路径，宁可多扫一次，不能少算一个桶。
     """
     horizon_at = _day_key_start(newest_key) - _usage_hour_keep_days() * 86400
     horizon = _local_day_key(horizon_at)
     for key in list(days):
         if key < horizon and "hours" in days[key]:
-            # 与午夜兜底同一个留痕：表置 None 而不是删键。剪枝线（下面那条）
-            # 本来也挡着重建，但留痕让「这张表不可用」成为桶自己的事实，
-            # 求和侧与折叠侧不必再依赖两条线的一致性。
+            # 与午夜兜底同一个留痕：表置 None 而不是删键。下面那条剪枝线
+            # 本来也挡着重建，但留痕让这张表不可用成为桶自己的事实，求和侧
+            # 与折叠侧不必再依赖两条线的一致性。
             days[key]["hours"] = None
     floor = state.get("hours_floor_at")
     if floor is None or floor < horizon_at:
@@ -8071,22 +7975,22 @@ def _prune_hour_buckets(state, days, newest_key):
 def _hours_cover(state, since):
     """这份状态的小时层能否服务起点为 `since` 的窗口。
 
-    hours_floor_at 是剪枝线（见 _prune_hour_buckets）：比它早的窗口可能少了
-    被剪掉的小时表，只能退回扫描。它最早也要折到第一个新的一天才会记下
-    （没折过就是 None，此时谁都不服务——调用方总是先折到文件尾）。
+    hours_floor_at 是剪枝线，见 _prune_hour_buckets：比它早的窗口可能少了
+    被剪掉的小时表，只能退回扫描。它要等第一次折到新的一天才会记下；没折
+    过就是 None，此时谁都不服务，调用方总是先折到文件尾。
     """
     floor = state.get("hours_floor_at")
     return floor is not None and since >= floor
 
 
 def _hours_floor_on_adopt(days, stored):
-    """采用 checkpoint 时的小时层剪枝线：取「文件里的」与「按最新一天现算」
-    的较晚者。
+    """采用 checkpoint 时的小时层剪枝线：取文件里的与按最新一天现算的
+    较晚者。
 
-    较晚者一定安全：剪枝线只会往前抬，抬高了最多是少服务几天（那些窗口
-    退回冷路径），永远不会服务一张被剪过的表。两条都挡住同一条路——拿
-    不完整的表当完整（那是这个层唯一会算错数的方向）：文件里那条可能是
-    别的保留天数下写的，现算这条跟着当前 WB_USAGE_HOUR_KEEP_DAYS 走。
+    较晚者一定安全：剪枝线只会往后抬，抬高了最多是少服务几天，那些窗口
+    退回冷路径；永远不会服务一张被剪过的表。两条都挡住同一条路，即拿不
+    完整的表当完整，那是这个层唯一会算错数的方向。文件里那条可能是别的
+    保留天数下写的，现算这条跟着当前 WB_USAGE_HOUR_KEEP_DAYS 走。
     """
     recomputed = None
     if days:
@@ -8099,7 +8003,7 @@ def _hours_floor_on_adopt(days, stored):
 
 
 def _add_usage_bucket(dst_map, key, src):
-    """把一个 by_model* 桶并入同键的桶（不存在就整只拷进来）。"""
+    """把一个 by_model* 桶并入同键的桶；不存在就整只拷进来。"""
     dst = dst_map.get(key)
     if dst is None:
         dst_map[key] = _copy_usage_bucket(src)
@@ -8111,7 +8015,7 @@ def _add_usage_bucket(dst_map, key, src):
 
 
 def _add_usage_snapshot(dst, src):
-    """把一份窗口半快照按字段并入另一份（日桶求和用）。
+    """把一份窗口半快照按字段并入另一份，供日桶求和。
 
     逐字段相加，不是重折：日桶是不可变的聚合，窗口只是它们的和。started
     是每份快照各自的创建时刻，不是累计量，跳过。
@@ -8133,7 +8037,8 @@ def _add_usage_snapshot(dst, src):
 
 
 def _add_analytics_models(dst, src):
-    """把一份 {model: {requests, tokens, reasoning, cost_cny}} 并入另一份。"""
+    """把一份 model 到 requests、tokens、reasoning、cost_cny 统计的映射
+    并入另一份。"""
     for mid, stat in src.items():
         tgt = dst.get(mid)
         if tgt is None:
@@ -8144,11 +8049,11 @@ def _add_analytics_models(dst, src):
 
 
 def _add_analytics_window_maps(dst, src):
-    """把一份窗口形状的 analytics maps 并入另一份（日桶求和用）。
+    """把一份窗口形状的 analytics maps 并入另一份，供日桶求和。
 
-    日桶本身就是 _ANALYTICS_WINDOW 那一半的形状（window / window_models），
-    所以这里只动这两个键；realms / last_at 照并，虽然 _merge_analytics_halves
-    最终取的是 all-time 侧的值。
+    日桶本身就是 _ANALYTICS_WINDOW 那一半的形状，即 window 与
+    window_models，所以这里只动这两个键；realms 与 last_at 照并，虽然
+    _merge_analytics_halves 最终取的是 all-time 侧的值。
     """
     _add_analytics_stat(dst["summary"], src["summary"])
     for uid, entry in src["accts"].items():
@@ -8181,11 +8086,11 @@ def _add_analytics_window_maps(dst, src):
 
 
 def _copy_analytics_window_maps(maps):
-    """一份窗口形状 maps 的深拷贝（落盘用，形状同 _new_analytics_maps()）。
+    """一份窗口形状 maps 的深拷贝，落盘用，形状同 _new_analytics_maps。
 
-    日桶/小时桶还会多带 at（两者都有）与 hours 子表（日桶）：照原样拷贝、
-    键序保持折叠时的插入顺序——checkpoint 不排序，加载回来要与冷启动逐字节
-    一致（见 _usage_cache_write）。
+    日桶与小时桶还会多带 at 与 hours 子表：照原样拷贝，键序保持折叠时的
+    插入顺序。checkpoint 不排序，加载回来要与冷启动逐字节一致，见
+    _usage_cache_write。
     """
     out = {"summary": dict(maps["summary"]), "accts": {}, "models": {}, "keys": {}}
     for uid, entry in maps["accts"].items():
@@ -8213,16 +8118,16 @@ def _copy_analytics_window_maps(maps):
 def _scan_usage_snapshot_window_days(r, since, until, pricing_on=None):
     """窗口半的冷路径：整段扫一遍，先按日分桶再相加。
 
-    日桶状态不可用（还没折过、被剪枝、折叠出错）时走这里。结果必须与日桶
-    状态给出的窗口半逐字节一致：窗口起点是本地午夜（until 给出时终点也是
-    本地午夜），两边装的是同一批行、同一个「按日分组」的求和口径，只是桶
+    日桶状态不可用时走这里，包括还没折过、被剪枝、折叠出错。结果必须与
+    日桶状态给出的窗口半逐字节一致：窗口起点是本地午夜，until 给出时终点
+    也是本地午夜；两边装的是同一批行、同一个按日分组的求和口径，只是桶
     一个现折、一个存量。
 
-    状态冷时它是窗口请求的直接答案（不折状态，重折留给 all-time 视图与
-    预热器，见 _usage_snap_state_cold）；其余情形它紧跟一次 all-time 折叠
-    （_usage_snapshot_window_from_days 先折到文件尾才发现日桶不够用），
-    行级记忆几乎全中：同一批行刚在 all-time 半算过价与日键。窗口外的行由
-    skip 挡在解析之前，这条路只付窗口内那批行。价表照样在本函数开头取一次。
+    状态冷时它是窗口请求的直接答案，不折状态，重折留给 all-time 视图与
+    预热器，见 _usage_snap_state_cold。其余情形它紧跟一次 all-time 折叠：
+    _usage_snapshot_window_from_days 先折到文件尾才发现日桶不够用。行级
+    记忆几乎全中，同一批行刚在 all-time 半算过价与日键。窗口外的行由 skip
+    挡在解析之前，这条路只付窗口内那批行。价表照样在本函数开头取一次。
     """
     pricing = _pricing_inputs(pricing_on)
     days = {}
@@ -8257,17 +8162,17 @@ def _scan_usage_snapshot_window_days(r, since, until, pricing_on=None):
 def _scan_usage_snapshot_window_hours(r, since, until, pricing_on=None):
     """窗口半的冷路径：整段扫一遍，先按小时分桶再相加。
 
-    小时层状态不可用（还没折过、被剪枝、折叠出错、那天的格点不成立）时走
-    这里。结果必须与小时桶状态给出的窗口半逐字节一致：窗口起点是本地整点
-    （until 给出时终点也落在同一套格点上），两边装的是同一批行、同一个
-    「按（日，小时）分组」的求和口径，只是桶一个现折、一个存量。
+    小时层状态不可用时走这里，包括还没折过、被剪枝、折叠出错、那天的格点
+    不成立。结果必须与小时桶状态给出的窗口半逐字节一致：窗口起点是本地
+    整点，until 给出时终点也落在同一套格点上；两边装的是同一批行、同一个
+    按日与小时分组的求和口径，只是桶一个现折、一个存量。
 
-    分组与 _usage_hour_bucket 同一套算术（日键 + 离午夜多少个 3600 秒），
-    但这里对 at 早于本地午夜的行照折不误（键可以是负的）：状态侧那种行会
-    把整张小时表摘掉、窗口退回这条路径，所以这条路径必须把它们算进去。
-    排序按 (日键, 序号) 数值序，与状态侧的遍历顺序一致。
+    分组与 _usage_hour_bucket 同一套算术，即日键加离午夜多少个 3600 秒。
+    但这里对 at 早于本地午夜的行照折不误，键可以是负的：状态侧那种行会把
+    整张小时表摘掉、窗口退回这条路径，所以这条路径必须把它们算进去。
+    排序按日键与序号的数值序，与状态侧的遍历顺序一致。
 
-    价表在本函数开头取一次，行级记忆（见「行级结果记忆」）跟着这一批扫描
+    价表在本函数开头取一次，行级记忆，见「行级结果记忆」，跟着这一批扫描
     走：同一批行通常刚在 all-time 半算过价与日键，这里几乎全中。
     """
     pricing = _pricing_inputs(pricing_on)
@@ -8307,7 +8212,7 @@ def _scan_usage_snapshot_window_hours(r, since, until, pricing_on=None):
 
 def _scan_usage_analytics_window_days(realm, since, until, stop_at=None,
                                       pricing_on=None):
-    """窗口半 analytics 的冷路径：按日分桶再相加（见 snapshot 版）。"""
+    """窗口半 analytics 的冷路径：按日分桶再相加，见 snapshot 版。"""
     pricing = _pricing_inputs(pricing_on)
     days = {}
 
@@ -8338,17 +8243,18 @@ def _scan_usage_analytics_window_days(realm, since, until, stop_at=None,
 
 def _scan_usage_analytics_window_hours(realm, since, until, stop_at=None,
                                        pricing_on=None):
-    """窗口半 analytics 的冷路径（起点整小时）：按小时分桶再相加。
+    """窗口半 analytics 的冷路径，起点整小时：按小时分桶再相加。
 
-    小时层不可用（还没折过、被剪枝、折叠出错、until 切在桶中间）时走这里。
-    结果必须与小时桶状态给出的窗口半逐字节一致：两边装的是同一批行、同一个
-    「按小时分组」的求和口径，只是桶一个现折、一个存量。
+    小时层不可用时走这里，包括还没折过、被剪枝、折叠出错、until 切在桶
+    中间。结果必须与小时桶状态给出的窗口半逐字节一致：两边装的是同一批行、
+    同一个按小时分组的求和口径，只是桶一个现折、一个存量。
 
-    分桶与折叠侧同一条规则（离那天的本地午夜多少秒）；本地午夜落在不存在
-    的小时里时这一天的小时键会变成负数，求和照样把它算进去（分组只是浮点
-    结合顺序的载体），所以这条冷路径不依赖格点是否成立。
+    分桶与折叠侧同一条规则，即离那天的本地午夜多少秒。本地午夜落在不存在
+    的小时里时这一天的小时键会变成负数，求和照样把它算进去，因为分组只是
+    浮点结合顺序的载体，所以这条冷路径不依赖格点是否成立。
 
-    价表在本函数开头取一次，行级记忆（见「行级结果记忆」）跟着这一批扫描走。
+    价表在本函数开头取一次，行级记忆，见「行级结果记忆」，跟着这一批扫描
+    走。
     """
     pricing = _pricing_inputs(pricing_on)
     days = {}
@@ -8386,31 +8292,31 @@ def _scan_usage_analytics_window_hours(realm, since, until, stop_at=None,
 
 
 # ---------------------------------------------------------------------------
-# 时间序列的日/小时/分钟桶
+# 时间序列的日、小时与分钟桶
 #
-# usage_timeseries() 本来就把行按时间装桶，但每次缓存未命中都要整段扫描
-# （路由器上 range=week 约 2 秒）。窗口边界同样是本地午夜，而它的桶宽只有
-# 3600 与 86400 两种能与窗口一致；span<=6h 的窗口（自定义区间，选择器
-# 见 _usage_timeseries_scope）给出 step=60，边界是任意分钟格点，日/小时桶
-# 都答不了——这一档由「最近 6 小时的分钟环」回答（见 _fold_usage_series_minute）。
-# 折叠时顺手维护这三层，窗口就是它们的切片：每个输出桶恰好等于一个存量桶
-# （不做跨桶相加），所以连浮点求和都是逐位一致的——不像 snapshot/analytics
-# 的窗口半需要把日桶相加。
+# usage_timeseries 本来就把行按时间装桶，但每次缓存未命中都要整段扫描。
+# 窗口边界同样是本地午夜，而它的桶宽只有 3600 与 86400 两种能与窗口一致；
+# span 不超过 6h 的窗口，也就是自定义区间，选择器见 _usage_timeseries_scope，
+# 给出 step=60，边界是任意分钟格点，日桶与小时桶都答不了；这一档由最近
+# 6 小时的分钟环回答，见 _fold_usage_series_minute。折叠时顺手维护这三层，
+# 窗口就是它们的切片：每个输出桶恰好等于一个存量桶，不做跨桶相加，所以连
+# 浮点求和都是逐位一致的；snapshot 与 analytics 的窗口半需要把日桶相加，
+# 没有这个性质。
 # ---------------------------------------------------------------------------
 _series_state = {}
 _series_state_lock = threading.Lock()
-# credit 历史只保留最近这么多条（整段扫描返回的也是窗口内的前 50 条）。
+# credit 历史只保留最近这么多条，整段扫描返回的也是窗口内的前 50 条。
 _SERIES_CREDITS_KEEP = 50
-# 分钟环的保留窗口：6 小时，与选择器给出 step=60 的最大跨度（span<=6h）一一
-# 对应。分钟桶比小时桶密 60 倍，跟着日桶的 32 天保留会让 checkpoint 翻好几倍，
-# 而更早的窗口本来就该由小时层（step=3600）回答——所以环只留最近 6 小时。
-# 保留线用「桶的 at 严格小于 max_at - 窗口」判定，窗口服务条件写成
-# lo >= max_at - 窗口；两者一配对，服务得上的窗口需要的桶恰好一个不落
-# （窗口起点必须落在分钟格点上，见 _series_minute_grid_ok）。
+# 分钟环的保留窗口：6 小时，与选择器给出 step=60 的最大跨度 span<=6h 一一
+# 对应。分钟桶比小时桶密 60 倍，跟着日桶的 32 天保留会让 checkpoint 翻好
+# 几倍，而更早的窗口本来就该由小时层回答，即 step=3600；所以环只留最近
+# 6 小时。保留线用桶的 at 严格小于 max_at 减窗口来判定，窗口服务条件写成
+# lo >= max_at - 窗口；两者一配对，服务得上的窗口需要的桶恰好一个不落。
+# 窗口起点必须落在分钟格点上，见 _series_minute_grid_ok。
 _SERIES_MINUTE_WINDOW = 6 * 3600
-# 折叠途中环的临时上限：超过就按保留线剪一次。剪枝是 O(环大小)、而环的
-# 正常大小 <= 361（6 小时 + 两个端点），720 是给「冷折时环里还堆着更早的
-# 桶」留的余量——这样整趟冷折的内存有界（满环约 200KB），不用等折完才剪。
+# 折叠途中环的临时上限：超过就按保留线剪一次。剪枝复杂度随环大小线性增长，
+# 而环的正常大小不超过 361，即 6 小时加两个端点；720 是给冷折时环里还堆着
+# 更早的桶留的余量。这样整趟冷折的内存有界，满环约 200KB，不用等折完才剪。
 _SERIES_MINUTE_RING_CAP = 720
 
 
@@ -8422,11 +8328,11 @@ def _new_series_bucket(at):
 
 
 def _feed_series_bucket(bucket, row):
-    """一行折进一个序列桶（日桶或小时桶）。
+    """一行折进一个序列桶，可能是日桶或小时桶。
 
     口径与 _usage_timeseries_uncached 的折叠逐条一致：completed 计 requests
-    与令牌，其它结果（含客户端中止）计 errors；credit 只要不是客户端中止就
-    累加。
+    与令牌，其它结果，含客户端中止，计 errors；credit 只要不是客户端中止
+    就累加。
     """
     outcome = row_outcome(row)
     if outcome == "completed":
@@ -8454,13 +8360,12 @@ def _series_credit_entry(at, row):
 
 
 def _series_credit_push(credits, row, at):
-    """把一条带 credit 的行放进「最近 50 条」缓冲。
+    """把一条带 credit 的行放进最近 50 条的缓冲。
 
     整段扫描返回的 credits 是窗口内按 at 倒序的前 50 条；缓冲里始终留着
-    最新的一批（至少 50 条，涨到 100 条时裁回 50），于是任何后缀窗口
-    （today/week/month 都是）的前 50 条都在这批里——比缓冲最旧一条还旧的
-    行不可能是窗口的前 50 条。at 相同时两边都是稳定排序，顺序（日志顺序）
-    一致。
+    最新的一批，至少 50 条，涨到 100 条时裁回 50。于是任何后缀窗口，即
+    today、week 与 month，的前 50 条都在这批里：比缓冲最旧一条还旧的行
+    不可能是窗口的前 50 条。at 相同时两边都是稳定排序，顺序与日志一致。
     """
     credits.append(_series_credit_entry(at, row))
     if len(credits) > _SERIES_CREDITS_KEEP * 2:
@@ -8469,20 +8374,20 @@ def _series_credit_push(credits, row, at):
 
 
 def _series_minute_key(at):
-    """行 -> 它所属的分钟桶键：epoch 分钟（向下取整）。
+    """行所属的分钟桶键：epoch 分钟，向下取整。
 
-    键用 epoch 分钟而不是「离本地午夜多少秒」：分钟窗口的起点是任意分钟格点
-    （自定义区间的 since），不锚在本地午夜上，所以桶的格点也取绝对分钟；
+    键用 epoch 分钟而不是离本地午夜多少秒：分钟窗口的起点是任意分钟格点，
+    也就是自定义区间的 since，不锚在本地午夜上，所以桶的格点也取绝对分钟。
     这样跨午夜、跨小时都是同一张表，切片不必按天分组。
     """
     return int(at // 60)
 
 
 def _fold_usage_series_minute(state, row, at):
-    """一行折进分钟环（与日/小时桶同一 realm 过滤、同一折叠口径）。
+    """一行折进分钟环，与日桶、小时桶同一 realm 过滤、同一折叠口径。
 
-    保留线以下的桶不建（建了也会被下一次剪枝丢掉）：窗口要服务得上的行都在
-    max_at - 6h 之上，更早的行折进来只是白建一个马上被剪的桶。
+    保留线以下的桶不建，建了也会被下一次剪枝丢掉：窗口要服务得上的行都在
+    max_at 减 6h 之上，更早的行折进来只是白建一个马上被剪的桶。
     """
     key = _series_minute_key(at)
     if key * 60 < state["max_at"] - _SERIES_MINUTE_WINDOW:
@@ -8497,12 +8402,12 @@ def _fold_usage_series_minute(state, row, at):
 
 
 def _prune_series_minutes(state):
-    """丢掉保留线（max_at - 6h）以下的分钟桶。
+    """丢掉保留线 max_at 减 6h 以下的分钟桶。
 
     只按 max_at 剪，不跟日桶的 32 天剪枝线：分钟环的覆盖范围就是它自己的
     保留窗口，与日桶保留多少天无关。判定与 _fold_usage_series_minute 的
-    跳过条件同一条（桶的 at 严格小于保留线），两边不会出现「建的桶马上被剪」
-    或「剪了还需要的桶」。
+    跳过条件同一条，即桶的 at 严格小于保留线，两边不会出现建的桶马上被剪
+    或剪了还需要的桶。
     """
     horizon = state["max_at"] - _SERIES_MINUTE_WINDOW
     minutes = state["minutes"]
@@ -8514,26 +8419,26 @@ def _fold_usage_series(row, r, state):
     """一行折进时间序列状态：日桶 + 小时桶 + 分钟环 + credit 缓冲。"""
     at = row.get("at") or 0
     if at > state["max_at"]:
-        # 折过的最大 at：窗口上界（hi=now）只要不低于它，存量桶就都在窗口内。
-        # 越界的行（时钟回拨/补写）会让它偏大，那只是更保守，方向安全。
+        # 折过的最大 at：窗口上界 hi=now 只要不低于它，存量桶就都在窗口内。
+        # 越界的行，例如时钟回拨或补写，会让它偏大，那只是更保守，方向安全。
         state["max_at"] = at
     bucket = _usage_day_bucket(state, row, r, _day_series_bucket)
     if bucket is None:
         return
     _feed_series_bucket(bucket, row)
-    # 分钟环放在小时桶的午夜兜底之前：兜底会 return（那一天的 hours 摘掉），
-    # 而分钟环与日/小时格点无关，漏折一行就会让它的覆盖出现空洞。
+    # 分钟环放在小时桶的午夜兜底之前：兜底会 return，那一天的 hours 被摘掉，
+    # 而分钟环与日、小时格点无关，漏折一行就会让它的覆盖出现空洞。
     _fold_usage_series_minute(state, row, at)
     if at < bucket["at"]:
-        # 本地午夜落在不存在的小时里（极少数时区的夏令时正好在午夜切换）：
-        # 这一天的行放不进小时格点，把 hours 摘掉让切片对这一天整体退回扫描
-        # （日桶本身照常，step=86400 的切片不受影响）。
+        # 本地午夜落在不存在的小时里，极少数时区的夏令时正好在午夜切换：
+        # 这一天的行放不进小时格点，把 hours 摘掉让切片对这一天整体退回扫描；
+        # 日桶本身照常，step=86400 的切片不受影响。
         bucket.pop("hours", None)
         return
-    # 小时子桶按「离那天的本地午夜多少秒」切：窗口起点是本地午夜时，窗口
-    # 序列的桶序号 k = 天序号*24 + 小时序号（夏令时不在日边界上时也一样，
-    # 因为两边都是纯 epoch 算术；日边界被夏令时挪动的情形由 _series_slice
-    # 的格点校验挡住）。键写成字符串，与 JSON 往返后的形状一致。
+    # 小时子桶按离那天的本地午夜多少秒切：窗口起点是本地午夜时，窗口序列的
+    # 桶序号等于天序号乘 24 加小时序号。夏令时不在日边界上时也一样，因为
+    # 两边都是纯 epoch 算术；日边界被夏令时挪动的情形由 _series_slice 的
+    # 格点校验挡住。键写成字符串，与 JSON 往返后的形状一致。
     hour = str(int((at - bucket["at"]) // 3600))
     sub = bucket["hours"].get(hour)
     if sub is None:
@@ -8545,15 +8450,15 @@ def _fold_usage_series(row, r, state):
 
 
 def _usage_series_state_ready(r):
-    """把 `r` 的时间序列状态推进到文件尾；返回 (state, offset, error)。
+    """把 `r` 的时间序列状态推进到文件尾，返回 state、offset 与 error。
 
     调用方必须已持有 _series_state_lock。时间序列折叠不算价，所以状态只带
-    realm 指纹（行没有 realm 字段时 row_realm() 会读它）。
+    realm 指纹；行没有 realm 字段时 row_realm 会读它。
 
-    状态里的 `minutes_from` 是分钟环的完整线：从零折起（含 refold）时它是
-    None（环对整份日志完整）；采用了一份没有分钟环的旧 checkpoint 时，环只
-    对采用点之后折进来的行完整，那条线就是采用时的 max_at（见
-    _usage_cache_adopt_series）。
+    状态里的 `minutes_from` 是分钟环的完整线。从零折起或 refold 时它是
+    None，环对整份日志完整；采用一份缺少分钟环的 checkpoint 时，环只对
+    采用点之后折进来的行完整，那条线就是采用时的 max_at，见
+    _usage_cache_adopt_series。
     """
     state = _series_state.get(r)
     if state is None:
@@ -8565,7 +8470,7 @@ def _usage_series_state_ready(r):
     realm = _realm_inputs()
     log_key = _usage_log_key()
     if state["key"] is None:
-        # 全新状态（进程刚起来）：先问 checkpoint，问不到才从零折起。
+        # 全新状态，进程刚起来：先问 checkpoint，问不到才从零折起。
         if not _usage_cache_adopt_series(r, state, log_key, realm):
             state.update({"days": {}, "days_floor": None, "max_at": 0,
                           "credits": [], "minutes": {}, "minutes_from": None,
@@ -8582,14 +8487,14 @@ def _usage_series_state_ready(r):
     if error is None:
         state["offset"] = offset
         state["tail"] = _log_tail_signature(offset)
-        # 折叠途中的剪枝是按上限触发的，收尾再剪一次，落盘的环就是保留窗口
-        # 以内的那一批（状态不折时这里也不花时间：环大小 <= 上限）。
+        # 折叠途中的剪枝按上限触发，收尾再剪一次，落盘的环就是保留窗口以内
+        # 的那一批；状态不折时这里也不花时间，环大小不超过上限。
         _prune_series_minutes(state)
     return state, offset, error
 
 
 def _series_output_bucket(bucket):
-    """存量桶 -> 输出桶（键序固定；日桶的 hours 子表不进输出）。"""
+    """存量桶转成输出桶，键序固定；日桶的 hours 子表不进输出。"""
     return {"at": bucket["at"], "requests": bucket["requests"],
             "errors": bucket["errors"], "prompt_tokens": bucket["prompt_tokens"],
             "completion_tokens": bucket["completion_tokens"],
@@ -8601,10 +8506,10 @@ def _series_output_bucket(bucket):
 def _series_minute_grid_ok(lo):
     """窗口起点能否落在分钟环的格点上：lo 必须是 60 的整数倍。
 
-    整段扫描的桶边界是 lo + k*60，存量分钟桶的边界是 epoch 分钟的整数倍；
-    两组边界一一对应（可以整桶取用）当且仅当 lo 自己落在格点上。面板的
-    datetime-local 输入给的就是整分钟（fromLocalInputValue 只到分钟），
-    手写的带小数的 since 一律退回整段扫描。
+    整段扫描的桶边界是 lo 加 k 乘 60，存量分钟桶的边界是 epoch 分钟的整数
+    倍；两组边界一一对应、可以整桶取用，当且仅当 lo 自己落在格点上。面板
+    的 datetime-local 输入给的就是整分钟，fromLocalInputValue 只到分钟；
+    手写的带小数 since 一律退回整段扫描。
     """
     return int(lo) == lo and int(lo) % 60 == 0
 
@@ -8612,9 +8517,10 @@ def _series_minute_grid_ok(lo):
 def _series_window_day_key(lo):
     """窗口起点 lo 的本地日键；取值超出平台 epoch 范围时返回 None。
 
-    _local_day_key 走 time.localtime，手写的极大 since（例如 6e18）会让它抛
-    OSError——那只是「这个窗口服务不了」的一种，按退回整段扫描处理，不该把
-    端点打成 500。分钟切片拿这个键做 days_floor 覆盖判断，拿不到就退回扫描。
+    _local_day_key 走 time.localtime，手写的极大 since，例如 6e18，会让它
+    抛出 OSError。那只是这个窗口服务不了的一种情形，按退回整段扫描处理，
+    不该把端点打成 500。分钟切片拿这个键做 days_floor 覆盖判断，拿不到就
+    退回扫描。
     """
     try:
         return _local_day_key(lo)
@@ -8623,13 +8529,14 @@ def _series_window_day_key(lo):
 
 
 def _series_closed_cut_ok(state, lo_i, hi, step):
-    """闭窗口的右边界能否由存量桶回答：hi 落在桶格点上，且直到它没有整秒行。
+    """闭窗口的右边界能否由存量桶回答：hi 落在桶格点上，且直到它没有
+    整秒行。
 
-    桶按 at 严格切分（日/小时桶锚在本地午夜，分钟环锚在 epoch 分钟），所以
-    hi 落在与桶同一条格点上时，「[lo, hi] 的行」与「at < hi 的桶」只差
-    「恰好落在 hi 上的行」；那一刻有整秒行时桶切不出它，只能退回整段扫描
-    （见 _closed_window_edge_ok）。取值离谱的 hi（手写 URL）按不成立处理，
-    退回整段扫描——与 _series_window_day_key 的取值保护同一个用意。
+    桶按 at 严格切分：日桶与小时桶锚在本地午夜，分钟环锚在 epoch 分钟。
+    所以 hi 落在与桶同一条格点上时，[lo, hi] 的行与 at < hi 的桶只差恰好
+    落在 hi 上的行；那一刻有整秒行时桶切不出它，只能退回整段扫描，见
+    _closed_window_edge_ok。取值离谱的 hi，例如手写 URL，按不成立处理，
+    退回整段扫描，与 _series_window_day_key 的取值保护同一个用意。
     """
     if not _closed_window_edge_ok(state, hi):
         return False
@@ -8648,33 +8555,34 @@ def _series_closed_cut_ok(state, lo_i, hi, step):
 
 
 def _series_slice_minutes(state, realm, lo, hi, day_key):
-    """分钟环的切片；不满足边界/覆盖条件时返回 None（退回整段扫描）。
+    """分钟环的切片；不满足边界或覆盖条件时返回 None，退回整段扫描。
 
-    成立条件（缺一不可，任何一条不成立就退回整段扫描——正确性优先）：
-      * 窗口起点是分钟格点（见 _series_minute_grid_ok）；
-      * hi 不低于折过的最大 at：否则窗口上界会切进桶里，而桶是聚合值，
-        切不出一半来（与日/小时切片同一条）。hi 切进数据里（闭窗口）时
-        还要过闭窗口闸门（见 _series_closed_cut_ok）：hi 落在分钟格点上、
-        且直到那一刻没有整秒行，才按「at < hi 的桶」切，恰好落在 hi 上的
-        行由边沿账挡回整段扫描；
-      * 窗口起点不早于 max_at - 6h：环的保留线，更早的窗口环里没有桶；
-      * 窗口起点晚于 minutes_from：环只从那条线之后才完整（采用过没有
-        分钟环的旧 checkpoint 时才有这条线，见 _usage_series_state_ready）；
-      * 每个桶的 at 落在键*60 上且不晚于 max_at（形状校验之外的防御，
-        与 _series_slice 对小时子桶的格点校验同一个用意）。
-    输出桶与整段扫描逐条相同（同一批行、同一个网格、同一个累加口径），
-    credits 与日/小时切片共用下面同一段选择。
+    成立条件缺一不可，任何一条不成立就退回整段扫描，优先保证正确：
+      * 窗口起点是分钟格点，见 _series_minute_grid_ok；
+      * hi 不低于折过的最大 at，否则窗口上界会切进桶里，而桶是聚合值，切
+        不出一半来，与日切片、小时切片同一条。hi 切进数据里时属于闭窗口，
+        还要过闭窗口闸门，见 _series_closed_cut_ok：hi 落在分钟格点上，且
+        直到那一刻没有整秒行，才按 at < hi 的桶切；恰好落在 hi 上的行由
+        边沿账挡回整段扫描；
+      * 窗口起点不早于 max_at 减 6h，这是环的保留线，更早的窗口环里没有桶；
+      * 窗口起点晚于 minutes_from，环只从那条线之后才完整；采用过缺少分钟
+        环的 checkpoint 时才有这条线，见 _usage_series_state_ready；
+      * 每个桶的 at 落在键乘 60 上且不晚于 max_at，这是形状校验之外的防御，
+        与 _series_slice 对小时子桶的格点校验同一个用意。
+
+    输出桶与整段扫描逐条相同，即同一批行、同一个网格、同一个累加口径；
+    credits 与日切片、小时切片共用下面同一段选择。
     """
     minutes = state.get("minutes")
     if not minutes:
-        # 空环（或状态里没有环）：这一份状态没有任何行落在保留窗口里。空环
-        # 答不出窗口里的行，也不能把窗口静默答成空序列——退回整段扫描，
-        # 由扫描给出真值（正确的空序列也由它给）。
+        # 空环，或状态里没有环：这一份状态没有任何行落在保留窗口里。空环
+        # 答不出窗口里的行，也不能把窗口静默答成空序列；退回整段扫描，由
+        # 扫描给出真值，正确的空序列也由它给。
         return None
     lo_i = int(lo)
     cut = False
     if hi < state["max_at"]:
-        # 上界切进环里：闭窗口闸门不成立就退回整段扫描（结果不变）。
+        # 上界切进环里：闭窗口闸门不成立就退回整段扫描，结果不变。
         if not _series_closed_cut_ok(state, lo_i, hi, 60):
             return None
         cut = True
@@ -8686,7 +8594,7 @@ def _series_slice_minutes(state, realm, lo, hi, day_key):
     if minutes_from is not None and lo_i <= minutes_from:
         return None
     if day_key is None:
-        # 直接调用（测试）时补上；取值离谱（见 _series_window_day_key）就退回。
+        # 直接调用时由测试补上；取值离谱，见 _series_window_day_key，就退回。
         day_key = _series_window_day_key(lo)
         if day_key is None:
             return None
@@ -8701,24 +8609,25 @@ def _series_slice_minutes(state, realm, lo, hi, day_key):
         if at < lo_i:
             continue
         if cut and at >= hi:
-            # 闭窗口：hi 那一刻归后一桶（桶按 at 严格切分），只取 at < hi
-            # 的桶；那一刻有整秒行时上面已经退回。
+            # 闭窗口：hi 那一刻归后一桶，桶按 at 严格切分；只取 at < hi 的
+            # 桶。那一刻有整秒行时上面已经退回。
             break
         out = _series_output_bucket(sub)
-        # 整段扫描的桶 at 是 lo + k*60，类型跟着 lo 走（int 或 float）；
-        # 存量桶的 at 是整数，这里按 lo 的类型处理，两边的 JSON 字节才一致。
+        # 整段扫描的桶 at 是 lo 加 k 乘 60，类型跟着 lo 走，可能是 int 或
+        # float；存量桶的 at 是整数，这里按 lo 的类型处理，两边的 JSON 字节
+        # 才一致。
         out["at"] = int(at) if isinstance(lo, int) else float(at)
         series.append(out)
     return _series_payload(state, realm, lo, hi, 60, series)
 
 
 def _series_payload(state, realm, lo, hi, step, series):
-    """切片载荷的公共部分：窗口头 + credit 历史。
+    """切片载荷的公共部分：窗口头与 credit 历史。
 
-    credit 历史：缓冲按 at 倒序稳定排序后取窗口内的前 50 条——与整段扫描
-    的选择逐条相同（见 _series_credit_push 的论证）。窗口的两端都要过滤：
-    缓冲收的是整份日志的计费行，闭窗口的上界切进缓冲里时（hi < max_at），
-    at > hi 的行不属于窗口，整段扫描不会收它们，切片也必须裁掉。
+    credit 历史：缓冲按 at 倒序稳定排序后取窗口内的前 50 条，与整段扫描的
+    选择逐条相同，见 _series_credit_push 的论证。窗口的两端都要过滤：缓冲
+    收的是整份日志的计费行；闭窗口的上界切进缓冲里时 hi < max_at，at > hi
+    的行不属于窗口，整段扫描不会收它们，切片也必须裁掉。
     """
     credits = sorted(state["credits"], key=lambda item: item.get("at") or 0,
                      reverse=True)
@@ -8730,22 +8639,22 @@ def _series_payload(state, realm, lo, hi, step, series):
 
 
 def _series_slice(state, realm, lo, hi, step, day_key):
-    """窗口序列 = 日桶/小时桶/分钟环的切片；不满足边界条件时返回 None。
+    """窗口序列等于日桶、小时桶或分钟环的切片；不满足边界条件时返回 None。
 
-    成立条件（缺一不可，任何一条不成立就退回整段扫描——正确性优先）：
-      * 窗口起点是本地午夜（day_key 由 _window_day_key 给出）；
-      * 桶宽是 3600 或 86400（与窗口一致的两种）；
-      * days_floor 覆盖窗口起点（剪枝/更早的天没折过就只能整段扫）；
-      * hi 不低于折过的最大 at，否则窗口上界会切掉桶里的行；hi 切进数据里
-        （闭窗口）时还要过闭窗口闸门（见 _series_closed_cut_ok）：hi 落在
-        同一套桶格点上、且直到那一刻没有整秒行，才按「at < hi 的桶」切，
-        恰好落在 hi 上的行由边沿账挡回整段扫描；
-      * 每个桶的 at 落在 lo + k*step 的格点上。这一条同时挡住夏令时：日长
-        不是 86400 秒的那天之后，每一天的本地午夜都不再落在 86400 的格点上，
-        于是自动退回整段扫描。时区没有夏令时（cn/路由器）时恒真。
+    成立条件缺一不可，任何一条不成立就退回整段扫描，优先保证正确：
+      * 窗口起点是本地午夜，day_key 由 _window_day_key 给出；
+      * 桶宽是 3600 或 86400，即与窗口一致的两种；
+      * days_floor 覆盖窗口起点，剪枝或更早的天没折过就只能整段扫；
+      * hi 不低于折过的最大 at，否则窗口上界会切掉桶里的行。hi 切进数据里
+        时属于闭窗口，还要过闭窗口闸门，见 _series_closed_cut_ok：hi 落在
+        同一套桶格点上，且直到那一刻没有整秒行，才按 at < hi 的桶切；恰好
+        落在 hi 上的行由边沿账挡回整段扫描；
+      * 每个桶的 at 落在 lo 加 k 乘 step 的格点上。这一条同时挡住夏令时：
+        日长不是 86400 秒的那天之后，每一天的本地午夜都不再落在 86400 的
+        格点上，于是自动退回整段扫描。时区没有夏令时则恒真，例如 cn。
 
-    桶宽 60 走分钟环（条件见 _series_slice_minutes），它不要求窗口起点是
-    本地午夜，只要求落在分钟格点上。
+    桶宽 60 走分钟环，条件见 _series_slice_minutes；它不要求窗口起点是本
+    地午夜，只要求落在分钟格点上。
     """
     if step == 60:
         return _series_slice_minutes(state, realm, lo, hi, day_key)
@@ -8754,7 +8663,7 @@ def _series_slice(state, realm, lo, hi, step, day_key):
     lo_i = int(lo)
     cut = False
     if hi < state["max_at"]:
-        # 上界切进桶里：闭窗口闸门不成立就退回整段扫描（结果不变）。
+        # 上界切进桶里：闭窗口闸门不成立就退回整段扫描，结果不变。
         if not _series_closed_cut_ok(state, lo_i, hi, step):
             return None
         cut = True
@@ -8790,7 +8699,7 @@ def _series_slice(state, realm, lo, hi, step, day_key):
             if (int(sub["at"]) - lo_i) % 3600:
                 return None
             if cut and int(sub["at"]) >= hi:
-                # 闭窗口的右边界（放在格点校验之后——错开的桶要先退回扫描）。
+                # 闭窗口的右边界，放在格点校验之后：错开的桶要先退回扫描。
                 done = True
                 break
             series.append(_series_output_bucket(sub))
@@ -8798,10 +8707,10 @@ def _series_slice(state, realm, lo, hi, step, day_key):
 
 
 def _top_models(bucket, top_n=KEY_MODEL_TOP_N):
-    """Split a model bucket into the N busiest models plus one remainder.
+    """把一个模型桶拆成最忙的 N 个模型和一条剩余项。
 
-    The remainder is flagged with `other` rather than being recognised by its
-    label, so a model genuinely called "(其他)" cannot be mistaken for it.
+    剩余项用 `other` 标记识别，不靠名称判断，所以真的叫「(其他)」的模型
+    不会被误认成剩余项。
     """
     items = sorted(bucket.items(), key=lambda kv: (-kv[1]["tokens"], -kv[1]["requests"], kv[0]))
     head = [{"model": mid, "requests": s["requests"], "tokens": s["tokens"],
@@ -8821,18 +8730,15 @@ def _top_models(bucket, top_n=KEY_MODEL_TOP_N):
 
 
 def _build_key_rows(key_map, realm=None):
-    """Merge observed per-key traffic with the configured key roster.
+    """把观察到的每 key 流量与配置里的 key 清单合并成表格行。
 
-    Every key the panel can still see gets a row even with no traffic in the
-    window: a key that was used yesterday and not today is a fact about
-    today's spend, and dropping it would read as "the key is gone". A key that
-    is disabled *and* idle in this window is dropped, because that row says
-    nothing about the selected range.
+    面板还能看到的每个 key 都有一行，窗口内没有流量也一样：昨天用过、今天
+    没用的 key 是今天支出的一部分事实，删掉这行会被读成 key 消失了。禁用且
+    在窗口内空闲的 key 会被丢掉，因为这一行说明不了所选区间的任何事。
 
-    The reverse direction matters just as much: an id seen in the log that the
-    roster does not know still gets a row, so the per-key table always adds up
-    to the per-account table. Those are folded into a single row - ids that
-    cannot be named are an anomaly, not a dimension worth splitting.
+    反方向同样重要：日志里出现而清单不认识的 id 也要有一行，这样每 key 表
+    永远与每账号表对得上。这些 id 合并成单独一行，无法命名的 id 是异常，
+    不值得单独拆成一个维度。
     """
     key_map = key_map or {}
     rows = {}
@@ -8857,7 +8763,7 @@ def _build_key_rows(key_map, realm=None):
         if not k_id:
             continue
         declared = entry.get("realm") or ""
-        # A key bound to the other exit can never have rows in this view.
+        # 绑定到另一出口的 key 在这个视图里不可能有行。
         if realm and declared and declared != realm:
             continue
         deleted = bool(entry.get("deleted_at"))
@@ -8867,13 +8773,11 @@ def _build_key_rows(key_map, realm=None):
             declared,
             False if deleted else entry.get("enabled", True) is not False,
             "deleted" if deleted else "panel")
-    # The launcher key (--api-key / API_KEY) lives in no settings file, so it
-    # is only ever visible as an id in the log. It is not an attribution
-    # dimension: once the panel holds any key of its own the launcher key is
-    # no longer accepted at all (see identify_key), so an unused one is a
-    # permanent zero that says nothing about who spent what. Give it a row
-    # only when the log shows it was actually used - the only state in which
-    # it carries history worth reconciling.
+    # 启动参数 key 由 --api-key 或 API_KEY 提供，不在任何设置文件里，所以
+    # 只在日志里以 id 形式出现。它不是归因维度：面板一旦有自己的 key，启动
+    # 参数 key 就不再被接受，见 identify_key；未使用的那一行是永久的零，
+    # 说明不了谁花了多少。只有日志显示它确实被用过时才给它一行，那是它唯一
+    # 值得对账的历史。
     if "launcher" not in rows and "launcher" in key_map:
         rows["launcher"] = empty_row("launcher", "启动参数", "", True, "launcher")
     if "panel" in key_map:
@@ -9712,7 +9616,7 @@ def _usage_cache_series_minutes_ok(rows):
     None 是合法的（旧版 checkpoint 没有分钟环这个键）：采用端把它当「环只
     从采用点之后才完整」处理（见 _usage_cache_adopt_series），所以这里放行
     而不是拒整份。行首必须是真整数（JSON 里 12345.0 不算）、严格递增——
-    递增同时钉住「没有重复分钟」；其余 8 个必须是折叠累加出来的数字。
+    递增同时保证「没有重复分钟」；其余 8 个必须是折叠累加出来的数字。
     """
     if rows is None:
         return True
@@ -10524,6 +10428,11 @@ def runtime_settings_view():
                                                default=wb_accounts.WEB_TURN_TIMEOUT),
         "daily_chat_web_timeout_default": wb_accounts.WEB_TURN_TIMEOUT,
         "daily_chat_web_timeout_max": wb_settings.DAILY_CHAT_WEB_TIMEOUT_MAX,
+        "task_jitter_max": wb_settings.task_jitter_max(ACCOUNTS_DIR),
+        "task_jitter_min": wb_settings.TASK_JITTER_MIN,
+        "task_jitter_max_limit": wb_settings.TASK_JITTER_MAX,
+        "scheduler_hours": wb_settings.scheduler_hours(ACCOUNTS_DIR),
+        "scheduler_hours_default": wb_settings.DEFAULT_SCHEDULER_HOURS,
         "daily_chat_model": wb_settings.daily_chat_model(ACCOUNTS_DIR),
         "daily_chat_model_default": wb_accounts.DAILY_CHAT_MODEL,
         "local_web_tools": wb_settings.local_web_tools(ACCOUNTS_DIR),
@@ -10587,7 +10496,7 @@ AFFINITY_DEBUG = os.environ.get("WB_AFFINITY_DEBUG", "0").lower() in (
     "1", "true", "yes", "on")
 # 亲和的上限：对话超过这么多条消息后不再绑定账号。
 #
-# 为什么需要上限：亲和把整段对话钉在同一个账号上，而对话的上下文是单调
+# 为什么需要上限：亲和把整段对话固定在同一个账号上，而对话的上下文是单调
 # 增长的，于是那一个账号要反复接收越来越大的请求体。实测（wk4 实例，
 # 2026-10-08，333 个请求）请求体与上游断连率的关系：
 #
@@ -10613,7 +10522,7 @@ AFFINITY_MAX_MSGS = int(os.environ.get("WB_AFFINITY_MAX_MSGS", "400") or 0)
 # 轮，页里每个账号都留着前缀；同时超大请求体仍摊在 size 个账号上，不是压回
 # 一个（那正是 400 条上限要解决的断连问题）。
 #
-# 取值：≥2 = 页大小（账号数）；1 = 和普通对话一样钉住（等于取消上限）；
+# 取值：≥2 = 页大小（账号数）；1 = 和普通对话一样固定账号（等于取消上限）；
 # 0 = 保持 1.6.x 的整池轮转。页的划分见 wb_accounts.AccountPool._page_slice。
 AFFINITY_PAGE_SIZE = int(os.environ.get("WB_AFFINITY_PAGE_SIZE", "3") or 0)
 def affinity_route(messages):
@@ -10771,7 +10680,7 @@ def log(msg, level=None, tag=None):
     sys.stderr.flush()
     add_log_entry(msg, level=level, tag=tag)
 
-# 本地网路工具的多引擎轮换、冷却与失败分类写进看板日志（tag=webtools）
+# 本地网络工具的多引擎轮换、冷却与失败分类写进看板日志（tag=webtools）
 wb_webtools.set_logger(log)
 
 def get_logs(limit=200, level="", tag="", search="", since_id=0):
@@ -11074,6 +10983,7 @@ def fetch_models(realm=None, force=False):
             _catalog_excluded[r] = [mid for mid in raw_ids if mid not in served_ids]
             _catalog_meta[r] = {"source": source, "fetched_at": time.time(),
                                 "file_mtime": file_mtime}
+        seed_default_disabled(_catalog_excluded[r])
         return entries
 def model_entry(mid, meta):
     """Build a rich /v1/models entry from the desktop app catalog metadata.
@@ -11099,9 +11009,9 @@ def model_entry(mid, meta):
     # disabledMultimodal explicitly turns image input off; absent means allowed.
     vision = bool(meta.get("supportsImages")) and not meta.get("disabledMultimodal")
     if mid == "glm-5.3-flash":
-        # 强制修正：上游元数据虽宣告支持多模态，但后端实际未接入视觉通道（见 issue #315）
+        # 强制修正：上游元数据虽声明支持多模态，但后端实际未接入视觉通道（见 issue #315）
         vision = False
-        item["vision_note"] = "上游宣告多模态但实际通道不支持读图，已修正为纯文本" 
+        item["vision_note"] = "上游声明多模态但实际通道不支持读图，已修正为纯文本"
     tools = bool(meta.get("supportsToolCall"))
     thinks = bool(meta.get("supportsReasoning"))
     inputs = ["text"] + (["image"] if vision else [])
@@ -11362,6 +11272,24 @@ def snapshot_credits():
     return out
 
 
+def seed_default_disabled(ids):
+    """把筛选规则丢掉的模型默认加入停止名单，每个模型只做一次。
+
+    默认拒绝这些模型的路由；操作者在模型页重新勾选后，excluded_seen 保证
+    下一次加载不会再关掉它。
+    """
+    seen = {str(m).strip().lower() for m in wb_settings.excluded_seen(ACCOUNTS_DIR)}
+    fresh = [m for m in ids if str(m).strip().lower() not in seen]
+    if not fresh:
+        return
+    wb_settings.remember_excluded(ACCOUNTS_DIR, fresh)
+    disabled = wb_settings.disabled_models(ACCOUNTS_DIR)
+    known = {str(m).strip().lower() for m in disabled}
+    wb_settings.set_disabled_models(
+        ACCOUNTS_DIR, disabled + [m for m in fresh
+                                  if str(m).strip().lower() not in known])
+
+
 def curate_remote_catalog(realm, ids, meta=None):
     """Trim a remote catalogue to the models the picker should offer.
 
@@ -11391,6 +11319,9 @@ def fetch_remote_product_config(realm):
     endpoint, the bundled snapshot).
     """
     if realm not in ("intl", "cn") or POOL is None:
+        return None
+    if stand_down_active():
+        log("remote catalog: gateway is stopped after an upstream 403, skipping")
         return None
     account = POOL.representative(realm=realm)
     if account is None or not account.access_token:
@@ -11482,6 +11413,7 @@ def refresh_catalog(realm):
                                         if mid not in {m for m, _ in entries}]
             _catalog_meta[realm] = {"source": "remote", "fetched_at": time.time(),
                                     "file_mtime": None}
+    seed_default_disabled(_catalog_excluded[realm])
     log("catalog refresh: %s updated from the product-config endpoint (%d models)"
         % (realm, len(entries)))
     note_remote_catalog(realm)
@@ -12321,12 +12253,11 @@ def normalize_tool_choice(obj):
     if isinstance(tc, str):
         val = tc.strip().lower()
         if val == "none":
-            # 这里曾经把 tools/functions 一起删掉，那正是 Agent 死循环的成因：
-            # 工具声明没了，模型拿不到函数签名、又没有结构化工具通道，却仍被要求
-            # 完成任务，于是把调用降级成 DSML / 伪 JSON 文本塞进 content
+            # 保留 tools/functions：删掉工具声明会让 Agent 进入死循环。
+            # 模型拿不到函数签名、又没有结构化工具通道，却仍被要求完成任务，
+            # 于是把调用降级成 DSML / 伪 JSON 文本塞进 content
             # （tool_calls 为空、finish_reason=stop）。客户端解析不到调用只能再
-            # 追问一轮，模型又重复一遍 "I'll do it"，上下文每轮 +2 条消息、token
-            # 线性膨胀，直到撑爆窗口或用户手动断开。
+            # 追问一轮，上下文每轮 +2 条消息、token 线性膨胀，直到撑爆窗口。
             #
             # tool_choice="none" 的语义是「本轮不许调用工具」，这层意思由
             # tool_choice 字段本身表达就够了，不需要抹掉能力声明。
@@ -12334,10 +12265,8 @@ def normalize_tool_choice(obj):
             # 原样透传，同时保留 tools。
             #
             # 取舍：实测本上游并不真正遵守 tool_choice="none"（保留 tools 后它
-            # 仍返回 tool_calls）。但对比两条路 —— 删 tools 会让模型输出不可解析
-            # 的文本、Agent 原地空转；留 tools 则走正常 tool_calls 通道，客户端能
-            # 正常执行与回填 —— 后者明显更好。确实需要禁止调用时，客户端不传
-            # tools 即可。
+            # 仍返回 tool_calls）。保留 tools 时走正常 tool_calls 通道，客户端
+            # 能正常执行与回填。确实需要禁止调用时，客户端不传 tools 即可。
             obj["tool_choice"] = "none"
         return
     if isinstance(tc, dict):
@@ -12726,13 +12655,13 @@ def translate_max_completion_tokens(obj):
 # ---------------------------------------------------------------------------
 # 模型封锁表
 #
-# 背景：客户端除了使用者的对话，还会自己发背景请求（记忆整理、自动复核等）。
-# 这些请求不经过模型选单，而是直接使用目录上的模型 ID，因此可能在使用者
+# 背景：客户端除了用户的对话，还会自己发背景请求（记忆整理、自动复核等）。
+# 这些请求不经过模型菜单，而是直接使用目录上的模型 ID，因此可能在用户
 # 没有实际操作时，用付费模型消耗额度。
 #
 # 对策（选用）：把要拒绝的模型填进 ALLOWED_MODELS / BANNED_SUBSTRING /
 #               EXTRA_BANNED；命中的请求在本机直接回 400，完全不碰上游。
-#               预设全部为空 = 不封锁任何模型，行为与原版相同。
+#               默认全部为空 = 不封锁任何模型，行为与原版相同。
 #
 # 调整方式：
 #   要放行某个模型 -> 加进 ALLOWED_MODELS 或 ALLOWED_PREFIXES
@@ -12741,13 +12670,13 @@ def translate_max_completion_tokens(obj):
 
 # 允许放行的模型（你要用的）
 ALLOWED_MODELS = {
-    # 预设不封锁任何模型；填入模型 id 即可只放行这些
+    # 默认不封锁任何模型；填入模型 id 即可只放行这些
 }
 
 # 允许前缀：涵盖 -high / -preview / [1M] 等变体
 ALLOWED_PREFIXES = ()
 
-# 封锁字串：模型名里含这个就拒绝
+# 封锁字符串：模型名里含这个就拒绝
 BANNED_SUBSTRING = ""
 
 # 额外封锁的内部模型（不在 gpt- 前缀内，但也会烧点）
@@ -12759,7 +12688,7 @@ def is_model_banned(model):
 
     规则：ALLOWED_MODELS / ALLOWED_PREFIXES 命中就放行；其余只要命中
     BANNED_SUBSTRING 或 EXTRA_BANNED 就拒绝，没命中则照常送往上游。
-    三个设定预设都是空的，所以预设不封锁任何模型。
+    三个设置默认都是空的，所以默认不封锁任何模型。
     """
     if not model:
         return False
@@ -12769,7 +12698,7 @@ def is_model_banned(model):
         return False
     if any(m.startswith(a) for a in ALLOWED_PREFIXES):
         return False
-    # 命中封锁字串就拒绝
+    # 命中封锁字符串就拒绝
     if BANNED_SUBSTRING and BANNED_SUBSTRING in m:
         return True
     # 其他已知会烧点的内部模型
@@ -12781,9 +12710,9 @@ def is_model_banned(model):
 # ---------------------------------------------------------------------------
 # 背景请求拦截
 #
-# Codex App 除了使用者的对话，还会自己发背景请求（记忆整理、环境建议、自动复核…）。
-# 这些请求不经过模型选单，所以单靠模型白名单挡不住 —— 它们可能直接用目录上
-# 的付费模型（例如 gpt-6-astra 这类），在使用者没有实际操作时照样消耗额度。
+# Codex App 除了用户的对话，还会自己发背景请求（记忆整理、环境建议、自动复核）。
+# 这些请求不经过模型菜单，所以单靠模型白名单挡不住 —— 它们可能直接用目录上
+# 的付费模型（例如 gpt-6-astra 这类），在用户没有实际操作时照样消耗额度。
 #
 # Codex 会在 client_metadata 里带 x-codex-turn-metadata，内容像：
 #   {"request_kind":"memory","thread_source":"memory_consolidation",
@@ -12794,7 +12723,7 @@ def is_model_banned(model):
 # 要不要拦截背景请求（False = 全部放行，维持原行为）
 BLOCK_BACKGROUND_REQUESTS = False
 
-# 命中任一关键字就视为背景请求（不分大小写、子字串比对）
+# 命中任一关键字就视为背景请求（不分大小写、子字符串比对）
 BACKGROUND_TRIGGER_KEYWORDS = (
     "memory_consolidation",
     "memory-write",
@@ -12841,7 +12770,7 @@ def turn_metadata_fields(payload):
     if not isinstance(meta, dict):
         return {}
 
-    # 收集所有可能的来源/触发栏位
+    # 收集所有可能的来源/触发字段
     fields = {}
     for key, value in meta.items():
         if isinstance(value, str) and value.strip().startswith("{"):
@@ -12875,9 +12804,9 @@ def is_compaction_request(payload):
 
 
 def background_request_reason(payload):
-    """若这是 Codex 自己发的背景请求，回传说明字串；否则回传 ""。
+    """若这是 Codex 自己发的背景请求，返回说明字符串；否则返回 ""。
 
-    只看 client_metadata，不碰讯息内容。
+    只看 client_metadata，不碰消息内容。
     """
     fields = turn_metadata_fields(payload)
     if not fields:
@@ -13232,6 +13161,20 @@ class ContentRejected(Exception):
         return 403
 
 
+class GatewayStandDown(Exception):
+    """An account was restricted by upstream (403), so the gateway stopped.
+
+    All accounts are disabled at once: after a restriction, rotating to the
+    next credential is what links the whole pool together. Nothing is sent
+    upstream until someone re-enables the accounts on the panel.
+    """
+
+    def __init__(self, detail="", account_uid=None):
+        self.detail = detail or ""
+        self.account_uid = account_uid
+        super().__init__("gateway stopped: an account was restricted upstream (403)")
+
+
 class RateLimited(Exception):
     """Upstream throttled this model (429 / code 6004). Distinct from a dead
     pool: the credential is fine, only the model is cooling down for a while."""
@@ -13307,19 +13250,19 @@ def gateway_hint(status, message):
 
 
 # ---------------------------------------------------------------------------
-# 出站身分自动切换
+# 出站身份自动切换
 #
-# 官方有三套身分（workbuddy / vscode / cli），端点与配额通道各不相同，
+# 官方有三套身份（workbuddy / vscode / cli），端点与配额通道各不相同，
 # 对照表见 wb_identity._ENDPOINTS。
 #
-# 某模型在某条通道被限流（429 / code 6004）时，换成另一套身分通常还能继续
+# 某模型在某条通道被限流（429 / code 6004）时，换成另一套身份通常还能继续
 # 用 —— 那是另一条配额线。每轮最多切 MAX_PRODUCT_SWITCHES 次，避免来回弹跳。
 #
-# 身分会写进凭证档并在重启后读回（issue #76）：面板手动切换当下就落盘，
+# 身份会写进凭证档并在重启后读回（issue #76）：面板手动切换当下就写盘，
 # 这里的自动切换则在下一次任何 save() 时一并写入。
 #
-# 这个开关交给面板设定决定（issue #67），预设关闭：自动切换会吃掉重试预算，
-# 也会把帐号留在操作者没主动选过的身分上，要用的话自己开。
+# 这个开关交给面板设置决定（issue #67），默认关闭：自动切换会消耗重试预算，
+# 也会把账号留在操作者没主动选过的身份上，需要时再手动打开。
 # ---------------------------------------------------------------------------
 
 MAX_PRODUCT_SWITCHES = 4
@@ -13348,11 +13291,11 @@ def _switch_count(account, model):
 
 
 def _try_switch_product(account, model):
-    """429 时换身分重试。回传 True 表示已切换、可以重试。
+    """429 时换身份重试。返回 True 表示已切换、可以重试。
 
     同一请求内最多切 MAX_PRODUCT_SWITCHES 次：
       cli -> workbuddy -> cli -> workbuddy
-    四次都不行就放弃，让呼叫端回报真正的 429。
+    四次都不行就放弃，让调用方返回真正的 429。
     """
     count = _switch_count(account, model)
     if count >= MAX_PRODUCT_SWITCHES:
@@ -13374,7 +13317,7 @@ def _try_switch_product(account, model):
     _SWITCH_LOG[(account.uid, model)] = (count + 1, time.time())
     if len(_SWITCH_LOG) > 500:
         _SWITCH_LOG.clear()
-    log("account %s: %s 被限流，自動切換身分 -> %s (第 %d/%d 次)"
+    log("account %s: %s 被限流，自动切换身份 -> %s (第 %d/%d 次)"
         % (account.uid[:8], current, target, count + 1, MAX_PRODUCT_SWITCHES),
         level="WARN")
     return True
@@ -13627,6 +13570,45 @@ def restriction_is_account_level(detail):
     return any(marker in lowered for marker in _RESTRICTION_403_MARKERS)
 
 
+#: 账号被上游限制后的网关状态。所有账号一起停用：限制发生后继续轮询下一个账号，
+#: 正是把整个账号池关联起来的原因。恢复由操作者在看板重新启用账号，不自动恢复。
+STAND_DOWN = {"active": False, "at": 0.0, "uid": "", "detail": ""}
+
+
+def stand_down_accounts(trigger_uid, detail=""):
+    """停用全部账号并记下原因，之后任何新请求都在入口被拒绝。"""
+    if POOL is not None:
+        POOL.set_all_enabled(False)
+    STAND_DOWN.update({"active": True, "at": time.time(),
+                       "uid": trigger_uid or "", "detail": (detail or "")[:300]})
+    log("account %s restricted by upstream (403): all accounts disabled, "
+        "gateway stopped" % (trigger_uid or "?")[:8], level="ERROR")
+
+
+def stand_down_active():
+    return bool(STAND_DOWN.get("active"))
+
+
+def stand_down_state():
+    """面板要的停止状态；没有停止时 active 为 False。"""
+    return dict(STAND_DOWN)
+
+
+def clear_stand_down():
+    """操作者手动启用账号后解除停止状态。"""
+    if STAND_DOWN.get("active"):
+        log("gateway resumed: an account was enabled on the panel")
+    STAND_DOWN.update({"active": False, "at": 0.0, "uid": "", "detail": ""})
+
+
+def stand_down_message(exc=None):
+    """503 的正文：说明为什么停、以及怎样恢复。"""
+    text = ("网关已停止：一个账号被上游限制（403）。全部账号已停用，"
+            "确认上游解封后在看板「全部启用」恢复")
+    detail = (getattr(exc, "detail", "") or "").strip()
+    return text + ("；上游原文：%s" % detail[:200] if detail else "")
+
+
 def _retry_after_epoch(value):
     """Epoch from an HTTP Retry-After value (seconds or an HTTP date)."""
     value = str(value or "").strip()
@@ -13848,6 +13830,10 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # share the same fold, and calling them separately paid for it three
     # times on every request.
     apply_daily_guards()
+    # 账号被上游限制过就一个请求都不再发：继续轮询下一个账号会把账号池关联起来。
+    if stand_down_active():
+        raise GatewayStandDown(STAND_DOWN.get("detail") or "",
+                               account_uid=STAND_DOWN.get("uid") or None)
     # 剩余用量优先调度（开关默认关）：把「估计剩余接近耗尽」的 (账号, 模型)
     # 权重推给池，让它们先接单。只在开关打开时读剩余估算（载荷有短 TTL，热路径
     # 上是缓存命中）；关着时推空表，把上一次可能留下的权重清掉，下一个请求就
@@ -13984,7 +13970,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             if base_data is None:
                 base_data = json.dumps(upstream_body, ensure_ascii=False).encode("utf-8")
             attempt_data = base_data
-        # 会话头族（X-Conversation-ID 等）由身分构造里每次请求现生成：上游不拿
+        # 会话头族（X-Conversation-ID 等）由身份构造里每次请求现生成：上游不拿
         # 这个 id 存历史，不需要按会话复用；缺了它上游的渠道校验会回 400 /
         # code 11-128（`conversation id missing`），补的是「有」而不是「稳定」。
         try:
@@ -14067,9 +14053,9 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                         log("account %s: model cap not persisted: %s"
                             % (account.uid[:8], exc))
                 if auto_switch and _try_switch_product(account, model):
-                    # 换了身分就等于换了一条配额线：要把它从「已试过」拿掉，
-                    # 并清掉刚刚记下的模型冷却，否则下一轮回圈会找不到帐号。
-                    # keep_caps：6004 的禁用（仍在恢复期内）跨身分成立，不能
+                    # 换了身份就等于换了一条配额线：要把它从「已试过」拿掉，
+                    # 并清掉刚刚记下的模型冷却，否则下一轮循环会找不到账号。
+                    # keep_caps：6004 的禁用（仍在恢复期内）跨身份成立，不能
                     # 被这次清理带走——真机实测它会让 6004 之后账号立刻又可用。
                     tried.discard(account.uid)
                     try:
@@ -14100,13 +14086,10 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     account.note_error("HTTP 403 (account restricted)",
                                        cooldown=RESTRICTED_403_COOLDOWN,
                                        single_account=(total <= 1), detail=detail)
-                    log("account %s restricted by upstream (403 11140), "
-                        "cooling %.0fs" % (account.uid[:8], RESTRICTED_403_COOLDOWN))
                     if session_key and POOL:
                         POOL.affinity.demote(session_key, account.uid)
-                    last_error = exc
-                    last_403_detail = detail
-                    continue
+                    stand_down_accounts(account.uid, detail)
+                    raise GatewayStandDown(detail, account_uid=account.uid)
                 # Panel degrade.go: a content rejection in passthrough/append
                 # mode is usually a system-prompt fingerprint false positive.
                 # Switch to the minimal neutral prompt until next 00:00 CST
@@ -14411,8 +14394,7 @@ def probe_local_network(realm):
 def probe_account(account, model=None, timeout=30):
     """给一个账号发一条最小请求，返回一行结果；成功即清掉它的本地惩罚。
 
-    单个「测试」与「一键测试」共用这一份：两边各写一套的话，早晚一边忘了清计数、
-    另一边忘了认本机断网——而这两件事正是「明明测了能用，它还熔断」的全部来源。
+    单个「测试」与「一键测试」共用这一份，清计数与识别本机断网的行为保持一致。
     """
     model = model or TEST_MODEL_DEFAULT
     row = {"uid": account.uid, "nickname": account.nickname or account.uid[:8],
@@ -14433,12 +14415,9 @@ def probe_account(account, model=None, timeout=30):
             msg = (choices[0].get("message") or {}) if choices else {}
             reply = (msg.get("content") or msg.get("reasoning_content") or "OK").strip()
             row["reply"] = reply[:77] + "..." if len(reply) > 80 else reply
-            # A served request, so it takes the semantic success path. That clears
-            # the account-level streak/breaker/degrade counters: a green panel test
-            # used to leave soft_streak standing, and the next 429 resumed the
-            # ladder from it. Only the tested model's cooldown is dropped here -
-            # sibling models keep theirs, and a 402 balance park keeps its own lift
-            # path (revive_balance_cooldown on a credits refresh).
+            # 请求真的被服务了，走语义成功路径：清掉账号级连续失败、熔断与降权计数。
+            # 这里只解除被测模型的冷却，同账号其他模型保留；402 余额停用另有
+            # 解除路径，由积分刷新触发 revive_balance_cooldown。
             account.note_success(model=model)
             row["ok"] = True
             return row
@@ -14453,8 +14432,7 @@ def probe_account(account, model=None, timeout=30):
             row["error"] = "本机网络不可用：%s" % exc_detail(exc)
             account.note_error(row["error"], cooldown=0)
             return row
-        # The label keeps its 80-char cut; `detail` rides along untouched so the
-        # panel can show the whole upstream body on hover.
+        # 面板标签保留 80 字符截断；detail 原样带上，供面板悬停时显示完整上游响应。
         row["status"] = exc.code
         row["error"] = "HTTP %d: %s" % (exc.code, detail[:150])
         account.note_error("HTTP %d: %s" % (exc.code, detail[:80]),
@@ -14491,9 +14469,8 @@ def extract_session_key(headers, payload):
         return str(key).strip()
     return None
 
-# CJK 计数走单遍 C 扫描：先 sub 掉 CJK 再按长度差计数，与原来的逐字符 Python
-# 循环逐值相等（64KB ASCII 实测 18.7ms -> 1.25ms）。别换 findall，实测更慢。
-# 调用点：aggregate_stream、_chat_stream_response 的 usage 兜底、
+# CJK 计数走单遍 C 扫描：先 sub 掉 CJK 再按长度差计数。别换 findall，实测更慢。
+# 调用点：aggregate_stream、_chat_stream_response 的 usage 估算、
 # /v1/messages/count_tokens。
 CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 def estimate_tokens(text):
@@ -14503,33 +14480,27 @@ def estimate_tokens(text):
         text = str(text)
     cjk = len(text) - len(CJK_RE.sub("", text))
     other = len(text) - cjk
-    return cjk + max(1, int(other / 3.6)) if text else 0
+    return cjk + max(1, int(other / 3.6))
 
-# 每次向流式响应要多少字节。64 KiB 远大于一条 SSE 事件（典型几百字节），
-# 又远小于 http.client 单次 read 的上限，按它切块能把「一行一次 syscall」
-# 摊成「一块一次」，同时不会让首字节延迟变差（见 iter_sse_lines）。
+# 每次向流式响应要多少字节。64 KiB 远大于一条典型几百字节的 SSE 事件，
+# 又远小于 http.client 单次 read 的上限，按块读取把逐行 syscall 摊成按块，
+# 同时不增加首字节延迟，见 iter_sse_lines。
 SSE_READ_BLOCK = 64 * 1024
 
 def iter_sse_lines(source, block_size=SSE_READ_BLOCK, before_read=None):
-    """按块读取流式响应并逐行产出，把逐行 read 的 syscall 开销摊掉。
+    """按块读取流式响应并逐行产出，摊掉逐行 read 的 syscall 开销。
 
-    直接 `for line in resp` 迭代 http.client.HTTPResponse 时，每一行都要走
-    一次 read() syscall，而每次 syscall 都要释放并重新抢回 GIL。一轮流式回复
-    动辄几千条事件，于是进程大部分时间花在二十来个 handler 线程之间来回交接
-    GIL 上，而不是在干活。4 vCPU 真机实测（v1.7.2，15~20 req/s）：10 秒内
-    106 214 次 futex，占全部 syscall 时间的 71%，其中约三分之二来自这条逐行
-    读取路径。
+    直接迭代 http.client.HTTPResponse 时每一行都要走一次 read() syscall，
+    并在二十来个 handler 线程之间反复交接 GIL。read1() 每次最多一次底层
+    syscall，按块取回后在内存里切行，syscall 数降一到两个数量级；read1()
+    一有字节就返回，完整的行立刻产出，延迟不变。
 
-    read1() 每次最多一次底层 syscall，所以按块取回来再在内存里切行，能把
-    syscall 数降一到两个数量级。延迟不变：read1() 一有字节就返回，完整的行
-    立刻产出；只有跨块的那一行需要等下一块。
+    产出的行带换行符，与直接迭代 response 的形状一致。没有 read1 的对象
+    退回普通迭代。
 
-    产出的行**带换行符**，与直接迭代 response 的形状完全一致，调用方一行都
-    不用改。没有 read1 的对象（列表、文本模式的文件……）退回普通迭代。
-
-    `before_read` 在每个**可能阻塞的 read1 之前**调一次，调用方可以在这里把
-    攒下的写出掉：一个读取块里的事件因此合成一次 write，而下一个字节一到就
-    立刻产出——延迟与逐块写完全一样，只是不再一个 chunk 一次 sendall。
+    before_read 在每个可能阻塞的 read1 之前调用一次，调用方可以在这里
+    把攒下的写出掉：一个读取块里的事件合成一次 write，下一个字节一到就
+    立即产出。
     """
     read1 = getattr(source, "read1", None)
     if read1 is None:
@@ -14556,19 +14527,18 @@ def iter_sse_lines(source, block_size=SSE_READ_BLOCK, before_read=None):
         yield buf
 
 class UpstreamStreamError(Exception):
-    """The upstream cut a reply short: no terminal marker, or an error frame.
+    """上游把回复截断：缺少终止标记，或收到错误帧。
 
-    Streaming relays send their protocol's error event and non-streaming paths
-    answer 502, so a half answer is never passed off as a finished one.
+    流式路径发送协议自己的错误事件，非流式路径回 502，
+    半段回答不会被当作完整结果交出去。
     """
 
 
 def heartbeat_frame(raw):
-    """The keep-alive comment in one upstream line, ready to forward, or None.
+    """把一条上游行转成可直接转发的保活注释，非注释行返回 None。
 
-    上游用 SSE 注释维持长静默的连接，有时以 ":" 开头的行发出，有时包在
-    data: 里；统一按注释转发，客户端自己的空闲超时就不会在模型思考期间
-    把连接掐掉。
+    上游用 SSE 注释维持长静默的连接，有时以 ":" 开头，有时包在 data: 里；
+    统一按注释转发，客户端自己的空闲超时就不会在模型思考期间断开。
     """
     line = raw.decode("utf-8", "replace").strip()
     if not line:
@@ -14582,7 +14552,7 @@ def heartbeat_frame(raw):
 
 
 def upstream_error_text(chunk):
-    """The error text carried by one upstream frame, or None for a normal chunk."""
+    """一条上游帧携带的错误文本；正常分块返回 None。"""
     if not isinstance(chunk, dict) or chunk.get("choices"):
         return None
     err = chunk.get("error")
@@ -14603,7 +14573,7 @@ def upstream_error_text(chunk):
 
 
 def aggregate_stream(raw_iter, model, resp_id):
-    """Fold an SSE stream into one non-streaming chat.completion object."""
+    """把 SSE 流折叠成一个非流式的 chat.completion 对象。"""
     content, reasoning, finish = [], [], "stop"
     tool_calls_map = {}
     usage = None
@@ -14668,12 +14638,10 @@ def aggregate_stream(raw_iter, model, resp_id):
                     if fn_args:
                         entry["function"]["arguments"] = (entry["function"]["arguments"] or "") + fn_args
             fc = delta.get("function_call")
-            # PATCH2-BY-OPS: 上游会在流末尾发 function_call:{"name":"","arguments":""}
-            # 占位。原判断对空 dict 成立，会凭空生成 tool_call 并伪造 id，
-            # 导致 finish_reason 被改成 "tool_calls"（参数全空）→ 严格客户端死等。
-            # 故：name 与 arguments 都为空才视为无效占位直接跳过。
-            fc_is_empty = (not isinstance(fc, dict)) or not (fc.get("name") or fc.get("arguments"))
-            if fc and isinstance(fc, dict) and not fc_is_empty:
+            # 上游会在流末尾发 function_call:{"name":"","arguments":""} 占位。
+            # name 与 arguments 都为空时视为无效占位跳过，不生成 tool_call，
+            # 否则 finish_reason 会被改成 "tool_calls"，严格客户端会一直等待。
+            if isinstance(fc, dict) and (fc.get("name") or fc.get("arguments")):
                 idx = 0
                 if idx not in tool_calls_map:
                     tool_calls_map[idx] = {
@@ -14698,22 +14666,20 @@ def aggregate_stream(raw_iter, model, resp_id):
     message = {"role": "assistant", "content": "".join(content)}
     if reasoning:
         message["reasoning_content"] = "".join(reasoning)
-    # A call the model printed instead of emitting arrives as `content`. The
-    # Responses path has parsed that shape for a while; this one did not, so the
-    # client saw prose, found no call, and ended the turn with nothing to run.
+    # 模型把调用打印在 content 里、没有发 tool_call 时，按同样的形状解析，
+    # 否则客户端只看到正文、找不到可执行的调用，回合会空转结束。
     if not tool_calls_map and repair_leaked_tool_calls(message):
         finish = "tool_calls"
-    # PATCH2-BY-OPS: 二次防御——剔除「无函数名且无参数」的空 tool_call。
-    # 即使上游以 tool_calls 数组形式发空占位，也不会泄漏给客户端。
+    # 剔除无函数名的空 tool_call：上游即使以 tool_calls 数组发空占位，
+    # 也不会泄漏给客户端。
     if tool_calls_map:
         tool_calls_map = {
             k: v for k, v in tool_calls_map.items()
             if (v.get("function") or {}).get("name")
         }
-    # A stream cut off by max_tokens / a dropped connection leaves the last
-    # tool call with half-written JSON. Drop those calls instead of handing
-    # the client unparsable arguments; only non-empty unparsable strings
-    # count as truncated, so no-argument tools survive.
+    # 因 max_tokens 或连接中断而截断的流，最后一个工具调用可能只有半截 JSON。
+    # 丢弃无法解析的参数，不把坏参数交给客户端；只有非空且解析失败的字符串
+    # 才算截断，无参数的工具保留。
     if tool_calls_map and (finish == "length" or not saw_done):
         tool_calls_map = {
             k: v for k, v in tool_calls_map.items()
@@ -14725,9 +14691,8 @@ def aggregate_stream(raw_iter, model, resp_id):
         if finish in ("stop", None):
             finish = "tool_calls"
     elif message.get("tool_calls"):
-        # A call recovered from `content` counts as a real one, and it also
-        # overrides a "length" the upstream reported for the same turn: the call
-        # came through whole, so the turn did not really run out of room.
+        # 从 content 恢复出的调用同样算真实调用，并覆盖同一轮上游报告的
+        # "length"：调用完整到达，说明这一轮并非长度用尽。
         finish = "tool_calls"
     elif finish == "tool_calls":
         # 占位被全部过滤掉，无实际工具调用，降级为正常结束，防止客户端无限挂起等待
@@ -14759,14 +14724,13 @@ def aggregate_stream(raw_iter, model, resp_id):
     out["first_chunk_at"] = first_chunk_at
     return out
 # ---------------------------------------------------------------------------
-# Responses API (/v1/responses) <-> Chat Completions translation
+# Responses API (/v1/responses) 与 Chat Completions 互转
 # ---------------------------------------------------------------------------
 #
-# Kelivo and other clients can speak OpenAI's newer Responses API. The upstream
-# gateway only speaks Chat Completions, so those requests are translated down,
-# and the reply is translated back up into Responses objects / SSE events.
+# Kelivo 等客户端使用 OpenAI 的 Responses API，上游只支持 Chat Completions：
+# 出站把请求转成 Chat，回程再转成 Responses 对象与 SSE 事件。
 def local_ip_addresses():
-    """Every non-loopback IPv4 address this machine answers on."""
+    """本机所有非回环 IPv4 地址。"""
     found = []
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
@@ -14787,7 +14751,7 @@ def local_ip_addresses():
 def _new_id(prefix):
     return prefix + uuid.uuid4().hex
 def _flatten_content(content):
-    """Flatten Responses-style content into text, or OpenAI vision parts."""
+    """把 Responses 风格的内容压平成文本，或保留 OpenAI 视觉分片。"""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -14822,21 +14786,18 @@ def _flatten_content(content):
 
 
 # ---------------------------------------------------------------------------
-# Responses API "custom" (freeform) tools
+# Responses API 的 custom 自由格式工具
 #
-# Some clients - most notably Codex 0.15x - declare their file-editing tool as a
-# *custom* (freeform) tool rather than a JSON-schema function:
+# Codex 等客户端把文件编辑工具声明为 type="custom" 的自由格式工具，未使用
+# JSON-schema function：
 #
 #     {"type": "custom", "name": "apply_patch", "format": {...grammar...}}
 #
-# and expect the model to answer with a custom_tool_call item carrying the raw
-# payload in "input", then feed the result back as custom_tool_call_output.
-#
-# The upstream chat endpoint has no notion of custom tools, so we downgrade them
-# to ordinary function tools with a single "input" string parameter on the way
-# out, and re-inflate them to custom_tool_call on the way back. Without this the
-# tool is silently ignored: the model emits the payload as ordinary prose and the
-# client never sees a tool call (measured: 52 text deltas, 0 tool items).
+# 模型应回一个 custom_tool_call，把原始载荷放在 input 里；结果再以
+# custom_tool_call_output 返回。上游 chat 端点不认识 custom 工具，所以出站
+# 降级为只有一个 input 字符串参数的普通 function，回程再还原成
+# custom_tool_call。缺了这一步工具会被静默忽略：模型把载荷当普通正文输出，
+# 客户端收不到任何工具调用。
 # ---------------------------------------------------------------------------
 
 CUSTOM_TOOL_HINT = (
@@ -14846,49 +14807,17 @@ CUSTOM_TOOL_HINT = (
 )
 
 
-# ---------------------------------------------------------------------------
-# namespace 工具拒绝
-#
-# Codex 会把 MCP server / 外挂工具用 type="namespace" 的形式送出来。实测行为：
-#   反代「接受」namespace 工具 -> app 把 MCP／外挂工具当成不可执行
-#                                -> 每一次呼叫都回 "unsupported call"
-#   反代「拒绝」namespace 工具 -> app 自动 fallback 成 flat function 清单
-#                                -> 全部工具恢复正常
-# （此行为在 Command Code proxy.mjs 的 CC_REJECT_NAMESPACE_TOOLS 实验里有记载，
-#   Agent Router 也是靠直接拒绝这类请求才正常的。）
-#
-# 所以在这里主动回一个格式明确的 400，逼 app 走 fallback。
-# 想还原成「照单全收」就把 REJECT_NAMESPACE_TOOLS 改成 False。
-# ---------------------------------------------------------------------------
-
-REJECT_NAMESPACE_TOOLS = False  # 保持关闭：正解是展开+还原 namespace
-
-NAMESPACE_TOOL_MESSAGE = (
-    'Unsupported tool type "namespace": this endpoint only supports flat '
-    '"function" tools. Resend the tools as individual function entries.'
-)
-
-
-def find_namespace_tool(tools):
-    """回传第一个 type=="namespace" 的工具名称，没有就回 None。"""
-    for t in tools or []:
-        if isinstance(t, dict) and str(t.get("type") or "").lower() == "namespace":
-            return str(t.get("name") or t.get("server_label") or "(unnamed)")
-    return None
-
-
 def _is_custom_tool(tool):
     return isinstance(tool, dict) and str(tool.get("type") or "").lower() == "custom"
 
 
 def custom_tool_names(tools, _depth=0):
-    """Names of tools declared as freeform/custom in a Responses request.
+    """Responses 请求里声明为自由格式 custom 的工具名集合。
 
-    递归进 namespace：新版 Codex Desktop 把自由格式工具嵌在 functions 命名
-    空间里（exec 的 type 就是 "custom"）。漏掉它的后果不是「少一个名字」，
-    而是回程被判成 function_call，客户端按 (name, namespace, kind) 三元组匹
-    配不到执行器，调用不执行、不返回，模型只能无限重试。namespace 只是客户
-    端给工具分组的方式，不是停止查找的理由。
+    需要递归进入 namespace：新版 Codex Desktop 把自由格式工具嵌在 functions
+    命名空间里，exec 的 type 就是 "custom"。漏掉名字会让回程被判定为
+    function_call，客户端按 name、namespace、kind 三元组匹配不到执行器，
+    调用不执行也不返回。namespace 只是客户端给工具分组的方式。
     """
     names = set()
     if _depth > NAMESPACE_MAX_DEPTH:
@@ -14909,7 +14838,7 @@ def custom_tool_names(tools, _depth=0):
 
 
 def _downgrade_custom_tool(tool):
-    """Rewrite a Responses custom tool into a Chat function tool."""
+    """把 Responses 的 custom 工具改写成 Chat function 工具。"""
     desc = tool.get("description") or ""
     fmt = tool.get("format") or {}
     extra = ""
@@ -14939,13 +14868,13 @@ def _downgrade_custom_tool(tool):
 #   {"type":"namespace","name":"codex_app","tools":[{name:"list_threads",...}]}
 #
 # 上游 Chat Completions 只认 flat function，看不懂 namespace。
-# 但 App 回程是用 (name, namespace) 两个栏位找执行器 ——
+# 但 App 回程是用 (name, namespace) 两个字段找执行器 ——
 # 只给 flat name，App 一律回 "unsupported call"（实测 js / list_threads 全灭）。
 #
 # 三件事：
 #   1. Expand   送上游前把 namespace 展开成 flat function，记住 name -> namespace
-#   2. Normalise 模型回传的 name 可能是 js / ns__js / ns::js，都要能解析
-#   3. Restore   回程的 function_call / custom_tool_call 补上 namespace 栏位
+#   2. Normalise 模型返回的 name 可能是 js / ns__js / ns::js，都要能解析
+#   3. Restore   回程的 function_call / custom_tool_call 补上 namespace 字段
 #
 # 参考：某开源 CodeBuddy/WorkBuddy 反向代理项目的 tool-namespaces 说明
 # ---------------------------------------------------------------------------
@@ -14957,11 +14886,11 @@ _NS_SEP = "__"
 def expand_namespace_tools(tools, _depth=0):
     """把 namespace 展开成 flat function 清单，其余工具原样保留。
 
-      * 子工具可能在 tools / children / functions 任一栏位
-      * namespace 子工具常常没有 type 栏位，展开时补成上游认得的 flat function
+      * 子工具可能在 tools / children / functions 任一字段
+      * namespace 子工具常常没有 type 字段，展开时补成上游认得的 flat function
       * custom / web_search 等非 function 项目原样留下，交给既有管线处理
       * 同名只留第一个
-      * 回传 (flat_tools, name_to_namespace)
+      * 返回 (flat_tools, name_to_namespace)
     """
     flat = []
     mapping = {}
@@ -15024,7 +14953,7 @@ def expand_namespace_tools(tools, _depth=0):
 
 
 def resolve_namespaced_name(name, mapping):
-    """把模型回传的名字解析回 (bare_name, namespace)。接受 js / ns__js / ns::js。"""
+    """把模型返回的名字解析回 (bare_name, namespace)。接受 js / ns__js / ns::js。"""
     if not name:
         return name, ""
     name = str(name)
@@ -15048,9 +14977,9 @@ def resolve_namespaced_name(name, mapping):
 
 
 def stamp_namespace(item, mapping):
-    """把模型回传的扁平工具名还原成 (name, namespace)。
+    """把模型返回的扁平工具名还原成 (name, namespace)。
 
-    串流的 response.output_item.done 事件才是客户端派发工具呼叫的依据，
+    流式的 response.output_item.done 事件才是客户端派发工具调用的依据，
     所以每个 function_call / custom_tool_call 项目都要在送出前补上 namespace。
     """
     if not mapping or not isinstance(item, dict):
@@ -15085,10 +15014,10 @@ def apply_namespace_to_calls(output_items, mapping):
 def additional_tools_from_input(payload):
     """从 input 数组里收集 additional_tools 条目的 tools。
 
-    新版 Codex Desktop 0.162+ 把工具放在 input 内的
-    {"type": "additional_tools", "tools": [...]} 条目里，顶层 tools 是空的。
-    出站（responses_to_chat）与回程（custom_tool_names / request_meta.tools）
-    的取值都必须走这里，否则两边看到的是不同的工具清单。
+    新版 Codex Desktop 把工具放在 input 内的
+    {"type": "additional_tools", "tools": [...]} 条目里，顶层 tools 为空。
+    出站 responses_to_chat 与回程 custom_tool_names、request_meta.tools
+    都必须走这里，否则两边看到不同的工具清单。
     """
     collected = []
     for item in payload.get("input") or []:
@@ -15100,7 +15029,7 @@ def additional_tools_from_input(payload):
 
 
 def _tools_for_chat(tools):
-    """Downgrade custom tools; leave everything else untouched."""
+    """降级 custom 工具，其他工具原样返回。"""
     out = []
     for t in tools or []:
         if not isinstance(t, dict):
@@ -15110,7 +15039,7 @@ def _tools_for_chat(tools):
 
 
 def _unwrap_custom_input(args):
-    """Pull the freeform string back out of an {"input": "..."} argument blob."""
+    """从 {"input": "..."} 参数块里取回自由格式字符串。"""
     if not isinstance(args, str):
         return json.dumps(args or "", ensure_ascii=False)
     try:
@@ -15127,24 +15056,18 @@ def _unwrap_custom_input(args):
         return parsed
     return args
 
-# The gateway can run web_search / web_fetch itself; the panel switch decides.
+# 网关可以自己执行 web_search / web_fetch，由面板开关决定。
 #
-# Some clients (Codex App and similar harnesses) declare web_search as a
-# server-side tool, but the upstream has no executor for it: forwarding the
-# declaration leaves the model answering as if no tool had been offered. With
-# the switch on, the gateway swaps the declaration for a function of its own,
-# swallows the calls and runs them locally (wb_webtools), then feeds the
-# results back.
+# Codex App 等客户端把 web_search 声明为服务端工具，但上游没有对应执行器：
+# 原样转发时模型会当作没有工具可用。开关打开后，网关把声明换成自己的
+# function，截下调用交给 wb_webtools 本地执行，再把结果喂回模型。
 #
-# Off by default: the declaration is forwarded untouched and a client that
-# declares its own search tool receives the call - the behaviour since v1.5.3.
-# Turning it on means the gateway itself fetches URLs a model asks for, so the
-# egress policy is the operator's call.
+# 默认关闭：声明原样转发，自带同名搜索工具的客户端会收到自己的调用。
+# 打开后网关会按模型要求抓取网址，出网策略由操作者决定。
 def local_web_tools_enabled():
-    """Panel switch: does this gateway run web_search / web_fetch itself?
+    """面板开关：网关是否自己执行 web_search / web_fetch。
 
-    Read per request, so flipping the panel takes effect on the next one
-    without a restart.
+    每个请求读取一次，切换面板后下一个请求即生效，无需重启。
     """
     try:
         return wb_settings.local_web_tools(ACCOUNTS_DIR) is True
@@ -15153,11 +15076,10 @@ def local_web_tools_enabled():
 
 
 def web_tools_active(body):
-    """True when this request's tools were swapped for the gateway's own.
+    """本请求的工具是否已替换为网关自己的定义。
 
-    Interception only applies to a request whose definitions the gateway
-    injected: with the switch off, a client's own same-named function must be
-    forwarded instead of being swallowed here.
+    只拦截网关注入过定义的请求：开关关闭时，客户端自己的同名 function
+    必须原样转发，不能被这里吞掉。
     """
     return isinstance(body, dict) and body.get("_web_tools") is True
 
@@ -15165,7 +15087,7 @@ def web_tools_active(body):
 def sum_usage(total, part):
     """把一轮的 token 用量累加起来。
 
-    代跑网路工具会多跑好几次上游，那些 token 是真的花掉的，所以记帐要加总，
+    代跑网络工具会多跑好几次上游，那些 token 是真的花掉的，所以记账要加总，
     不能让最后一轮盖掉前面几轮。
     """
     if not isinstance(part, dict):
@@ -15188,7 +15110,7 @@ _CITATION_MD_RE = re.compile(r"\[([^\]\n]{1,200})\]\((https?://[^)\s]+)\)")
 def build_citations(text, sources):
     """把模型实际引用到的来源转成 url_citation annotations。
 
-    只标注真的有出现在工具输出里的网址 —— 模型自己编的连结不会被当成引用。
+    只标注真的出现在工具输出里的网址，模型自己编的链接不会被当成引用。
     """
     text = str(text or "")
     if not text or not sources:
@@ -15243,12 +15165,11 @@ def build_citations(text, sources):
 
 def follow_up_with_tool_results(internal_calls, holder, model, session_key, t_start,
                                 lease=None, drop_tools=False):
-    """执行反代自己代跑的网路工具，把结果喂回模型，回传新的上游连线。
+    """执行反代代跑的网络工具，把结果喂回模型，返回新的上游连接。
 
-    drop_tools=True 表示这是最后一轮：把网路工具从工具清单收回，模型没有东西
-    可以再呼叫，只能用手上的结果把话讲完。旧版在回合用尽时合成一个
-    resp_wrapup（status=completed、output=[]）收尾，那等于把失败伪装成正常
-    结束，客户端看到的就是「讲到一半断掉」——issue #43。
+    drop_tools=True 表示最后一轮：从工具清单收回网络工具，模型只能用手上的
+    结果收尾。回合用尽时直接失败，不合成 status=completed、output=[] 的
+    resp_wrapup，见 issue #43。
     """
     convo = holder.get("convo_messages")
     if convo is None:
@@ -15295,11 +15216,10 @@ def follow_up_with_tool_results(internal_calls, holder, model, session_key, t_st
 
 
 def internal_calls_from_chat(chat_obj, web_tools=False):
-    """Calls in an aggregated chat completion the gateway runs itself.
+    """聚合后的 chat completion 中由网关自己执行的调用。
 
-    Only a request whose definitions the gateway injected can carry such a
-    call; with the switch off a client's own same-named function stays the
-    client's, so this answers empty.
+    只有网关注入过工具定义的请求才可能带这类调用；开关关闭时，客户端
+    自己的同名 function 归客户端，这里返回空列表。
     """
     message = ((chat_obj.get("choices") or [{}])[0] or {}).get("message") or {}
     out = []
@@ -15314,7 +15234,7 @@ def internal_calls_from_chat(chat_obj, web_tools=False):
 
 
 def tool_name_of(tool):
-    """Tool name, whichever of the two shapes the entry uses."""
+    """工具名，兼容 function.name 与顶层 name 两种形状。"""
     if not isinstance(tool, dict):
         return ""
     if isinstance(tool.get("function"), dict):
@@ -15323,7 +15243,7 @@ def tool_name_of(tool):
 
 
 def _responses_input_to_messages(payload):
-    """Turn the Responses input items into chat messages."""
+    """把 Responses 的 input 条目转成 chat 消息。"""
     messages = []
     instructions = payload.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
@@ -15346,9 +15266,8 @@ def _responses_input_to_messages(payload):
                     role = item.get("role") or "user"
                     if role == "developer":
                         role = "system"
-                    # If this is assistant text and the previous message is an assistant
-                    # message (e.g. from an adjacent function_call), merge them so
-                    # tool_calls and text stay in one message without breaking tool sequence.
+                    # assistant 文本与前一条 assistant 消息相邻时合并，
+                    # 让 tool_calls 与文本留在同一条消息里，不打断工具序列。
                     if role == "assistant" and messages and messages[-1].get("role") == "assistant":
                         prev = messages[-1]
                         if prev.get("content"):
@@ -15365,9 +15284,8 @@ def _responses_input_to_messages(payload):
                             pending_reasoning = ""
                         messages.append(msg_dict)
             elif itype == "reasoning":
-                # Reasoning item from previous assistant turn in Responses API.
-                # In standard Chat Completions, reasoning is either backfilled into
-                # the assistant message's reasoning_content or omitted.
+                # 上一轮 assistant 的 reasoning 条目：在 Chat Completions 里
+                # 回填到 assistant 消息的 reasoning_content，否则丢弃。
                 r_text = ""
                 summ = item.get("summary")
                 if isinstance(summ, list):
@@ -15397,9 +15315,8 @@ def _responses_input_to_messages(payload):
                     else:
                         _txt = str(raw_out or "")
                     if isinstance(_txt, list):
-                        # _flatten_content returns structured chat parts when
-                        # the output carries images. Keep them as multimodal
-                        # user content instead of crashing on .strip().
+                        # 输出带图片时 _flatten_content 返回结构化分片，
+                        # 作为多模态用户内容保留，避免对列表调用 strip。
                         try:
                             log("[wb-proxy] orphan function_call_output kept as multimodal parts (%d)"
                                 % len(_txt))
@@ -15445,7 +15362,7 @@ def _responses_input_to_messages(payload):
                         "arguments": item.get("arguments") or "{}",
                     },
                 }
-                # Merge into previous assistant message if adjacent
+                # 与前一条 assistant 消息相邻时合并
                 if messages and messages[-1].get("role") == "assistant":
                     prev = messages[-1]
                     if "tool_calls" in prev:
@@ -15466,7 +15383,7 @@ def _responses_input_to_messages(payload):
                         pending_reasoning = ""
                     messages.append(msg_dict)
             elif itype == "custom_tool_call":
-                # Freeform tool call coming back as conversation history.
+                # 作为对话历史返回的自由格式工具调用。
                 raw_input = item.get("input")
                 if isinstance(raw_input, (dict, list)):
                     raw_input = json.dumps(raw_input, ensure_ascii=False)
@@ -15480,7 +15397,7 @@ def _responses_input_to_messages(payload):
                         "arguments": json.dumps({"input": raw_input}, ensure_ascii=False),
                     },
                 }
-                # Merge into previous assistant message if adjacent
+                # 与前一条 assistant 消息相邻时合并
                 if messages and messages[-1].get("role") == "assistant":
                     prev = messages[-1]
                     if "tool_calls" in prev:
@@ -15501,7 +15418,7 @@ def _responses_input_to_messages(payload):
                         pending_reasoning = ""
                     messages.append(msg_dict)
             elif itype == "custom_tool_call_output":
-                # Result of a freeform tool call (e.g. apply_patch output).
+                # 自由格式工具调用的结果，例如 apply_patch 的输出。
                 raw_out = item.get("output")
                 if isinstance(raw_out, list):
                     content = _flatten_content(raw_out)
@@ -15542,7 +15459,7 @@ def _responses_input_to_messages(payload):
 
 
 def responses_to_chat(payload):
-    """Translate a Responses API request body into a Chat Completions body."""
+    """把 Responses API 请求体转成 Chat Completions 请求体。"""
     messages = _responses_input_to_messages(payload)
     chat = {"model": payload.get("model"), "messages": messages}
     for key in ("temperature", "top_p", "seed"):
@@ -15562,7 +15479,8 @@ def responses_to_chat(payload):
         effort = payload.get("reasoning_effort")
     if effort:
         chat["reasoning_effort"] = effort
-    # 合并顶层 tools 和 input 列表中的 additional_tools 条目（新版 Codex Desktop 0.162+ 特征）
+    # 合并顶层 tools 与 input 列表里的 additional_tools 条目，新版 Codex Desktop
+    # 会把工具整份放进后者。
     raw_tools = []
     if isinstance(payload.get("tools"), list):
         raw_tools.extend(payload["tools"])
@@ -15571,7 +15489,7 @@ def responses_to_chat(payload):
         flat_tools, ns_map = expand_namespace_tools(raw_tools)
         chat["tools"] = _tools_for_chat(flat_tools)
         chat["_namespace_map"] = ns_map
-    # 客户端宣告 web_search / web_fetch 时，把那份宣告换成我们的
+    # 客户端声明 web_search / web_fetch 时，把那份声明换成我们的
     # function（见 wb_webtools.install_tool_defs）。
     # 看板开关关闭时原样透传，客户端自己的同名工具不受影响。
     # 用合并后的清单：工具可能整份都在 additional_tools 里，只看顶层会漏。
@@ -15588,10 +15506,10 @@ def responses_to_chat(payload):
 
 
 # ---------------------------------------------------------------------------
-# Anthropic Messages API (/v1/messages) <-> Chat Completions
+# Anthropic Messages API (/v1/messages) 与 Chat Completions 互转
 # ---------------------------------------------------------------------------
 def anthropic_error_type(status):
-    """Map an HTTP status to the Anthropic error.type vocabulary."""
+    """把 HTTP 状态码映射成 Anthropic 的 error.type。"""
     try:
         status = int(status)
     except (TypeError, ValueError):
@@ -15895,7 +15813,7 @@ def _anthropic_blocks_to_messages(role, blocks):
 
 
 def messages_to_chat(payload):
-    """Translate an Anthropic Messages request into Chat Completions."""
+    """把 Anthropic Messages 请求转成 Chat Completions 请求。"""
     if not isinstance(payload, dict):
         raise ValueError("request body must be a JSON object")
     model = _anthropic_text(payload.get("model")).strip()
@@ -15950,10 +15868,8 @@ def messages_to_chat(payload):
         role = _anthropic_text(item.get("role")).strip() or "user"
         content = item.get("content")
         if role in ("system", "developer"):
-            # Claude Code >= 2.1.286 turns on Anthropic's mid-conversation
-            # system beta and carries system messages inside `messages`. The
-            # upstream knows the system role, so keep the message where the
-            # client put it rather than failing the whole request.
+            # Claude Code 等客户端会开启 Anthropic 的会话中 system beta，
+            # 把 system 消息放进 messages。上游认识 system 角色，原样保留。
             text = _anthropic_system_text(content) or _anthropic_content_to_text(content)
             if text:
                 messages.append({"role": "system", "content": text})
@@ -16027,7 +15943,7 @@ def _anthropic_stop_reason(finish_reason):
 
 
 def chat_to_messages(obj):
-    """Fold one Chat Completions object into an Anthropic Messages object."""
+    """把一个 Chat Completions 对象折叠成 Anthropic Messages 对象。"""
     if not isinstance(obj, dict):
         obj = {}
     choices = obj.get("choices") if isinstance(obj.get("choices"), list) else []
@@ -16037,9 +15953,8 @@ def chat_to_messages(obj):
         message = choices[0].get("message") if isinstance(choices[0].get("message"), dict) else {}
         finish = choices[0].get("finish_reason") or ""
     content = []
-    # The upstream thinking trace becomes a native thinking block so clients
-    # such as Claude Code can render it; the request side drops incoming
-    # thinking blocks, so nothing unsigned ever reaches the upstream.
+    # 上游的思考轨迹转成原生 thinking block，Claude Code 等客户端可以渲染；
+    # 请求侧会丢弃传入的 thinking block，因此没有未签名的内容会到上游。
     reasoning = _anthropic_text(message.get("reasoning_content"))
     if reasoning:
         content.append({"type": "thinking", "thinking": reasoning})
@@ -16088,7 +16003,7 @@ def _anthropic_estimate_chat_tokens(chat):
 
 
 def stream_messages_events(raw_iter, model, holder=None):
-    """Yield Anthropic Messages SSE frames from a chat-completions SSE stream."""
+    """把 chat-completions SSE 流转成 Anthropic Messages SSE 帧。"""
     holder = holder if isinstance(holder, dict) else {}
     state = {
         "started": False,
@@ -16186,9 +16101,8 @@ def stream_messages_events(raw_iter, model, holder=None):
         start = ensure_start(chunk)
         if start:
             yield start
-        # Capture usage before the choices guard: the final upstream frame
-        # carries both the usage block and the finish_reason (and no delta),
-        # so skipping it here would zero out every streaming usage row.
+        # 先取 usage 再过 choices 判断：最后一帧同时带 usage 与 finish_reason
+        # 且没有 delta，在这里跳过会让每条流式用量记录归零。
         if isinstance(chunk.get("usage"), dict):
             state["usage"] = chunk["usage"]
         choices = chunk.get("choices") if isinstance(chunk.get("choices"), list) else []
@@ -16196,8 +16110,8 @@ def stream_messages_events(raw_iter, model, holder=None):
             continue
         choice = choices[0] if isinstance(choices[0], dict) else {}
         delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
-        # Upstream thinking trace (deepseek-style reasoning_content) becomes
-        # native thinking blocks so the client can display the reasoning.
+        # 上游的思考轨迹，例如 deepseek 的 reasoning_content，转成原生 thinking
+        # block，客户端可以显示推理过程。
         reason = delta.get("reasoning_content")
         if isinstance(reason, str) and reason:
             for frame in ensure_thinking():
@@ -16280,9 +16194,8 @@ def stream_messages_events(raw_iter, model, holder=None):
             continue
         yield anthropic_sse_frame("content_block_stop", {"index": entry["block"]})
     state["done"] = True
-    # Hand the raw upstream usage block back to the caller: the stream
-    # response records it on the usage row, and without this every streamed
-    # Messages request was logged as usage_missing.
+    # 把上游原始 usage 块交回调用方：流式响应会把它记进用量行，
+    # 缺了这一步每条流式 Messages 请求都会记为 usage_missing。
     holder["usage"] = state.get("usage")
     yield anthropic_sse_frame("message_delta", {
         "delta": {"stop_reason": state["stop"], "stop_sequence": None},
@@ -16307,16 +16220,13 @@ def _responses_usage(u):
         "total_tokens": u.get("total_tokens") or 0,
     }
 def chat_to_response(chat_obj, model, custom_names=None, request_meta=None, namespace_map=None, sources=None):
-    """Fold a Chat Completions object into a Responses API response object.
+    """把一个 Chat Completions 对象折叠成 Responses API 响应对象。
 
-    custom_names is the set of tool names the client declared as freeform
-    ("custom"). Calls to those tools are re-inflated into custom_tool_call
-    items so clients such as Codex recognise them.
+    custom_names 是客户端声明为自由格式 custom 的工具名集合，这些工具的调用
+    会还原成 custom_tool_call 条目，Codex 等客户端才能识别。
 
-    request_meta echoes the request-level capabilities (tools, tool_choice,
-    parallel_tool_calls) back on the response. They used to be hardcoded to
-    tools=[], tool_choice=auto and parallel_tool_calls=true, so a client that
-    asked for something else was told the opposite of what it requested.
+    request_meta 把请求级能力 tools、tool_choice、parallel_tool_calls 原样
+    回显到响应上，客户端请求什么就回报什么。
     """
     custom_names = custom_names or set()
     choice = (chat_obj.get("choices") or [{}])[0]
@@ -16353,8 +16263,8 @@ def chat_to_response(chat_obj, model, custom_names=None, request_meta=None, name
                 "name": name,
                 "arguments": fn.get("arguments") or "{}",
             })
-    # DeepSeek DSML tool calls fallback
-    if not (msg.get("tool_calls")):
+    # DeepSeek DSML 工具调用兜底
+    if not msg.get("tool_calls"):
         dsml_calls, clean_t = parse_dsml_tool_calls(text)
         if dsml_calls:
             for dc in dsml_calls:
@@ -16423,7 +16333,7 @@ def stream_responses_events(upstream, model, holder):
     saw_done = False
     custom_names = set(holder.get("custom_names") or ())
     ns_map = holder.get("namespace_map") or {}
-    # 由反代代跑的网路工具呼叫，收集起来不转发给客户端
+    # 由反代代跑的网络工具调用，收集起来不转发给客户端
     _internal_calls = {}
     # Only reach for same-named calls when this request's definitions were the
     # gateway's own (see web_tools_active); otherwise they belong to the client.
@@ -16476,7 +16386,7 @@ def stream_responses_events(upstream, model, holder):
             "summary": [{"type": "summary_text", "text": "".join(reason_parts)}],
         }
     def _annotations():
-        """引用来源：只认工具真的回传过的网址。"""
+        """引用来源：只认工具真的返回过的网址。"""
         try:
             return build_citations("".join(text_parts), holder.get("web_sources") or [])
         except Exception:
@@ -16567,7 +16477,7 @@ def stream_responses_events(upstream, model, holder):
                 full_text = clean_text
         if dsml_calls and not tool_calls_map:
             for dc in dsml_calls:
-                # DSML 形状的网路工具呼叫一样由反代执行
+                # DSML 形状的网络工具调用一样由反代执行
                 if _own_web_tools and wb_webtools.is_internal_tool(dc.get("name")):
                     entry = _internal_calls.setdefault(dc.get("id") or _new_id("call_"),
                                                        {"name": dc.get("name"), "arguments": "{}"})
@@ -16605,16 +16515,15 @@ def stream_responses_events(upstream, model, holder):
                     "output_index": out_idx,
                     "item": fc_item,
                 })
-        # 这一轮如果有代跑的网路工具呼叫，就把完成事件留给下一轮，
-        # 否则客户端会以为整个回合已经结束（旧版是在回合用尽时补一个合成的
-        # resp_wrapup，那才是 issue #43 真正的病灶）。
+        # 这一轮如果有代跑的网络工具调用，就把完成事件留给下一轮，
+        # 否则客户端会以为整个回合已经结束（issue #43）。
         if _internal_calls:
             holder.setdefault("internal_calls", []).extend(
                 {"name": v["name"], "arguments": v["arguments"]}
                 for v in _internal_calls.values()
             )
             holder["suppress_completion"] = True
-            # 让 App 画出原生的「已搜寻网路」卡片：对每个代跑的呼叫送出
+            # 让 App 画出原生的「已搜索网络」卡片：对每个代跑的调用送出
             # web_search_call 项目与生命周期事件。
             for _v in _internal_calls.values():
                 _nm = str(_v.get("name") or "")
@@ -17748,6 +17657,14 @@ class Handler(BaseHTTPRequestHandler):
         if not uid or not self._panel_ok():
             return ""
         return uid
+    def _stand_down_block(self, path):
+        """网关停止时，会带账号令牌访问上游的入口一律 503。返回是否已处理。"""
+        if not (stand_down_active() and path in STAND_DOWN_POST_PATHS):
+            return False
+        self._error(503, stand_down_message(GatewayStandDown(
+            STAND_DOWN.get("detail") or "")), "overloaded_error")
+        return True
+
     @staticmethod
     def _is_panel_route(path):
         """Management endpoints shown in the web panel.
@@ -17898,6 +17815,7 @@ class Handler(BaseHTTPRequestHandler):
         if self._panel_ok():
             info["accounts"] = len(POOL.accounts) if POOL else 0
             info["accounts_ready"] = POOL.count_ready() if POOL else 0
+            info["stand_down"] = stand_down_state()
         return self._json(200, info)
 
     def _get_console_state(self):
@@ -17950,8 +17868,7 @@ class Handler(BaseHTTPRequestHandler):
         rep = current_account()
         info = {
             "ok": True,
-            # Report the realm actually in use; this used to be the
-            # literal "intl" and drifted from the panel switch.
+            # Report the realm actually in use, so it follows the panel switch.
             "realm": CURRENT_REALM,
             "accounts": len(POOL.accounts) if POOL else 0,
             "accounts_ready": POOL.count_ready() if POOL else 0,
@@ -18020,6 +17937,7 @@ class Handler(BaseHTTPRequestHandler):
         for mid in saved[0]:
             if mid not in served and mid not in extra:
                 extra.append(mid)
+        seed_default_disabled(extra)
         disabled = {m.strip().lower() for m in wb_settings.disabled_models(ACCOUNTS_DIR)}
         raw_meta = _catalog_raw_meta.get(realm) or {}
         data = []
@@ -18142,6 +18060,9 @@ class Handler(BaseHTTPRequestHandler):
     def _get_accounts_credits(self):
         if not self._authorized():
             return
+        if stand_down_active():
+            return self._error(503, stand_down_message(GatewayStandDown(
+                STAND_DOWN.get("detail") or "")), "overloaded_error")
         # Refresh credits for all accounts
         for a in (POOL.accounts if POOL else []):
             a.fetch_credits()
@@ -18202,6 +18123,7 @@ class Handler(BaseHTTPRequestHandler):
             "accounts": account_views(realm=query.get('realm', [None])[0] or CURRENT_REALM),
             "storage": ACCOUNTS_DIR,
             "usable": POOL.count_ready() if POOL else 0,
+            "stand_down": stand_down_state(),
         })
 
     def _get_accounts_export(self, query):
@@ -18245,6 +18167,9 @@ class Handler(BaseHTTPRequestHandler):
     def _get_accounts_login_poll(self, query):
         if not self._authorized():
             return
+        if stand_down_active():
+            return self._error(503, stand_down_message(GatewayStandDown(
+                STAND_DOWN.get("detail") or "")), "overloaded_error")
         state = (query.get("state") or [""])[0]
         return self._json(200, POOL.poll_login(state))
 
@@ -18498,7 +18423,7 @@ class Handler(BaseHTTPRequestHandler):
                 break
             total += size
             if total > max_bytes:
-                # 剩下的块没读：连接无法再对齐，回 413 后关闭，_error 也不再排空
+                # 剩下的块没读：连接上的数据流已无法继续解析，回 413 后关闭，_error 也不再排空
                 self.close_connection = True
                 self._body_consumed = True
                 raise BodyTooLarge(total)
@@ -18977,6 +18902,34 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 return self._error(400, str(exc), "invalid_request_error")
             reply["daily_chat_web_timeout"] = raw
+        if "task_jitter_max" in payload:
+            # Whole seconds, 2 秒起步：低于 2 秒的等待挡不住同批风控，
+            # 高于上限只可能是多打了一位。上限见 wb_settings。
+            raw = payload.get("task_jitter_max")
+            if isinstance(raw, bool) or raw is None:
+                return self._error(400, "task_jitter_max must be a whole number",
+                                   "invalid_request_error")
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                return self._error(400, "task_jitter_max must be a whole number",
+                                   "invalid_request_error")
+            if not wb_settings.TASK_JITTER_MIN <= value <= wb_settings.TASK_JITTER_MAX:
+                return self._error(
+                    400, "task_jitter_max must be between %d and %d"
+                         % (wb_settings.TASK_JITTER_MIN, wb_settings.TASK_JITTER_MAX),
+                    "invalid_request_error")
+            reply["task_jitter_max"] = wb_settings.set_task_jitter_max(
+                ACCOUNTS_DIR, value)
+        if "scheduler_hours" in payload:
+            try:
+                cleaned = wb_settings.set_scheduler_hours(
+                    ACCOUNTS_DIR, payload.get("scheduler_hours"))
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            reply["scheduler_hours"] = cleaned
+            if SCHEDULER:
+                SCHEDULER.apply_schedule(cleaned)
         if "daily_chat_model" in payload:
             raw = payload.get("daily_chat_model") or ""
             # Empty clears the override back to the built-in id. Anything else
@@ -19275,9 +19228,9 @@ class Handler(BaseHTTPRequestHandler):
                 meta = meta if isinstance(meta, dict) else {}
                 entry = {"id": mid}
                 # 与 /v1/models 走同一条查找链（上游值 > 内建知识表 > 本地缓存 >
-                # 默认）：否则一键配置写进客户端的窗口会和网关自己宣告的对不上
+                # 默认）：否则一键配置写进客户端的窗口会和网关自己声明的不一致
                 # （目录里的 contextWindow.defaultLength 只是桌面端的默认档，
-                # deepseek-v4.1-flash 是 300k，而网关宣告的是 1M）。
+                # deepseek-v4.1-flash 是 300k，而网关声明的是 1M）。
                 try:
                     ctx, out, _src = wb_modelsdev.lookup(
                         mid, meta.get("maxInputTokens"),
@@ -19311,7 +19264,7 @@ class Handler(BaseHTTPRequestHandler):
                 if vision:
                     entry["supports_vision"] = True
                 # 可选的思考档位交给客户端（DSH 用它生成会话里的档位选择器）。
-                # 只宣告目录明确列出档位的模型：固定档位的模型（只有
+                # 只声明目录明确列出档位的模型：固定档位的模型（只有
                 # reasoning.effort、没有 supportedEfforts）不列，选了也不会改变
                 # 上游实际跑的档位。
                 efforts = (meta.get("reasoning") or {}).get("supportedEfforts")
@@ -19601,9 +19554,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_accounts_import(payload)
         return self._error(404, "unknown account endpoint", "invalid_request_error")
     def _route_accounts_product(self, payload):
-        """切换出站身分（cli <-> workbuddy），并即时回传结果。
+        """切换出站身份（cli <-> workbuddy），并即时返回结果。
 
-        官方有两套身分、两条配额线。某条满了可以切到另一条继续用。
+        官方有两套身份、两条配额线。某条满了可以切到另一条继续用。
         """
         target = str(payload.get("product") or "").strip().lower()
         uid = payload.get("uid")
@@ -19626,7 +19579,7 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             try:
                 if account.set_product(target):
-                    # 立刻落盘：set_product() 只改记忆体，而面板上这一下是操作者
+                    # 立刻写盘：set_product() 只改内存，而面板上这一下是操作者
                     # 的明确选择，不能等到别的路径（refresh / 签到 / 查积分）刚好
                     # 存档才生效——切完就重启容器的人会白白丢掉这次切换。
                     try:
@@ -19635,7 +19588,7 @@ class Handler(BaseHTTPRequestHandler):
                         log("product save failed for %s: %s" % (account.uid[:8], exc),
                             level="WARN")
                     changed.append(account.uid[:8])
-                    log("account %s: 面板手動切換身分 -> %s"
+                    log("account %s: 面板手动切换身份 -> %s"
                         % (account.uid[:8], target), level="INFO")
             except Exception as exc:
                 log("product switch failed for %s: %s" % (account.uid[:8], exc),
@@ -19978,13 +19931,18 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, {"results": results, "accounts": account_views()})
 
     def _route_accounts_login_start(self, payload):
-        platform = payload.get("platform") or "CLI"
+        product = str(payload.get("product") or "").strip().lower()
+        if product not in wb_identity.VALID_PRODUCTS:
+            return self._error(400, "product must be one of: %s"
+                               % ", ".join(wb_identity.VALID_PRODUCTS),
+                               "invalid_request_error")
         target_realm = payload.get("realm") or CURRENT_REALM
         try:
-            started = POOL.start_login(realm=target_realm, platform=platform)
+            started = POOL.start_login(realm=target_realm, product=product)
         except Exception as exc:
             return self._error(502, "could not start login: %s" % exc)
-        log("oauth login started (realm=%s, platform=%s, state=%s)" % (target_realm, platform, started["state"][:8]))
+        log("oauth login started (realm=%s, product=%s, platform=%s, state=%s)"
+            % (target_realm, product, started["platform"], started["state"][:8]))
         return self._json(200, started)
 
     def _route_accounts_login_cancel(self, payload):
@@ -20190,6 +20148,8 @@ class Handler(BaseHTTPRequestHandler):
             updated = POOL.set_enabled(uid, bool(payload.get("enabled")))
             if updated is None:
                 return self._error(404, "no such account")
+            if payload.get("enabled"):
+                clear_stand_down()
             log("account %s %s"
                 % (uid[:8], "enabled" if payload.get("enabled") else "disabled"))
         if "weight" in payload:
@@ -20245,7 +20205,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _route_accounts_set_all(self, payload):
         POOL.set_all_enabled(bool(payload.get("enabled")))
-        return self._json(200, {"accounts": account_views()})
+        if payload.get("enabled"):
+            clear_stand_down()
+        return self._json(200, {"accounts": account_views(),
+                                "stand_down": stand_down_state()})
 
     def _route_accounts_delete(self, payload):
         uid = payload.get("uid")
@@ -20360,6 +20323,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, key_blocked, "invalid_request_error")
             upstream, account, effort = open_upstream(
                 chat_req, session_key=session_key, target_realm=req_realm)
+        except GatewayStandDown as exc:
+            record_error(model, 503, exc.detail[:200],
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         account=exc.account_uid, key=self._key_id())
+            return self._error(503, stand_down_message(exc), "overloaded_error")
         except ContentRejected as exc:
             record_error(model, 403, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
@@ -20523,13 +20491,13 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def _responses_nonstream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, effort=None, lease=None):
-        # 跟串流那条一样：客户端宣告 web_search / web_fetch 时由反代代跑。
-        # 中间那几轮对客户端不可见，最后才组成一个 Responses 物件回传；不这样
+        # 跟流式那条一样：客户端声明 web_search / web_fetch 时由反代代跑。
+        # 中间那几轮对客户端不可见，最后才组成一个 Responses 对象返回；不这样
         # 做的话 web_search 的 function_call 会直接漏给客户端，客户端只会回
         # 一句 unsupported call。
         sources = []
         rounds = 0
-        # 开关关闭时不拦同名呼叫：那是客户端自己的工具。
+        # 开关关闭时不拦同名调用：那是客户端自己的工具。
         web_tools = web_tools_active(base_body)
         # 多轮 follow-up 共用一份会话：每轮都重建会把上一轮的 assistant
         # tool_call / tool 结果从上下文里抹掉，第二轮开始就重复搜索或答非所问。
@@ -20632,6 +20600,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._anthropic_error(400, key_blocked, "invalid_request_error")
             upstream, account, effort = open_upstream(
                 chat_req, session_key=session_key, target_realm=req_realm)
+        except GatewayStandDown as exc:
+            record_error(model, 503, exc.detail[:200],
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         account=exc.account_uid, key=self._key_id())
+            return self._anthropic_error(503, stand_down_message(exc), "overloaded_error")
         except ContentRejected as exc:
             record_error(model, 403, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
@@ -20798,9 +20771,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/pricing/refresh", "/pricing/mapping"):
             # Panel-only management writes (the pricing table is the panel's
             # own view of the estimate). Registered here because the generic
-            # dispatcher below only routes chat and account paths - POST
-            # /pricing/refresh used to 404, which made the panel's "立即取价"
-            # button fail silently behind its toast.
+            # dispatcher below only routes chat and account paths.
             if not self._panel_ok():
                 return self._error(401, "panel password required", "invalid_request_error")
             payload = self._payload_or_error()
@@ -20850,6 +20821,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_panel(path)
         if self._is_panel_route(path) and not self._panel_ok():
             return self._error(401, "panel password required", "invalid_request_error")
+        if self._stand_down_block(path):
+            return
         is_messages_route = path in (
             "/v1/messages", "/messages",
             "/v1/messages/count_tokens", "/messages/count_tokens",
@@ -20939,7 +20912,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch_chat_post(self, path, payload):
         # 先挡背景请求：Codex 自己发的（记忆整理／环境建议／自动复核）
-        # 不算「使用者实际使用」，一律本地拒绝，不碰上游。
+        # 不算「用户实际使用」，一律本地拒绝，不碰上游。
         if BLOCK_BACKGROUND_REQUESTS:
             reason = background_request_reason(payload)
             if reason:
@@ -20987,6 +20960,11 @@ class Handler(BaseHTTPRequestHandler):
             upstream, account, effort = open_upstream(
                 payload, session_key=session_key, target_realm=req_realm,
                 prebuilt_body=forwarded)
+        except GatewayStandDown as exc:
+            record_error(model, 503, exc.detail[:200],
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         account=exc.account_uid, key=self._key_id())
+            return self._error(503, stand_down_message(exc), "overloaded_error")
         except ContentRejected as exc:
             record_error(model, 403, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000),
@@ -21400,6 +21378,9 @@ def _bootstrap_runtime(args):
     # slot yet and the semaphore swap is safe.
     resize_chat_slots(POOL.count_ready())
     apply_daily_guards()
+    # 虚拟档位别名默认停止处理；操作者在模型页勾选后，excluded_seen 保证
+    # 下一次启动不会又关掉。
+    seed_default_disabled(sorted(VIRTUAL_ALIAS_MODELS))
     load_persisted_realm()
     global SCHEDULER
     from wb_scheduler import Scheduler
@@ -21420,9 +21401,9 @@ def _bootstrap_runtime(args):
     PRICING = wb_pricing.PriceRefresher(
         wb_settings.pricing_refresh_minutes(ACCOUNTS_DIR))
     PRICING.start()
-    # Credit balances back the expiring-credits dispatch preference, and only
-    # the sign-in / daily-activity tasks used to refresh them. The refresher
-    # keeps them current in the background so no request pays for a lookup.
+    # Credit balances back the expiring-credits dispatch preference. The
+    # refresher keeps them current in the background so no request pays for
+    # a lookup.
     global CREDITS_REFRESHER
     CREDITS_REFRESHER = wb_accounts.CreditsRefresher(POOL)
     CREDITS_REFRESHER.start()

@@ -1,25 +1,10 @@
-"""Where a proxy exits, and what kind of address that exit is.
-
-The gateway only ever learns an exit's IP address (api.ipify.org, fetched
-through the proxy itself). The country and the address kind therefore come from
-a public lookup: ip-api.com answers without a key, and `lang=zh-CN` returns the
-country name the panel shows.
-
-`hosting` is the signal behind the 住宅 / 机房 split - an address announced by a
-hosting provider is treated as a machine room, everything else as residential.
-That is a heuristic, not a registry fact, so the announcing network is stored
-alongside it and shown to the operator.
-
-A lookup that fails is reported as unknown rather than raised: a proxy that
-carries traffic is still usable when the lookup is blocked or rate limited.
-"""
-
+# 出口 IP 的国家与地址类型查询，数据来自 ip-api.com。
 import json
 import urllib.parse
 import urllib.request
 
-# `message` is requested so a refusal ("private range", "reserved range",
-# rate limit) is visible in the payload instead of surfacing as a bare failure.
+# 请求 message 字段，让私有地址、保留地址与限流等拒绝原因出现在响应里，
+# 避免只剩一个失败状态。
 GEO_ENDPOINT = ("http://ip-api.com/json/%s?lang=zh-CN"
                 "&fields=status,message,country,countryCode,isp,org,as,"
                 "hosting,proxy,mobile")
@@ -30,26 +15,24 @@ DATACENTER = "datacenter"
 
 TYPE_LABELS = {RESIDENTIAL: "住宅", DATACENTER: "机房"}
 
-# Fields a slot stores about its exit; every one of them may be empty, which
-# means "not known" and never "assume something".
+# 槽位保存的出口字段；任一字段可以为空，空表示未知，不做假设。
 FIELDS = ("country", "country_code", "ip_type", "isp", "asn")
 
 
 def type_label(ip_type):
-    """Chinese label for a stored kind, or "" when the kind is unknown."""
+    """返回存储类型的显示标签，未知时返回空串。"""
     return TYPE_LABELS.get(str(ip_type or "").strip().lower(), "")
 
 
 def empty():
-    """The unknown-exit answer, with the same shape as a successful lookup."""
+    """返回未知出口的空结果，字段形状与成功查询一致。"""
     return dict.fromkeys(FIELDS, "")
 
 
 def classify(payload):
-    """Turn one ip-api.com reply into the fields a slot stores.
+    """把一条 ip-api.com 响应转换成槽位字段。
 
-    Anything unusable - a failed status, a missing body, a `hosting` flag that
-    is neither true nor false - comes back empty rather than guessed.
+    失败状态、缺少正文或 hosting 既非真也非假时返回空字段，不做猜测。
     """
     if not isinstance(payload, dict) or payload.get("status") != "success":
         return empty()
@@ -70,16 +53,15 @@ def classify(payload):
 
 
 def _open(request, timeout):
-    """Indirection so tests can answer without a network."""
+    """测试可替换此函数，避免真实网络。"""
     return urllib.request.urlopen(request, timeout=timeout)
 
 
 def lookup(ip, timeout=LOOKUP_TIMEOUT):
-    """Country and address kind for one exit IP; empty fields when unknown.
+    """查询一个出口 IP 的国家与地址类型，未知时字段为空。
 
-    The request goes out directly rather than through the proxy being
-    described: the lookup has to work even when that proxy only reaches the
-    upstream, and it must not be answered by the exit we are asking about.
+    请求直接发出，不走被描述的代理：该代理只通上游时查询仍要可用，也不能由
+    待查出口回答。
     """
     address = str(ip or "").strip()
     if not address:
@@ -95,10 +77,9 @@ def lookup(ip, timeout=LOOKUP_TIMEOUT):
 
 
 def slot_name(country, ip_type):
-    """Default slot name: the exit's country and kind, e.g. "美国 住宅".
+    """返回默认槽位名，由出口国家与类型组成，例如「美国 住宅」。
 
-    No country means no name. "住宅" on its own would not tell two slots apart,
-    so the caller is better off falling back to the slot id.
+    没有国家就没有名字。只有「住宅」无法区分两个槽位，调用方应回退到槽位 id。
     """
     where = str(country or "").strip()
     if not where:

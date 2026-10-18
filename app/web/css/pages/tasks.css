@@ -9,7 +9,11 @@
 
 .sched-logs-title { font-size: 11px; color: var(--muted-foreground); }
 
-/* 移动端把四块折成一次一块：上面是分段切换，下面只显示选中的那块。 */
+/* 头部操作在标题右侧；窄屏换行时仍靠右，窄手机恢复左对齐。 */
+.card-actions { margin-left: auto; }
+@media (max-width: 640px) { .card-actions { margin-left: 0; justify-content: flex-start; } }
+
+/* 移动端把各块折成一次一块：上面是分段切换，下面只显示选中的那块。 */
 .tasks-switch { display: none; }
 @media (max-width: 767px) {
   .tasks-switch { display: block; }

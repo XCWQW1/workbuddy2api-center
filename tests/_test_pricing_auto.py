@@ -695,8 +695,6 @@ class PricingEndpointTests(PricingTestCase):
     """The panel's two pricing writes, driven through the handler methods."""
 
     def _handler(self, payload, pricing=None):
-        test = self
-
         class Stub(object):
             _handle_settings_save = P.Handler._handle_settings_save
             _route_pricing_mapping = P.Handler._route_pricing_mapping

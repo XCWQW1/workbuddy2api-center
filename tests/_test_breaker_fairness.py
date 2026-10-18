@@ -13,7 +13,6 @@
 
     python tests/_test_breaker_fairness.py
 """
-import json
 import os
 import socket
 import sys

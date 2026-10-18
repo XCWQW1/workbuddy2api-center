@@ -1,8 +1,3 @@
-"""cockpit tools JSON import compatibility (M4 D7).
-
-Run with: python _test_cockpit_import.py
-No upstream credentials or outbound network are used.
-"""
 import base64
 import json
 import os
@@ -53,7 +48,7 @@ class CockpitRowTests(unittest.TestCase):
         self.assertEqual(kwargs["refreshToken"], "refresh-token")
         self.assertEqual(kwargs["realm"], "intl")
         self.assertEqual(kwargs["source"], "cockpit")
-        # expires_at is milliseconds; the account stores seconds.
+        # expires_at 以毫秒计，账号里存的是秒。
         self.assertLess(abs(kwargs["expiresAt"] - (time.time() + 3600)), 120)
 
     def test_nickname_falls_back_to_email(self):

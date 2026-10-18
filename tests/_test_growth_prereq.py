@@ -1,13 +1,3 @@
-"""first_buddy 前置链：auto 任务先完成并领奖（发放 Buddy），single 任务才能接取。
-
-    python tests/_test_growth_prereq.py
-
-背景（2026-10-09 实测）：上游给成长任务加了 task_type（auto/single）与前置校验。
-first_buddy 是 auto 类（不接受接取），它是其他任务与猫猫旅行的前置；而且前置校验
-认的是 Buddy 实例 —— 必须完成 first_buddy 并领取其奖励（reward_buddy=true）才发放。
-旧流程把它当未接取任务跳过，于是 17 个任务全部 "prerequisite not met: first_buddy"，
-旅行也 400 "no active buddy"。
-"""
 import io
 import json
 import os
@@ -194,7 +184,7 @@ class GrowthPrereqTests(unittest.TestCase):
 
     def test_travel_departs_directly_when_buddy_exists(self):
         calls = []
-        # status 里 buddy_id 恒为 0（猫在家），不得因此误走补齐前置
+        # status 里 buddy_id 恒为 0，猫在家，不得因此误走补齐前置
         T.fetch_growth_tasks = lambda acc: (_ for _ in ()).throw(
             AssertionError("有 Buddy 时不该走补齐前置"))
 

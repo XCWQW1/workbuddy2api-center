@@ -1,10 +1,3 @@
-"""Pin the instance-wide UI language setting.
-
-The dashboard keeps a per-browser override in localStorage. This setting is
-the fallback when a browser has no override yet: a new origin, a different
-port or hostname, or a fresh browser profile should still open in the
-instance's chosen language instead of always falling back to Simplified.
-"""
 import os
 import sys
 import tempfile

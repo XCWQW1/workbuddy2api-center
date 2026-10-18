@@ -1,16 +1,6 @@
-# -*- coding: utf-8 -*-
-"""wb_modelsdev.py — 模型 context/output 四级查找（panel context_catalog.go + modelsdev.go）。
-
-查找链（每个栏位独立）：
-  1. 上游动态值（remote > 0）权威；
-  2. 内建知识表 CONTEXT_FALLBACK（panel 实测 + models.dev 共识值，CN/global 共用）；
-  3. 本地 model.json 快取（models.dev 索引的持久化，accounts 目录）；
-  4. models.dev 按需拉取（异步、5s 超时、失败静默；拉到后写 model.json）。
-
-未知 context → 1_000_000（宁可高估：低估会让客户端提前截断上下文）；未知
-output → None（输出上限没有「高估安全侧」，不编造、省略字段）。
-纯标准库，Python 3.9 兼容。
-"""
+# 模型 context/output 四级查找，每个字段独立：上游动态值 > 内建知识表 >
+# 本地 model.json 缓存 > models.dev 异步拉取。未知 context 用 1000000，
+# 未知 output 返回 None。
 
 import json
 import os
@@ -20,26 +10,25 @@ import urllib.request
 
 MODELSDEV_URL = "https://models.dev/api.json"
 MODELSDEV_TIMEOUT = 5
-MODELSDEV_FETCH_COOLDOWN = 300        # 5 min process-wide throttle
-MODELSDEV_NEGATIVE_TTL = 24 * 3600    # per-model negative cache
+MODELSDEV_FETCH_COOLDOWN = 300        # 进程内全局拉取节流，单位秒
 MODELSDEV_MAX_BODY = 32 * 1024 * 1024
 MODELSDEV_VALUE_MAX = 10 ** 9
 DEFAULT_CONTEXT = 1000000
 CACHE_FILENAME = "model.json"
 
-# Vendor-official providers win over aggregator gateways in the index build.
+# 构建索引时，厂商官方 provider 优先于聚合网关。
 VENDOR_SOURCES = ("zai", "moonshotai", "moonshotai-cn", "openai", "google",
                   "deepseek", "minimax")
 
-# 内建知识表（panel context_catalog.go 移植；值为实测 / models.dev 共识）。
+# 内建知识表，移植自 panel 的 context_catalog.go，值为实测与 models.dev 共识。
 CONTEXT_FALLBACK = {
-    # GLM (z-ai)
+    # GLM / z-ai
     "glm-5.2": (1000000, 131072),
     "glm-5.1": (200000, 131072),
     "glm-5.3": (1000000, 131072),
     "glm-5.3-flash": (1000000, 131072),
     "glm-5v-turbo": (200000, 131072),
-    # Kimi (moonshot)
+    # Kimi / moonshot
     "kimi-k2.7": (256000, 65536),
     "kimi-k2.6": (256000, 262144),
     "kimi-k2.5": (164000, 262144),
@@ -69,11 +58,9 @@ CONTEXT_FALLBACK = {
 }
 
 _lock = threading.Lock()
-_index = None            # bare id -> (context, output)
-_index_loaded = False
+_index = None            # 裸 id 到 context/output 二元组
 _last_fetch = 0.0
 _fetching = False
-_negatives = {}
 
 
 def cache_path(directory):
@@ -81,7 +68,7 @@ def cache_path(directory):
 
 
 def bare_id(model_id):
-    """models.dev keys come both bare and namespaced; index by the tail."""
+    """models.dev 的键既有裸名也有带命名空间的形式，统一按末段索引。"""
     return str(model_id or "").strip().lower().rsplit("/", 1)[-1]
 
 
@@ -100,8 +87,8 @@ def _coerce_pair(value):
 
 
 def load_index(directory, force=False):
-    """Level 3: read the local model.json index (missing/corrupt -> empty)."""
-    global _index, _index_loaded
+    """第 3 级：读取本地 model.json 索引，文件缺失或损坏时返回空表。"""
+    global _index
     with _lock:
         if _index is not None and not force:
             return _index
@@ -118,7 +105,6 @@ def load_index(directory, force=False):
         data = {}
     with _lock:
         _index = data
-        _index_loaded = True
     return data
 
 
@@ -137,10 +123,10 @@ def save_index(directory, index):
 
 
 def build_index(doc):
-    """models.dev api.json -> bare id -> (context, output).
+    """把 models.dev 的 api.json 建成裸 id 到 context/output 二元组的索引。
 
-    Vendor-official providers win; otherwise the most common pair wins
-    (ties broken by the smaller value). Invalid/absurd values are dropped.
+    厂商官方 provider 的取值优先，否则取出现次数最多的一对，平票取较小值；
+    无效或过大的数值丢弃。
     """
     votes = {}
     for provider, pdata in (doc or {}).items():
@@ -179,7 +165,7 @@ def build_index(doc):
 
 
 def refresh_async(directory, log=None):
-    """Level 4: fetch models.dev in the background (throttled, offline-safe)."""
+    """第 4 级：后台拉取 models.dev，带节流，离线时静默失败。"""
     global _last_fetch, _fetching
     now = time.time()
     with _lock:
@@ -189,7 +175,7 @@ def refresh_async(directory, log=None):
         _last_fetch = now
 
     def worker():
-        global _fetching, _index, _index_loaded
+        global _fetching, _index
         try:
             req = urllib.request.Request(
                 MODELSDEV_URL, headers={"User-Agent": "wb2api-hub"})
@@ -200,7 +186,6 @@ def refresh_async(directory, log=None):
                 save_index(directory, index)
                 with _lock:
                     _index = index
-                    _index_loaded = True
         except Exception as exc:
             if log:
                 log("models.dev refresh skipped: %s" % str(exc)[:120])
@@ -214,11 +199,11 @@ def refresh_async(directory, log=None):
 
 def lookup(model_id, remote_context=0, remote_output=0, directory=None,
            index=None):
-    """Resolve (context, output_or_None) for one model.
+    """解析单个模型的 context 与 output。
 
-    Precedence per field: remote > knowledge table > local cache > default
-    (context 1M; output omitted). The models.dev fetch itself is asynchronous
-    and only warms the cache, so this function never blocks on the network.
+    每个字段按 上游动态值 > 内建知识表 > 本地缓存 > 默认值 的顺序取值，
+    context 默认 1000000，output 默认省略。models.dev 的拉取是异步的，
+    只负责预热缓存，这里不会阻塞在网络请求上。
     """
     key = bare_id(model_id)
     try:

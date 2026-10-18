@@ -1,13 +1,3 @@
-"""The four guards share one grouped shape: a global default that covers both
-realms, plus an optional per-realm override where an empty value means
-"inherit the global".
-
-Pinned here: the grouped store and the one-time fold of the flat pre-grouping
-keys, the values the pool hands each account, and the two shapes
-/settings/save accepts. An override of 0 is *not* the same as an empty one -
-0 turns the guard off for that realm, empty keeps following the global - so
-both directions are asserted. No network access required.
-"""
 import os
 import sys
 import tempfile
@@ -81,7 +71,7 @@ class LimitStorageTests(unittest.TestCase):
             self.assertEqual(stored["global"], 0)
             stored = wb_settings.set_limit(d, "reserve_credits", "global", -5)
             self.assertEqual(stored["global"], 0)
-            # An override that cannot be read becomes "inherit", not "off".
+            # 读不出的覆盖值按继承处理，不视为关闭。
             wb_settings.set_limit(d, "reserve_credits", "global", 7)
             wb_settings.set_limit(d, "reserve_credits", "intl", "abc")
             self.assertIsNone(
@@ -107,8 +97,7 @@ class LimitStorageTests(unittest.TestCase):
             self.assertEqual(wb_settings.reserve_credits(d), 7)
             self.assertEqual(wb_settings.daily_token_limit(d, "cn"), 1000)
             stored = wb_settings.load(d)
-            # The flat keys are folded away, so a rollback cannot read a stale
-            # number from beside the grouped copy.
+            # 扁平键会被折叠掉，回滚时不会在分组副本旁边读到过期数字。
             for key in wb_settings.LIMIT_KEYS:
                 self.assertNotIn(key, stored)
             self.assertEqual(stored["panel_password_hash"], "x")
@@ -137,8 +126,7 @@ class LimitPoolTests(unittest.TestCase):
         accounts = []
         for realm in realms:
             entry = account("uid-" + (realm or "none"), realm)
-            # Account() falls back to "intl" when it cannot detect a realm, so
-            # pin the realm this case is actually about.
+            # Account() 识别不出区时退回 "intl"，这里固定用例真正关心的区。
             entry.realm = realm
             accounts.append(entry)
         pool.accounts = accounts
@@ -153,7 +141,7 @@ class LimitPoolTests(unittest.TestCase):
             got = {a.realm: a.daily_token_limit for a in pool.accounts}
             self.assertEqual(got["intl"], 100)
             self.assertEqual(got["cn"], 40)
-            # An account whose realm could not be detected follows the global.
+            # 识别不出区的账号跟随全局值。
             self.assertEqual(got[""], 100)
 
     def test_pool_still_accepts_one_number_for_everyone(self):

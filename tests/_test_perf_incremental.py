@@ -1,31 +1,3 @@
-"""perf 的增量样本（T2）与 _tail_lines 的逐块读取（T3）。
-
-/usage/perf 是面板轮询里唯一没有增量的聚合：每次 TTL 过期都重读日志末尾
-sample 行、逐行 json.loads、把每一行的五个数值往全局与三层模型桶各 append
-一次，再对每个桶排序求分位。真机 558ms/次，TTL 15 秒——面板开着就每 15 秒
-付一次。本套件钉住三件事：
-
-  1. _tail_lines 只对"本块 + 上一轮遗留的前缀片段"做 split（不重切已读的
-     块）：用 open 计数桩证明读进来的字节数就是尾部那一段、split 的块数就是
-     ceil(字节/chunk)，同时与旧实现的逐字复制（参考实现）在十来种边界日志上
-     逐字节对拍——行集合与顺序一个字节都不许变。
-  2. perf 的增量环：同一份日志按脚本演进（追加 / 半行写一半又写完整 / 空行 /
-     坏 JSON / 没有 realm 的老行 / client_aborted / 截断 / 同尺寸重写 / 删除 /
-     重建 / 超过 sample），每一步的输出都与参考实现（旧 _perf_stats_uncached
-     的逐字复制）逐字节相同；sample_from / sample_capped / sampled / 三层桶的
-     顺序与内容全部一致。
-  3. 增量真的省了工作：0 新字节的 TTL 重算一个 json.loads 都不发生、也不重读
-     日志；N 行新日志只解析 N 行（计数桩）。
-
-唯一一处有意的口径收敛（下面单独钉住）：窗口预过滤跳过的行不解析，但旧实现
-里"样本最老的那一行"无论窗口如何都会被解析，它的 at 就是 sample_from。增量
-实现给被预过滤的行也留一份它声明的 at（完整行才走这条），所以两者只在"坏
-JSON、以 } 结尾、带可解析的 {"at": <float>, 前缀、且是样本最老的一行"时不同：
-新实现报那一行声明的 at，旧实现报下一行的 at；两者只差 sample_from 一个字段，
-且那一行滑出样本后立刻重新一致。
-
-无网络：日志在临时目录里现造。
-"""
 import io
 import json
 import os
@@ -80,7 +52,7 @@ def text(obj):
 
 
 # --------------------------------------------------------------------------
-# 参考实现：改动前 _tail_lines 与 _perf_stats_uncached 的逐字复制
+# 参考实现：_tail_lines 与 _perf_stats_uncached 的逐字副本，用于对拍
 # --------------------------------------------------------------------------
 def ref_tail_lines(path, max_lines, chunk=256 * 1024):
     lines = []
@@ -113,8 +85,8 @@ def ref_tail_lines(path, max_lines, chunk=256 * 1024):
 
 
 def ref_perf_stats(sample=5000, realm=None, since=None, until=None):
-    """改动前 _perf_stats_uncached 的逐字复制（走参考 _tail_lines）。"""
-    ttfts, gens, walls, rates, hits, tok_rates = [], [], [], [], [], []
+    """参考聚合实现，读取走本文件的 ref_tail_lines。"""
+    ttfts, gens, walls, hits, tok_rates = [], [], [], [], []
     total = ok = err = aborted = 0
     m_buckets = {}
     mr_buckets = {}
@@ -315,7 +287,7 @@ def append_lines(lines):
 
 
 def reset_state():
-    """清掉增量环与载荷缓存（本套件按用例从零起）。"""
+    """清掉增量环与载荷缓存，本套件按用例从零起。"""
     try:
         P._perf_state.clear()
     except AttributeError:
@@ -324,7 +296,7 @@ def reset_state():
 
 
 def inc(sample, realm=None, rng=None, since=None, until=None):
-    """走增量入口（ttl=0 每次都是 TTL 过期后的重建）。"""
+    """走增量入口，ttl=0 表示每次都按 TTL 过期重建。"""
     return P.perf_stats(sample, realm=realm, ttl=0, range=rng,
                         since=since, until=until)
 
@@ -345,14 +317,14 @@ def compare(label, sample, realm=None, rng=None, since=None, until=None):
 
 
 # --------------------------------------------------------------------------
-# [1] _tail_lines：与参考实现逐字节一致 + 读入的字节数有界（不重切已读块）
+# [1] _tail_lines：与参考实现逐字节一致 + 读入的字节数有界，不重切已读块
 # --------------------------------------------------------------------------
 print("[1] _tail_lines：逐字节对拍 + 读取字节数有界")
 
 CASES = {
-    # 正常行 + 末尾没有换行的完整行（_tail_lines 把它当一行）
+    # 正常行 + 末尾没有换行的完整行，_tail_lines 把它当一行
     "no_final_newline": ("".join(row(ANCHOR + i * 60) + "\n" for i in range(20))[:-1]).encode(),
-    # 末尾是写了一半的 JSON（没有换行）
+    # 末尾是写了一半的 JSON，没有换行
     "partial_tail": ("".join(row(ANCHOR + i * 60) + "\n" for i in range(20))
                      + '{"at": 1, "mod').encode(),
     # 末尾换行之后只剩空白
@@ -394,7 +366,7 @@ CASES["huge_line"] = (row(ANCHOR) + "\n"
                       + json.dumps({"at": ANCHOR + 1, "pad": "x" * (300 * 1024)},
                                    ensure_ascii=False) + "\n"
                       + row(ANCHOR + 2) + "\n").encode()
-# 20000+ 行（跨很多块）
+# 20000+ 行，跨很多块
 CASES["big"] = "".join(row(ANCHOR + i * 3, "m-%d" % (i % 5), "u%d" % (i % 3),
                            "intl" if i % 2 else "cn") + "\n"
                       for i in range(25000)).encode()
@@ -412,7 +384,7 @@ for name in sorted(CASES):
 check("_tail_lines 与参考实现逐字节一致（%d 种日志 × 5 个 sample）"
       % len(CASES), ok_all)
 
-# 读入的字节数有界：open 计数桩只数 read()，证明没有把已读的块再切一遍
+# 读入的字节数有界：open 计数桩只数 read，证明没有把已读的块再切一遍
 _real_open = open
 
 
@@ -466,7 +438,7 @@ check("sample=5000 读入的字节数随 sample 线性缩小（不是整段重�
       nbytes5 < nbytes, (nbytes5, nbytes))
 check("sample=5000 的行数与参考一致", len(lines5) == 5000, len(lines5))
 
-# 计时只打印不断言（CI 机器负载不可控；结构性证据在上面两条）
+# 计时只打印不断言：CI 机器负载不可控，结构性证据在上面两条
 t0 = time.perf_counter()
 P._tail_lines(LOG, 20000)
 t20 = (time.perf_counter() - t0) * 1000.0
@@ -478,7 +450,7 @@ print("    计时参考（25000 行日志）：sample=5000 %.2fms，sample=20000
       % (t5, t20, (t20 / t5) if t5 else 0))
 
 # --------------------------------------------------------------------------
-# [2] 冷路径：_perf_stats_uncached（重构后的渲染）与参考实现逐字节一致
+# [2] 冷路径：_perf_stats_uncached 的渲染与参考实现逐字节一致
 # --------------------------------------------------------------------------
 print()
 print("[2] 冷路径渲染与参考实现逐字节一致")

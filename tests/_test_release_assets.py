@@ -10,11 +10,13 @@ The fork's release pipeline is ``.github/workflows/release.yml``:
   * ``docker-publish.yml`` builds the image and ``package.yml`` builds the
     green package, both from that tag.
 
-``package.yml`` runs ``tools/_build_green_package.py`` on Windows: the ZIP is
-a ``git archive`` of the tagged tree plus the pinned official embeddable
-CPython (``python/``), and it is attached to the Release. The assertions below
-pin those promises locally, so a release cannot ship a working-tree snapshot,
-a runtime that cannot start the gateway, or a package missing ``app/web``.
+``package.yml`` runs ``release/release_tools.py portable`` on Windows after
+preparing the pinned runtime: the ZIP comes from ``release/portable.txt`` (only
+the managed release files, so dot folders cannot leak in), plus the trimmed
+``python/`` runtime and ``release-manifest.json``, and it is attached to the
+Release. The assertions below pin those promises locally, so a release cannot
+ship a working-tree snapshot, a runtime that cannot start the gateway, or a
+package missing ``app/web``.
 
 The portable-ZIP helper in ``release/`` is the explicit-manifest builder (the
 ``release/portable.txt`` list is what the updater replaces). It is exercised
@@ -27,7 +29,6 @@ Run with: python tests/_test_release_assets.py
 import ast
 import glob
 import hashlib
-import importlib.util
 import os
 import re
 import sys
@@ -55,15 +56,6 @@ EXPECTED_LEGS = (
 def read(*parts):
     with open(os.path.join(ROOT, *parts), encoding="utf-8") as fh:
         return fh.read()
-
-
-def load_green_builder():
-    """Import tools/_build_green_package.py without running its main()."""
-    path = os.path.join(ROOT, "tools", "_build_green_package.py")
-    spec = importlib.util.spec_from_file_location("build_green_package", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def make_runtime(directory, extra=()):
@@ -266,9 +258,9 @@ class ManifestTests(unittest.TestCase):
         listed = set(tools.read_manifest())
         self.assertEqual(sorted(p for p in on_disk if p not in listed), [])
 
-    def test_launchers_and_dashboard_are_listed(self):
+    def test_launchers_and_gateway_are_listed(self):
         listed = tools.read_manifest()
-        for name in ("dashboard.html", "app/wb_proxy.py", "README.md", "LICENSE",
+        for name in ("app/wb_proxy.py", "app/web/index.html", "README.md", "LICENSE",
                      "start-wb-proxy.bat", "start-wb-proxy.sh",
                      "start-wb-proxy.command", "start-wb-proxy-lan.sh"):
             self.assertIn(name, listed)
@@ -276,17 +268,25 @@ class ManifestTests(unittest.TestCase):
     def test_every_launcher_script_is_listed(self):
         """启动脚本按前缀全量扫：漏登记一个就在这儿红。
 
-        #285 的教训：portable.txt 里 start-wb-proxy-lan.bat 被 restart-wb-proxy.bat
-        顶掉了，而新脚本恰恰要调用它——便携包少了这个文件，Windows 的 LAN 启动与
-        重启都会失败。上面那份手写清单只点了 .sh 的名，所以没拦住。
         quick-deploy.sh 是 Docker 路径、刻意不进便携包，不在前缀里。
         """
         listed = tools.read_manifest()
-        for prefix in ("start-wb-proxy", "restart-wb-proxy", "allow-firewall"):
+        for prefix in ("start-wb-proxy", "allow-firewall"):
             for path in sorted(glob.glob(os.path.join(ROOT, prefix + "*"))):
                 name = os.path.basename(path)
                 if name.endswith((".bat", ".sh", ".command")):
                     self.assertIn(name, listed, "便携包清单缺少 %s" % name)
+
+    def test_removed_restart_scripts_stay_removed(self):
+        """重启脚本与无窗口启动已经取消，同步上游时不要再带回来。"""
+        leftovers = sorted(glob.glob(os.path.join(ROOT, "restart-wb-proxy*")))
+        self.assertEqual(leftovers, [])
+        for name in ("start-wb-proxy.bat", "start-wb-proxy-lan.bat",
+                     "start-wb-proxy.sh", "start-wb-proxy-lan.sh"):
+            with open(os.path.join(ROOT, name), encoding="utf-8") as fh:
+                text = fh.read()
+            self.assertNotIn("pythonw", text.lower(), name)
+            self.assertNotIn("console_tail", text, name)
 
     def test_runtime_data_files_are_listed(self):
         # wb_pricing._candidate_file() prefers pricing/pricing.json over the
@@ -316,7 +316,7 @@ class ManifestTests(unittest.TestCase):
     def test_development_only_files_stay_out(self):
         listed = tools.read_manifest()
         for name in ("Dockerfile", "docker-compose.yml", "quick-deploy.sh",
-                     "tests/run_all.py", "tools/_build_green_package.py"):
+                     "tests/run_all.py"):
             self.assertNotIn(name, listed)
 
 
@@ -423,6 +423,18 @@ class PortableZipTests(unittest.TestCase):
                              if n.endswith("python/python.exe")]
             self.assertEqual(len(runtime_files), 1)
 
+    def test_dot_paths_are_never_packaged(self):
+        self.assertTrue(tools.is_dot_path(".github/workflows/x.yml"))
+        self.assertTrue(tools.is_dot_path("app/.cache/x"))
+        self.assertFalse(tools.is_dot_path("app/web/index.html"))
+        self.assertFalse(tools.is_dot_path("dotfiles/README.md"))
+        with tempfile.TemporaryDirectory(prefix="relzip-") as directory:
+            runtime = make_runtime(os.path.join(directory, "python"),
+                                   extra=(".hidden/secret.txt",))
+            path, _ = self.build(directory, runtime=runtime)
+            names = zipfile.ZipFile(path).namelist()
+            self.assertFalse([n for n in names if ".hidden" in n], names)
+
     def test_a_missing_runtime_is_refused(self):
         with tempfile.TemporaryDirectory(prefix="relzip-") as directory:
             with self.assertRaises(SystemExit):
@@ -470,10 +482,9 @@ class PortableZipTests(unittest.TestCase):
         self.assertIn("python/bin/python3", sh)
         self.assertIn("app/wb_proxy.py", sh)
 
-    def test_the_archive_root_matches_the_green_package(self):
-        # Two builders, one product: extracting either asset gives the same
-        # top-level folder, so launchers and the update path agree.
-        self.assertEqual(tools.PACKAGE_ROOT, load_green_builder().PACKAGE_ROOT)
+    def test_the_archive_root_matches_the_package_layout(self):
+        # Extracting the asset gives one top-level folder, so launchers and
+        # the update path agree.
         self.assertEqual(tools.PACKAGE_ROOT, "wb-proxy-center")
 
     def test_archive_paths_are_safe(self):
@@ -584,16 +595,16 @@ class ReleaseToolingTests(unittest.TestCase):
         # line aborted the first rehearsal of this workflow - the repository
         # already paid for the same lesson in tests/run_all.py. Every tool pins
         # its own streams instead of trusting the console.
-        for name in ("release/portable_runtime.py", "release/release_tools.py",
-                     "tools/_build_green_package.py"):
+        for name in ("release/portable_runtime.py", "release/release_tools.py"):
             self.assertIn('reconfigure(encoding="utf-8"', read(*name.split("/")), name)
 
     def test_the_test_workflow_pins_utf8_for_every_python_process(self):
         self.assertIn('PYTHONUTF8: "1"', read(".github", "workflows", "tests.yml"))
 
-    def test_the_green_package_job_runs_the_pinned_builder(self):
+    def test_the_package_job_builds_the_portable_zip(self):
         package = read(".github", "workflows", "package.yml")
-        self.assertIn("python tools/_build_green_package.py", package)
+        self.assertIn("python release/portable_runtime.py prepare", package)
+        self.assertIn("python release/release_tools.py portable", package)
         self.assertIn("runs-on: windows-latest", package)
 
 
@@ -847,77 +858,40 @@ class ReleaseWorkflowTests(unittest.TestCase):
             check_release_writers(mutated)
 
 
-class GreenPackageTests(unittest.TestCase):
-    """tools/_build_green_package.py is the asset the Release actually carries."""
-
-    def setUp(self):
-        self.builder = load_green_builder()
-        self.source = read("tools", "_build_green_package.py")
-        self.package = read(".github", "workflows", "package.yml")
-
-    def test_the_builder_packages_the_tagged_tree(self):
-        # `git archive <ref>` packages exactly what the tag points at; copying
-        # the working tree would ship uncommitted edits (and miss deletions).
-        self.assertIn('["git", "archive", "--format=tar"', self.source)
-        self.assertIn('f"--output={tree}", args.ref', self.source)
-        self.assertIn("ref: ${{ inputs.tag || github.event.release.tag_name }}",
-                      self.package)
-
-    def test_the_runtime_is_the_pinned_embeddable_distribution(self):
-        self.assertRegex(self.builder.PYTHON_VERSION, r"^\d+\.\d+\.\d+$")
-        self.assertEqual(
-            self.builder.RUNTIME_URL,
-            "https://www.python.org/ftp/python/%s/python-%s-embed-amd64.zip"
-            % (self.builder.PYTHON_VERSION, self.builder.PYTHON_VERSION))
-        self.assertRegex(self.builder.RUNTIME_SHA256, r"^[0-9a-f]{64}$")
-        # The digest is verified before anything is extracted.
-        self.assertIn("digest = sha256(archive)", self.source)
-        self.assertIn("if digest != RUNTIME_SHA256", self.source)
-        self.assertIn("raise SystemExit", self.source)
-
-    def test_the_isolated_mode_pth_is_removed(self):
-        # The embeddable distribution's ._pth puts Python into isolated mode:
-        # sys.path follows that file only, so app/ imports fail until it is
-        # deleted. Its name has to track the runtime version.
-        major_minor = "".join(self.builder.PYTHON_VERSION.split(".")[:2])
-        self.assertEqual(self.builder.PTH_NAME, "python%s._pth" % major_minor)
-        self.assertIn("(runtime / PTH_NAME).unlink()", self.source)
-
-    def test_the_archive_layout_matches_the_launchers(self):
-        self.assertEqual(self.builder.PACKAGE_ROOT, "wb-proxy-center")
-        self.assertIn('f"{PACKAGE_ROOT}-v{args.version}.zip"', self.source)
-        self.assertIn('f"{PACKAGE_ROOT}/{path.relative_to(staging).as_posix()}"',
-                      self.source)
-        bat = read("start-wb-proxy.bat")
-        self.assertIn("app\\wb_proxy.py", bat)
-        self.assertIn("python\\python.exe", bat)
-        sh = read("start-wb-proxy.sh")
-        self.assertIn("app/wb_proxy.py", sh)
-        self.assertIn("python/bin/python3", sh)
+class PackageWorkflowTests(unittest.TestCase):
+    """package.yml builds the portable ZIP from the manifest and attaches it."""
 
     def test_the_package_workflow_builds_and_attaches_the_zip(self):
-        self.assertIn("release:\n    types: [published]", self.package)
-        self.assertIn("workflow_call:\n    inputs:\n      tag:", self.package)
-        self.assertIn("workflow_dispatch:\n    inputs:\n      tag:", self.package)
-        self.assertIn("runs-on: windows-latest", self.package)
+        package = read(".github", "workflows", "package.yml")
+        self.assertIn("release:\n    types: [published]", package)
+        self.assertIn("workflow_call:\n    inputs:\n      tag:", package)
+        self.assertIn("workflow_dispatch:\n    inputs:\n      tag:", package)
+        self.assertIn("runs-on: windows-latest", package)
         # The version comes from the tag, never a second hand-maintained
         # literal that could disagree with it.
-        self.assertIn("value=${TAG#v}", self.package)
-        self.assertIn('python tools/_build_green_package.py --version '
-                      '"${{ steps.version.outputs.value }}" --out dist',
-                      self.package)
-        self.assertIn("path: dist/*.zip", self.package)
-        self.assertIn('gh release view "$TAG"', self.package)
-        self.assertIn('gh release upload "$TAG" dist/*.zip --clobber', self.package)
+        self.assertIn("value=${TAG#v}", package)
+        self.assertIn("python release/portable_runtime.py prepare", package)
+        self.assertIn("python release/release_tools.py portable", package)
+        self.assertIn("dist/wb-proxy-center-v$VERSION.zip", package)
+        self.assertIn("path: dist/*.zip", package)
+        self.assertIn('gh release view "$TAG"', package)
+        self.assertIn('gh release upload "$TAG" dist/*.zip --clobber', package)
 
-    def test_the_release_pipeline_calls_the_green_package_job(self):
+    def test_the_release_pipeline_calls_the_package_job(self):
         jobs = workflow_jobs(read(".github", "workflows", "release.yml"))
         package = jobs["package"]
         self.assertIn("uses: ./.github/workflows/package.yml", package)
         self.assertIn("tag: ${{ needs.release.outputs.tag }}", package)
 
+    def test_no_dot_paths_reach_the_archive(self):
+        """清单是发布包的权威来源：任何以点开头的目录或文件都不许进来。"""
+        for name in tools.read_manifest():
+            self.assertFalse(
+                any(part.startswith(".") for part in name.split("/")),
+                "%s 藏在点开头的路径里" % name)
+
     def test_user_data_cannot_reach_the_archive(self):
-        # git archive only sees tracked files, and the updater's protected
+        # The manifest is the only source list, and the updater's protected
         # directories are gitignored - so a release can never carry accounts/
         # or usage/ from the maintainer's machine.
         ignored = read(".gitignore")

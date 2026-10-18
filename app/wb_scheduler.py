@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import random
+import wb_settings
 import wb_tasks
 from wb_tasks import do_cat_travel
 
@@ -18,25 +19,39 @@ from wb_tasks import do_cat_travel
 class Scheduler:
     def __init__(self, pool):
         self.pool = pool
-        # 采用 Sliverkiss/workbuddy2api 的默认排程 (CST 24 小时制)
-        self.checkin_hours = [9, 21]     # 每日 09:00、21:00 签到
-        self.travel_hours = [9, 21]      # 每日 09:00 派出、21:00 领奖闭环
-        self.keepalive_hours = [22]      # 每日 22:00 集中 Token 保活检查
-        self.cat_hours = [1]             # 每日 01:00 夜猫子专属任务
-        self.all_hours = sorted(list(set(self.checkin_hours + self.travel_hours + self.keepalive_hours + self.cat_hours)))
+        # 时段来自设置；默认保持原有排程（09:00/21:00、22:00、01:00）。
+        self.checkin_hours = []
+        self.travel_hours = []
+        self.keepalive_hours = []
+        self.cat_hours = []
+        self.all_hours = []
         self.enabled = True
         self._stop_event = threading.Event()
         self._thread = None
         self.last_run_time = None
         self.next_run_time = None
         self.logs = []
+        self.apply_schedule()
         # Guards against overlapping runs: trigger_now() spawns a thread per
         # click, and a manual trigger can also land on top of the hourly job.
         self._run_lock = threading.Lock()
-        self._calc_next_fire()
         # Surface task-level failures (dead endpoints, upstream shape changes)
         # in the same log the panel shows.
         wb_tasks.set_logger(self.log)
+
+    def apply_schedule(self, hours=None):
+        """按设置更新四组整点时段；不传时从账号目录读取。"""
+        directory = getattr(self.pool, "dir", "")
+        if hours is None:
+            hours = (wb_settings.scheduler_hours(directory) if directory
+                     else wb_settings.DEFAULT_SCHEDULER_HOURS)
+        self.checkin_hours = list(hours.get("checkin") or [])
+        self.travel_hours = list(hours.get("travel") or [])
+        self.keepalive_hours = list(hours.get("keepalive") or [])
+        self.cat_hours = list(hours.get("cat") or [])
+        self.all_hours = sorted(set(self.checkin_hours + self.travel_hours
+                                    + self.keepalive_hours + self.cat_hours))
+        self._calc_next_fire()
 
     def log(self, msg, tag=None):
         ts = time.strftime("%Y-%m-%d %H:%M:%S", wb_tasks.cst_now())
@@ -149,6 +164,10 @@ class Scheduler:
 
     def _run_cycle(self, trigger_reason="周期巡检"):
         self.last_run_time = time.strftime("%Y-%m-%d %H:%M:%S", wb_tasks.cst_now())
+        proxy = sys.modules.get("wb_proxy") or sys.modules.get("__main__")
+        if getattr(proxy, "stand_down_active", lambda: False)():
+            self.log("账号被上游限制，网关已停止：跳过本次巡检")
+            return
         self.log(f"开始执行任务 ({trigger_reason})...")
         if not self.pool or not self.pool.accounts:
             self.log("暂无可用的活跃账号，跳过本次巡检")
@@ -160,15 +179,23 @@ class Scheduler:
         travel_count = 0
         daily_chat_count = 0
 
+        processed = 0
         for idx, acc in enumerate(list(self.pool.accounts)):
-            if idx > 0:
-                # 账号间随机错峰防并发风控（2~5秒浮动延时，issue #394）
-                time.sleep(random.uniform(2.0, 5.0))
+            # 停用的账号一个请求都不发：签到、保活、活跃上报都算请求。
+            if not acc.enabled:
+                continue
+            if processed:
+                # 账号间随机错峰防并发风控；下限固定 2 秒，上限由设置页决定。
+                directory = getattr(self.pool, "dir", "")
+                upper = (wb_settings.task_jitter_max(directory) if directory
+                         else wb_settings.TASK_JITTER_DEFAULT)
+                time.sleep(random.uniform(wb_settings.TASK_JITTER_MIN, upper))
+            processed += 1
             uid8 = acc.uid[:8] if acc.uid else "?"
             # 1. 检查 Token 剩余寿命 (小于 2 小时自动刷新保活)
             exp = acc.expires_at or 0
             if exp and (exp - time.time()) < 7200:
-                self.log(f"账号 [{uid8}] Token 即将到期，执行主动保活刷新...")
+                self.log(f"账号 [{uid8}] Token 即将到期，执行主动保活刷新")
                 if acc.refresh():
                     refreshed_count += 1
                     self.log(f"✓ 账号 [{uid8}] Token 自动保活刷新成功")
@@ -178,7 +205,7 @@ class Scheduler:
             # 2. 如果是国内版账号，检查每日签到与猫猫旅行
             if acc.realm == "cn":
                 if acc.can_checkin():
-                    self.log(f"检测到国内版账号 [{uid8}] 今日尚未签到，执行自动签到...")
+                    self.log(f"检测到国内版账号 [{uid8}] 今日尚未签到，执行自动签到")
                     res = acc.checkin(trigger="scheduler")
                     if res.get("ok"):
                         checkin_count += 1
@@ -188,7 +215,7 @@ class Scheduler:
                     time.sleep(1.0)
 
                 if acc.can_report_activity():
-                    self.log(f"检测到国内版账号 [{uid8}] 今日尚未活跃上报，执行对话活跃上报...")
+                    self.log(f"检测到国内版账号 [{uid8}] 今日尚未活跃上报，执行对话活跃上报")
                     res = acc.report_activity()
                     if res.get("ok"):
                         report_count += 1
@@ -222,7 +249,7 @@ class Scheduler:
             # 3. 如果是国际版账号，检查每日活跃对话 (送 30/50 积分福利)
             if acc.realm == "intl":
                 if acc.can_daily_chat():
-                    self.log(f"检测到国际版账号 [{uid8}] 今日尚未活跃，执行每日活跃打卡对话...")
+                    self.log(f"检测到国际版账号 [{uid8}] 今日尚未活跃，执行每日活跃打卡对话")
                     res = acc.daily_chat(trigger="scheduler")
                     if res.get("ok"):
                         daily_chat_count += 1
@@ -236,11 +263,18 @@ class Scheduler:
         self.log(f"巡检完成：Token保活 {refreshed_count} 个，国内签到 {checkin_count} 个，活跃上报 {report_count} 个，猫猫日常 {travel_count} 个，国际活跃 {daily_chat_count} 个")
 
     def status(self):
+        def label(hours):
+            return "/".join("%02d:00" % hour for hour in hours) if hours else "关闭"
         return {
             "enabled": self.enabled,
-            "mode": "整点排程 (09:00/21:00 签到旅行 · 每日活跃上报 · 22:00 保活 · 01:00 夜猫)",
-            "mode_cn": "整点排程 (09:00/21:00 签到旅行 · 每日活跃上报 · 22:00 保活 · 01:00 夜猫)",
-            "mode_intl": "账号 Token 自动保活与凭证常驻 (每日 22:00 集中巡检)",
+            "mode": "整点排程 (签到与活跃上报 %s · 猫猫旅行 %s · 保活 %s · 夜猫 %s)"
+                    % (label(self.checkin_hours), label(self.travel_hours),
+                       label(self.keepalive_hours), label(self.cat_hours)),
+            "mode_cn": "整点排程 (签到与活跃上报 %s · 猫猫旅行 %s · 保活 %s · 夜猫 %s)"
+                       % (label(self.checkin_hours), label(self.travel_hours),
+                          label(self.keepalive_hours), label(self.cat_hours)),
+            "mode_intl": "账号 Token 自动保活与凭证常驻 (每日 %s 集中巡检)"
+                         % label(self.keepalive_hours),
             "last_run_time": self.last_run_time or "尚未运行",
             "next_run_time": self.next_run_time or "待调度",
             "logs": self.logs[-20:],

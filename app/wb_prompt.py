@@ -2,15 +2,15 @@
 """wb_prompt.py — 网关自有系统提示词模式（panel prompt.go / degrade.go 语义）。
 
 客户端（Codex / Claude Code 等）在 system prompt 里注入固定模板句时，上游内容
-审核可能按逐字匹配误杀合法流量。本模组让网关在出站前改写 system/developer
-讯息，从源头消灭 system 来源的指纹误报；user/assistant/tool 讯息不动（既有
+审核可能按逐字匹配误杀合法流量。本模块让网关在出站前改写 system/developer
+消息，从源头消除 system 来源的指纹误报；user/assistant/tool 消息不动（既有
 sanitize 指纹清洗照旧，两层互不替代）。
 
-模式（settings.json 的 prompt.mode，预设 passthrough）：
+模式（settings.json 的 prompt.mode，默认 passthrough）：
   - passthrough：透传客户端 system/developer（hub 原本的行为）；
   - custom：删除所有 system/developer，换成一条网关提示词；
   - append：在开头连续 system/developer 区块之后插入一条网关提示词，
-    客户端既有讯息逐字保留。
+    客户端既有消息逐字保留。
 
 降级（passthrough / append）：内容审核拦截（403）多半是 system 来源的指纹
 误杀。此时切到最小中性提示词，直到次日 00:00 CST 重置，并把同一个请求用
@@ -54,7 +54,7 @@ def load_prompt(mode, file_path=""):
 
 
 def rewrite(messages, system_prompt):
-    """删除所有 system/developer，头部插入一条网关 system 讯息。"""
+    """删除所有 system/developer，头部插入一条网关 system 消息。"""
     if not system_prompt:
         return messages
     kept = [m for m in (messages or [])
@@ -64,7 +64,7 @@ def rewrite(messages, system_prompt):
 
 
 def append(messages, system_prompt):
-    """在开头连续 system/developer 区块之后插入网关提示词，其余讯息不动。"""
+    """在开头连续 system/developer 区块之后插入网关提示词，其余消息不动。"""
     if not system_prompt:
         return messages
     msgs = list(messages or [])

@@ -24,6 +24,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
 
+_TMP_ENV = isolated_data_dirs("wb-pricing-panel-auth-")
+
 import wb_proxy as proxy          # noqa: E402
 import wb_settings as settings    # noqa: E402
 

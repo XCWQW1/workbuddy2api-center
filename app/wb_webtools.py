@@ -1,60 +1,22 @@
 # -*- coding: utf-8 -*-
-"""反代代跑 web_search / web_fetch（开关在 wb_proxy.LOCAL_WEB_TOOLS）
-
-背景：Codex App 会宣告 web_search 这种 Responses 的伺服器端工具，但 WorkBuddy
-上游没有任何搜寻服务——v1.5.3 的 revert 已经量测过，直接把 web_search /
-web_search_preview / web_fetch 丢给 chat endpoint，模型的回答跟完全不给工具
-一样（零个 tool call）。所以没有现成的执行器可以转接，只能由反代自己跑。
-
-v1.5.0 ~ 1.5.2 做过同一件事，被 revert（issue #43）。三个缺陷都在这里修掉：
-
-  1. 只认 args["query"] 这个字串。模型改送 queries 阵列时会收到一句「你没问
-     问题」，于是必然重试、必然把回合数耗光。-> query_args() 同时接受
-     query / queries / q，并把多个查询合并成一次搜寻。
-  2. 去重只看已展开成 chat 形状的 function，漏掉客户端原本那份伺服器端宣告，
-     上游因此同时看到两个同名的 web_search。-> install_tool_defs() 先把同名
-     项目全部拿掉，再放进唯一一份我们的定义。
-  3. 回合用尽时合成一个 resp_wrapup（status=completed、output=[]）收尾，把
-     失败伪装成正常结束，客户端看到的是「讲到一半断掉」。-> 这里不合成任何
-     东西：呼叫端在最后一轮把工具收回，让模型自己用文字收尾。
-
-多引擎自动轮换：单引擎实现只打 DuckDuckGo HTML 版，上游对出口 IP 限流、
-返回反爬页（HTTP 202 / 验证页）时，解析不到结果就被误报成「查无结果」，
-同一网关上的所有对话都只会看到「搜不到」，也看不出是被限流。现在：
-
-  * 预设引擎链 duckduckgo -> bing -> wikipedia -> stackoverflow -> google
-    news（只用国际来源，不收中国引擎）；一家失败自动换下一家——常规引擎
-    （DuckDuckGo / Bing）接手时对模型完全透明，换成 Wikipedia /
-    Stack Overflow / Google News 这类非常规来源时结果会标明来源；
-    真正全挂才回明确的错误；
-  * 失败分类：「真的没有结果」（照旧的查无结果文案）与「被限流／拦截」
-    （HTTP 202/403/429 或反爬页）分开；被挡的引擎进冷却（预设 600 秒），
-    其他引擎还健康时不重复挨打，其他全挂时仍会补试一轮；
-  * 全部失败时回 "search is temporarily unavailable" ＋各家原因，并要模型
-    不要重试同一句、直接告知使用者——不再把失败伪装成查无结果；
-  * 查询结果 TTL 快取（预设 600 秒，空结果 120 秒）＋同 key 併发去重，
-    相同查询不会重复打线上；
-  * 对外请求有最小间隔（WB_WEB_MIN_INTERVAL，预设 0.5 秒）与单次搜寻总预算
-    （WB_WEB_BUDGET，预设 25 秒），避免一轮把每个引擎都打穿。
-
-web_fetch 一并硬化：只收文本型内容（PDF 等二进位直接回一句错误）、支援
-gzip 压缩、读档上限 4 MB、charset 依标头与 <meta> 推断、结果进快取；
-URL 守卫除原本的字面检查外，解析 DNS 后逐一核对必须都是公网位址（防 DNS
-rebinding 把 fetch 指进内网）。
-
-搜寻后端全部免 API key（DuckDuckGo / Bing 的 HTML 版、Wikipedia 与
-Stack Exchange 的公开 API、Google News RSS）。任何失败都回一句可读的错误给模型，不假造结果。
-只用 Python 标准库。
-
-环境变数：
-  WB_WEB_ENGINES       覆盖引擎链与顺序，逗号分隔（例："duckduckgo,bing"）
-  WB_WEB_COOLDOWN      被挡引擎的冷却秒数（预设 600，0 = 不冷却）
-  WB_WEB_CACHE_TTL     搜寻／抓取快取秒数（预设 600，0 = 关闭）
-  WB_WEB_MIN_INTERVAL  对外最小间隔秒数（预设 0.5，0 = 关闭）
-  WB_WEB_BUDGET        单次搜寻所有引擎的总预算秒数（预设 25，0 = 不限）
-  WB_WEB_TOOLS_PROXY   搜索请求的出口代理 http(s)://[user:pass@]host:port；
-                       web_fetch 为固定解析 IP 的安全连接，不走这个代理
-"""
+# 反代代跑 web_search 与 web_fetch，开关在 wb_proxy.LOCAL_WEB_TOOLS。
+#
+# 搜索按引擎链自动轮换：duckduckgo、bing 失败时依次换 wikipedia、
+# stackoverflow、news；非常规来源的结果会标明来源，全部失败时回明确的错误，
+# 不把失败伪装成查无结果。被限流的引擎进冷却，查询结果进 TTL 缓存，相同 key
+# 的并发查询合并成一次对外请求。
+#
+# web_fetch 只收文本型内容，支持 gzip，读档上限 4 MB，charset 依标头与
+# <meta> 推断，结果同样进缓存。URL 守卫在 DNS 解析后逐一核对，必须都是公网
+# 地址，防止 DNS rebinding 把 fetch 指进内网。
+#
+# 环境变量：
+#   WB_WEB_ENGINES       覆盖引擎链与顺序，逗号分隔
+#   WB_WEB_COOLDOWN      被挡引擎的冷却秒数，默认 600，0 表示不冷却
+#   WB_WEB_CACHE_TTL     搜索与抓取缓存秒数，默认 600，0 表示关闭
+#   WB_WEB_MIN_INTERVAL  对外最小间隔秒数，默认 0.5，0 表示关闭
+#   WB_WEB_BUDGET        单次搜索所有引擎的总预算秒数，默认 25，0 表示不限
+#   WB_WEB_TOOLS_PROXY   搜索请求的出口代理；web_fetch 固定解析 IP，不走代理
 
 import base64
 import collections
@@ -76,7 +38,7 @@ import urllib.request
 WEB_SEARCH_NAME = "web_search"
 WEB_FETCH_NAME = "web_fetch"
 
-# 客户端会用这几种 type 宣告同一个工具
+# 客户端会用这几种 type 声明同一个工具
 SEARCH_DECL_TYPES = ("web_search", "web_search_preview", "web_search_preview_2025_03_11")
 FETCH_DECL_TYPES = ("web_fetch",)
 
@@ -155,7 +117,7 @@ def _log(msg, level="INFO", tag="webtools"):
     except Exception:
         pass
 # ---------------------------------------------------------------------------
-# 快取 / 併发去重 / 对外节流
+# 缓存 / 并发去重 / 对外节流
 # ---------------------------------------------------------------------------
 
 class _TTLCache(object):
@@ -197,7 +159,7 @@ _INFLIGHT = {}
 
 
 def _single_flight(key):
-    """有人正在算同一个 key 时回传 event 等它；自己是第一个则回 None。"""
+    """有人正在算同一个 key 时返回 event 等它；自己是第一个则返回 None。"""
     with _INFLIGHT_LOCK:
         event = _INFLIGHT.get(key)
         if event is not None:
@@ -231,7 +193,7 @@ def _throttle():
 
 
 def reset_state():
-    """清空快取与冷却状态（测试与面板重设用）。"""
+    """清空缓存与冷却状态，测试与面板重设时调用。"""
     _CACHE.clear()
     with _ENGINE_STATE_LOCK:
         _ENGINE_STATE.clear()
@@ -244,11 +206,11 @@ def reset_state():
 # ---------------------------------------------------------------------------
 
 class _UnsafeRedirectError(Exception):
-    """Raised when a web tool response redirects into a disallowed address."""
+    """网页工具的响应重定向到不允许的地址时抛出。"""
 
 
 def _ip_is_public(text):
-    """单一 IP 是否属于公网（含 IPv4-mapped IPv6 的还原检查）。"""
+    """单一 IP 是否属于公网，含 IPv4 映射 IPv6 的还原检查。"""
     try:
         ip = ipaddress.ip_address(str(text or "").split("%")[0])
     except ValueError:
@@ -260,7 +222,7 @@ def _ip_is_public(text):
 
 
 def _resolve_host_public(host):
-    """(ok, problem)。DNS 解析出来的每个位址都必须是公网。"""
+    """返回 ok 与 problem 两个值；DNS 解析出来的每个地址都必须是公网。"""
     try:
         infos = socket.getaddrinfo(host, None)
     except Exception as exc:
@@ -311,7 +273,7 @@ def _guard_url(url, resolve=False):
 
 
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Apply the same URL policy to every redirect target as the initial URL."""
+    """每个重定向目标都套用与初始 URL 相同的地址策略。"""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         target = urllib.parse.urljoin(req.full_url, str(newurl or ""))
@@ -322,7 +284,7 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 def _egress_proxy():
-    """此工具专用的出口代理；没设就走 urllib 预设（环境变数 HTTP(S)_PROXY）。"""
+    """此工具专用的出口代理；没设就走 urllib 默认值，即环境变量 HTTP_PROXY 与 HTTPS_PROXY。"""
     raw = (os.environ.get("WB_WEB_TOOLS_PROXY") or "").strip()
     if not raw:
         return ""
@@ -332,7 +294,7 @@ def _egress_proxy():
 
 
 def _open_url(url, timeout=HTTP_TIMEOUT, max_bytes=MAX_BODY_BYTES, accept=None):
-    """GET 一个网址，回传 (raw_bytes, status, content_type, charset)。失败抛例外。"""
+    """GET 一个网址，返回 raw_bytes、status、content_type、charset 组成的元组。失败抛出异常。"""
     headers = {
         "User-Agent": _USER_AGENT,
         "Accept": accept or "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -448,7 +410,7 @@ def _bing_target(href):
     return href
 
 # ---------------------------------------------------------------------------
-# 各引擎的 URL 与解析器（纯标准库、正则优先，页面改版只影响单个引擎）
+# 各引擎的 URL 与解析器：纯标准库、正则优先，页面改版只影响单个引擎
 # ---------------------------------------------------------------------------
 
 def _url_duckduckgo(query, n):
@@ -637,7 +599,7 @@ ENGINE_NAMES_DEFAULT = ("duckduckgo", "bing", "wikipedia", "stackoverflow", "new
 
 
 def engine_names():
-    """设定里的引擎链；WB_WEB_ENGINES 可覆盖顺序与子集。"""
+    """设置里的引擎链；WB_WEB_ENGINES 可覆盖顺序与子集。"""
     raw = (os.environ.get("WB_WEB_ENGINES") or "").strip()
     if raw:
         picked = [x.strip().lower() for x in raw.split(",") if x.strip()]
@@ -694,7 +656,7 @@ def _page_looks_blocked(text, spec):
 
 
 def _run_engine(name, query, n, timeout):
-    """跑一家引擎：回 {state: ok|empty|blocked|error, results, detail}。"""
+    """跑一家引擎，返回 state、results、detail 三个键组成的字典。"""
     spec = _ENGINES.get(name)
     if not spec:
         return {"state": "error", "results": [], "detail": "unknown engine"}
@@ -736,11 +698,11 @@ def _format_results(query, results, note=""):
 
 
 def _search_fanout(query, n):
-    """依序打所有引擎；第一家成功的直接回报，只有全挂才回错误。
+    """依序打所有引擎；第一家成功的直接回报，只有全部失败才回错误。
 
-    常规引擎（DuckDuckGo / Bing）接手时结果与平常无异；换成 Wikipedia /
-    Stack Overflow / Google News 这类非常规来源时，结果会带上 source_note，
-    让模型知道手上的不是一般网页搜寻结果。
+    常规引擎 DuckDuckGo 与 Bing 接手时结果与平常无异；换成 Wikipedia、
+    Stack Overflow、Google News 这类非常规来源时，结果会带上 source_note，
+    让模型知道手上的不是一般网页搜索结果。
     """
     names = _chain_for(query)
     if not names:
@@ -794,7 +756,7 @@ def _search_fanout(query, n):
         if results is not None:
             return _finish_ok(name, results)
 
-    # 其他引擎全挂时，把冷却中的引擎补试一轮（可能已经恢复）
+    # 其他引擎全部失败时，把冷却中的引擎补试一轮，可能已经恢复。
     for name in skipped:
         if _remaining() <= 1:
             break
@@ -814,7 +776,7 @@ def _search_fanout(query, n):
             "unavailable and continue with what you already know." % detail)
 
 # ---------------------------------------------------------------------------
-# 工具定义（给上游看的 function 形状）
+# 工具定义：给上游看的 function 形状
 # ---------------------------------------------------------------------------
 
 def web_search_tool_def():
@@ -870,7 +832,7 @@ def web_fetch_tool_def():
 
 
 # ---------------------------------------------------------------------------
-# 宣告替换（照旧）
+# 声明替换
 # ---------------------------------------------------------------------------
 
 def _declared(tools, types):
@@ -886,7 +848,7 @@ def _declared(tools, types):
 
 
 def client_wants_web(tools):
-    """客户端宣告了哪几个网路工具（伺服器端或 function 形状都算）。"""
+    """客户端声明了哪几个网络工具，服务器端或 function 形状都算。"""
     return {
         "search": _declared(tools, SEARCH_DECL_TYPES + (WEB_SEARCH_NAME,)),
         "fetch": _declared(tools, FETCH_DECL_TYPES + (WEB_FETCH_NAME,)),
@@ -894,11 +856,11 @@ def client_wants_web(tools):
 
 
 def install_tool_defs(chat_tools, wants):
-    """把客户端的网路工具宣告换成我们的 function。
+    """把客户端的网络工具声明换成我们的 function。
 
-    同名项目（伺服器端的 {"type": "web_search"}、客户端自己带的 function、
-    以及上一轮从我们这里学到的定义）一律先移除，只留唯一一份；否则上游会
-    同时看到两个 web_search，模型会挑错那个去呼叫。
+    同名项目一律先移除，包括服务器端的 {"type": "web_search"}、客户端自己
+    带的 function，以及上一轮从我们这里学到的定义，只留唯一一份；否则上游会
+    同时看到两个 web_search，模型会挑错那个去调用。
     """
     names = set()
     if wants.get("search"):
@@ -931,11 +893,10 @@ def is_internal_tool(name):
 
 
 def query_args(args):
-    """从工具参数取出查询字串。
+    """从工具参数取出查询字符串。
 
-    旧版只读 args["query"] 这个字串，模型改送 queries 阵列时就会被回一句
-    「你没问问题」——issue #43 就是这样一路重试到回合用尽。这里接受
-    query / queries / q，阵列会用 " or " 接起来。
+    接受 query、queries、q 三种键，数组会用 " or " 接起来；模型改送数组时
+    不会因为读不到 query 而收到「你没问问题」并反复重试。
     """
     if not isinstance(args, dict):
         return ""
@@ -965,7 +926,7 @@ def url_arg(args):
 
 
 def max_rounds():
-    """最多代跑几轮网路工具。环境变数可覆盖，方便临时关小。"""
+    """最多代跑几轮网络工具。环境变量可覆盖，方便临时调小。"""
     try:
         n = int(os.environ.get("WB_MAX_WEB_ROUNDS", "") or "")
     except (TypeError, ValueError):
@@ -976,11 +937,11 @@ def max_rounds():
 MAX_WEB_ROUNDS = max_rounds()
 
 # ---------------------------------------------------------------------------
-# 对外动作：search / fetch（execute 永不抛例外，永远回一句能喂回模型的字串）
+# 对外动作：search 与 fetch。execute 永不抛出异常，永远返回一句能喂回模型的字符串
 # ---------------------------------------------------------------------------
 
 def search(query, num_results=5):
-    """多引擎搜寻；模型只会看到成功的结果或一句明确的失败。"""
+    """多引擎搜索；模型只会看到成功的结果或一句明确的失败。"""
     query = str(query or "").strip()
     if len(query) < 2:
         return ('Error: web_search needs a query of at least 2 characters; '
@@ -1017,7 +978,7 @@ def search(query, num_results=5):
 
 
 class WebToolError(Exception):
-    """抓取失败的原因（地址被拒、解析不了、超时、连不上），转成给模型的一句话。"""
+    """抓取失败的原因，如地址被拒、解析不了、超时、连不上，转成给模型的一句话。"""
 
 
 class HttpStatusError(WebToolError):
@@ -1032,7 +993,7 @@ _SSL_CONTEXT = None
 
 
 def _ssl_context():
-    """默认上下文：证书链与主机名都要校验（连接虽然钉在 IP 上，这里不受影响）。"""
+    """默认上下文：证书链与主机名都要校验；连接虽然固定在校验过的 IP 上，这里不受影响。"""
     global _SSL_CONTEXT
     if _SSL_CONTEXT is None:
         _SSL_CONTEXT = ssl.create_default_context()
@@ -1089,7 +1050,7 @@ def _connect(parsed, addresses, deadline):
 
 
 def _fetch(parsed, addresses, deadline):
-    """发一个 GET，返回 (状态码, 响应头, 响应体, 是否被字节上限截断)。
+    """发一个 GET，返回状态码、响应头、响应体与是否被字节上限截断。
 
     重定向那一跳只读响应头：跳过去的地址多半用不上它带的页面。
     """
@@ -1097,8 +1058,9 @@ def _fetch(parsed, addresses, deadline):
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
     conn = cls(host, port, timeout=_remaining(deadline))
-    # 已经连好、https 也已经握手；塞进去免得它按主机名再解析一次（DNS 重绑定的口子）。
-    # Host 与 Accept-Encoding（identity）由 putrequest 按连接的主机和端口补上。
+    # 已经连好、https 也已经握手；塞进去免得它按主机名再解析一次，堵住 DNS
+    # 重绑定的口子。Host 与 Accept-Encoding identity 由 putrequest 按连接的
+    # 主机和端口补上。
     sock = _connect(parsed, addresses, deadline)
     conn.sock = sock
     try:
@@ -1122,7 +1084,7 @@ def _fetch(parsed, addresses, deadline):
         conn.close()
 
 
-# is_private / is_global 各版本的覆盖范围不一样，这几段自己兜底
+# is_private / is_global 各版本的覆盖范围不一样，这几段自己补齐
 _EXTRA_BLOCKED_V4 = tuple(ipaddress.ip_network(n) for n in (
     "192.0.0.0/24",      # IETF 协议专用，未必被 is_private 覆盖
     "192.88.99.0/24",    # 6to4 中继 anycast，已废弃
@@ -1133,7 +1095,7 @@ _EXTRA_BLOCKED_V6 = tuple(ipaddress.ip_network(n) for n in (
 
 
 def _pinned_as_ip(text):
-    """解析成 ipaddress 对象；IPv4 映射的 IPv6 归一到 IPv4（::ffff:127.0.0.1）。"""
+    """解析成 ipaddress 对象；IPv4 映射的 IPv6 归一到 IPv4，例如 ::ffff:127.0.0.1。"""
     ip = ipaddress.ip_address(str(text).split("%")[0])
     mapped = getattr(ip, "ipv4_mapped", None)
     return mapped if mapped is not None else ip
@@ -1150,7 +1112,7 @@ def _pinned_is_blocked(ip):
 
 
 def _pinned_resolve(host):
-    """解析主机的全部地址（IPv4 在前）；有一个不可对外就整个主机名拒绝。"""
+    """解析主机的全部地址，IPv4 在前；有一个不可对外就整个主机名拒绝。"""
     infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
     addresses = []
     for info in infos:
@@ -1162,7 +1124,7 @@ def _pinned_resolve(host):
             addresses.append(ip)
     if not addresses:
         raise WebToolError("Could not resolve %s." % host)
-    addresses.sort(key=lambda ip: ip.version)   # 没有 IPv6 出口时不必陪它白等
+    addresses.sort(key=lambda ip: ip.version)   # 没有 IPv6 出口时不必等它超时
     blocked = [str(ip) for ip in addresses if _pinned_is_blocked(ip)]
     if blocked:
         raise WebToolError("%s resolves to %s, which is not allowed." % (host, ", ".join(blocked)))
@@ -1178,10 +1140,10 @@ def _looks_like_ip(host):
 
 
 def _pinned_guard_url(url):
-    """只允许对外的一般 http(s) 网址，返回 (规范化 URL, 可连接的 IP 列表)。
+    """只允许对外的一般 http(s) 网址，返回规范化 URL 与可连接的 IP 列表。
 
-    主机名末尾的点先去掉（localhost. 与 localhost 是同一个名字），再看每一个
-    解析结果；连接时只用这里返回的 IP，所以解析之后名字被改到内网也不受影响。
+    主机名末尾的点先去掉，localhost. 与 localhost 是同一个名字；再看每一个
+    解析结果。连接时只用这里返回的 IP，所以解析之后名字被改到内网也不受影响。
     """
     try:
         parsed = urllib.parse.urlparse(str(url or ""))
@@ -1207,7 +1169,7 @@ def _pinned_guard_url(url):
 
 
 def _http_get(url):
-    """抓一个页面：逐跳校验重定向，返回 (文本, 是否被截断, Content-Type)。"""
+    """抓一个页面：逐跳校验重定向，返回文本、是否被截断与 Content-Type。"""
     deadline = time.monotonic() + FETCH_DEADLINE
     current = url
     for _hop in range(MAX_REDIRECTS + 1):
@@ -1229,9 +1191,9 @@ def _http_get(url):
 
 
 def _fetch_text(url):
-    """抓一个网址并转成可读文字；结果进快取。
+    """抓一个网址并转成可读文字；结果进缓存。
 
-    失败时回一句给模型的错误文本，成功时回 (文字, 是否被字节上限截断)。
+    失败时回一句给模型的错误文本，成功时返回文字与是否被字节上限截断两个值。
     """
     key = ("fetch", url)
     hit = _CACHE.get(key)
@@ -1284,9 +1246,9 @@ def fetch(url, start_index=0):
 
 
 def sources_from_result(result):
-    """把搜寻结果里的 (标题, 网址) 读回来。
+    """把搜索结果里的标题与网址读回来。
 
-    喂给模型的是文字，但客户端要画引用来源需要结构化资料，所以在这里从我们
+    喂给模型的是文字，但客户端要画引用来源需要结构化数据，所以在这里从我们
     自己产出的格式反解，不必另外保存状态。
     """
     out = []
@@ -1300,7 +1262,7 @@ def sources_from_result(result):
 
 
 def execute(name, args_raw):
-    """执行一次内部网路工具。永不抛例外，永远回一句能喂回模型的字串。"""
+    """执行一次内部网络工具。永不抛出异常，永远返回一句能喂回模型的字符串。"""
     name = str(name or "").strip()
     if isinstance(args_raw, str):
         try:

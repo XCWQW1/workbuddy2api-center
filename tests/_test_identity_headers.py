@@ -18,10 +18,28 @@ class VSCodeIdentityTest(unittest.TestCase):
         self.assertEqual(headers["X-IDE-Type"], "VSCode")
         self.assertEqual(headers["X-IDE-Version"], "1.142.0")
         self.assertEqual(headers["X-Product-Version"], "4.12.39997873")
+        self.assertEqual(headers["X-Agent-Type"], "main")
+        self.assertEqual(headers["X-Agent-Purpose"], "conversation")
+        self.assertEqual(headers["X-Agent-Runtime"], "other")
         self.assertEqual(
             headers["User-Agent"],
             "VSCode/%s CodeBuddy/%s" % (
                 headers["X-IDE-Version"], headers["X-Product-Version"]))
+
+
+class CliIdentityTest(unittest.TestCase):
+    def test_headers_follow_the_codebuddy_cli_shape(self):
+        headers = wb_identity.build_identity_headers(
+            "cli", "intl", "uid-1", "token-1")
+        self.assertEqual(headers["X-IDE-Type"], "CLI")
+        self.assertEqual(headers["X-IDE-Version"], "2.161.0")
+        self.assertEqual(headers["X-Agent-Type"], "main")
+        self.assertEqual(headers["X-Agent-Purpose"], "conversation")
+        self.assertEqual(headers["X-Agent-Runtime"], "other")
+        self.assertEqual(
+            headers["User-Agent"],
+            "CLI/%s CodeBuddy/%s" % (
+                headers["X-IDE-Version"], headers["X-IDE-Version"]))
 
 
 if __name__ == "__main__":

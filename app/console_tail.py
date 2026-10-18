@@ -1,18 +1,4 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""WorkBuddy proxy - live console viewer.
-
-独立的日志查看器：连接到本地 wb_proxy 服务，轮询 /logs 增量并打印到
-*本进程自己的* 控制台窗口。关闭本窗口只会关掉这个查看器，服务进程照常运行。
-
-由启动脚本（start-wb-proxy.bat）或面板「显示控制台」按钮拉起。仅依赖标准库。
-
-用法:
-    python console_tail.py --port 8788 [--host 127.0.0.1] [--token <panel-token>]
-
-    --token 由面板按钮场景传入（服务端内置 token，即使面板密码改过也有效）；
-    未给 token 时自用默认密码 admin 登录。任一种 token 失效都会自动重新登录。
-"""
+# 独立日志查看器：轮询本地 wb_proxy 的 /logs，只输出到本进程自己的控制台窗口。
 import sys
 import time
 import json
@@ -23,35 +9,32 @@ HOST = "127.0.0.1"
 PORT = 8788
 TOKEN = ""
 REFRESH = 1.0
-# 启动脚本会先拉起服务再开本查看器：服务就绪前的连接失败静默等待，
-# 超过该时长仍连不上才退出。
+# 服务就绪前的连接失败静默等待，超过该时长仍连不上才退出。
 STARTUP_GRACE = 30.0
-# 连接成功过之后，连续失败达到该次数即认为服务已关闭，查看器自动退出。
+# 连接成功后连续失败达到该次数，视为服务已关闭并退出。
 FAIL_STREAK_EXIT = 3
 
-# 本地回环请求绝不走代理：环境里若有全局 HTTP(S)_PROXY，请求会被代理转发，
-# 服务退出时看到的就是代理层的 502 报错，而不是干净的「服务已关闭」。
+# 本地回环请求不走代理：全局 HTTP_PROXY 或 HTTPS_PROXY 会把请求转给代理层，
+# 服务退出时看到的将是代理返回的 502。
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _ensure_console_output():
-    """Force stdout/stderr onto this process's own console window.
+    """把 stdout 与 stderr 绑到本进程自己的控制台窗口。
 
-    服务进程（pythonw）的 std 句柄可能被重定向（nohup/服务管理器）。Windows 的
-    句柄继承机制会让 CREATE_NEW_CONSOLE 弹出的本进程继承那些重定向句柄，导致
-    print 全写进文件、新控制台窗口一片空白。CONOUT$ 永远指向**本进程当前attached
-    控制台**的屏幕缓冲区，显式重开 stdout 即可强制输出到新弹的窗口。
-    正常在终端里直接运行（stdout 本来就是 tty）时不做任何事，保留管道调试能力。
+    服务进程可能以 pythonw 运行并被重定向标准句柄。新建控制台窗口会继承这些
+    句柄，print 便写进文件而非窗口。CONOUT$ 指向当前进程附加的控制台缓冲区，
+    显式重开 stdout 即可。stdout 已是 tty 时保持原样，保留管道调试能力。
     """
     try:
         if sys.stdout is not None and sys.stdout.isatty():
-            return  # 本来就输出到控制台
+            return
     except Exception:
         pass
     try:
         import ctypes
         if not ctypes.windll.kernel32.GetConsoleWindow():
-            return  # 无 attached 控制台（重定向调试场景），保持原样
+            return
         sys.stdout = open("CONOUT$", "w", buffering=1, encoding="utf-8", errors="replace")
         sys.stderr = open("CONOUT$", "w", buffering=1, encoding="utf-8", errors="replace")
     except Exception:
@@ -146,7 +129,7 @@ def main():
                 print(fmt(e))
         except urllib.error.HTTPError as e:
             if e.code == 401:
-                # token 失效（服务重启过）或尚未登录：尝试重新登录。
+                # token 失效或尚未登录时重新登录。
                 try:
                     login()
                     fail_streak = 0
@@ -155,12 +138,12 @@ def main():
             else:
                 fail_streak += 1
         except Exception:
-            # 连接被拒 / 超时等：只计数不打印，避免刷屏。
+            # 连接被拒或超时只计数，不打印，避免刷屏。
             fail_streak += 1
         if fail_streak >= FAIL_STREAK_EXIT:
             if ever_ok:
                 print("[viewer] 服务已关闭，查看器退出。")
-                print("[viewer] 本窗口将在 2 秒后自动关闭...")
+                print("[viewer] 本窗口将在 2 秒后自动关闭")
                 time.sleep(2)
                 return
             if time.time() - started > STARTUP_GRACE:
@@ -181,10 +164,10 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        # 崩溃保护：让错误显示在窗口里并停留，而不是一闪而过
+        # 崩溃时让错误留在窗口里可见。
         try:
             print("[viewer] fatal error: %s" % e, flush=True)
-            print("[viewer] 本窗口将在 15 秒后关闭...", flush=True)
+            print("[viewer] 本窗口将在 15 秒后关闭", flush=True)
             time.sleep(15)
         except Exception:
             pass

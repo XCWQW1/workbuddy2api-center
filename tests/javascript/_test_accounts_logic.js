@@ -318,4 +318,15 @@ const noSlots = logic.autoAssignPlan([base()], []);
 assert.deepEqual(noSlots.rows, []);
 assert.match(noSlots.instead, /没有已启用的代理槽/);
 
+// ---- 模型排除：初始勾选与保存时的排除名单
+const sel = logic.modelSelection(['hy3', 'GLM-5.3', 'kimi-k3'], ['glm-5.3']);
+assert.deepEqual([...sel.picked], ['hy3', 'kimi-k3'], '排除名单按大小写不敏感匹配');
+assert.deepEqual(logic.deniedModels(sel.ids, sel.picked), ['GLM-5.3']);
+const allOn = logic.modelSelection(['hy3', 'glm-5.3'], []);
+assert.deepEqual(logic.deniedModels(allOn.ids, allOn.picked), []);
+assert.deepEqual(logic.deniedModels(['hy3', 'glm-5.3'], new Set()), ['hy3', 'glm-5.3']);
+assert.equal(logic.disabledModelsTitle({ disabledModels: ['hy3', 'glm-5.3'] }),
+  '不派给这个账号的模型：hy3、glm-5.3');
+assert.equal(logic.disabledModelsTitle({ disabledModels: [] }), '');
+
 console.log('账号页纯逻辑断言通过');

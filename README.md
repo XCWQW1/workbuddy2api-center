@@ -26,7 +26,7 @@
 - **用量审计**：网关为每条请求记录模型、Token、积分、密钥、来源 IP、状态码和实际使用的思考档位。
 - **模型目录**：按官方桌面端清单整理，剔除补全通道与专线变体，支持手动刷新与每日自动获取。
 - **积分与定价**：按 OpenRouter 价格估算每次请求的等价花费，支持人民币与美元切换。
-- **活动与自动化**：国内版签到、成长任务、猫猫旅行，国际版每日活跃打卡；后台调度器按固定时刻巡检。
+- **活动与自动化**：国内版 Buddy 加油站签到、成长任务与连登活跃、猫猫旅行，国际版今日活跃打卡；后台调度器按固定时刻巡检。账号被上游限制时，网关立即停止全部账号并向客户端返回 503。
 - **剩余用量与限额护栏**：账号级保留积分、每日 Token、每日积分、按模型 Token 四条护栏，另有剩余用量估算。
 - **本地网络工具**：网关可代替客户端执行声明的 `web_search` 和 `web_fetch` 工具。
 - **零依赖**：只需要 Python 3.9 或更新版本。项目提供 Windows、macOS、Linux 启动脚本和 Docker 镜像。
@@ -56,7 +56,7 @@
 | macOS | 双击 `start-wb-proxy.command`；首次启动遭到 Gatekeeper 拦截时，右键选择“打开” |
 | Linux 与 macOS 终端 | 执行 `./start-wb-proxy.sh`，可以在后面加端口号，例如 `./start-wb-proxy.sh 9000` |
 
-绿色包自带的精简 Python 运行时只覆盖 Windows；macOS 和 Linux 使用系统 Python。如果不想安装 Python，可以从 [Releases](https://github.com/flower-elf/workbuddy2api-center/releases) 下载绿色包 `wb-proxy-center-v*.zip`，包内带有 Windows 的 Python 运行时。Windows 解压后直接双击 `start-wb-proxy.bat`。macOS 和 Linux 解压后，同样用 `.command` 或 `.sh` 脚本启动。
+如果不想安装 Python，可以从 [Releases](https://github.com/flower-elf/workbuddy2api-center/releases) 下载绿色包 `wb-proxy-center-v*.zip`。绿色包只为 Windows 附带精简 Python 运行时，Windows 解压后直接双击 `start-wb-proxy.bat`。macOS 和 Linux 使用系统 Python，解压后同样用 `.command` 或 `.sh` 脚本启动。
 
 macOS 和 Linux 的脚本按顺序查找三个位置：包内的 `python/bin/python3`、`/usr/bin/python3` 和 Homebrew 的 python3。macOS 上没有 Python 时，执行 `xcode-select --install` 或 `brew install python`。
 
@@ -135,7 +135,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只运行名字里含 realm 的套件
 ```
 
-测试共有 190 个套件：135 个 Python 套件 + 55 个 JavaScript 套件。JavaScript 套件里有一部分覆盖仓库保留的上游 `dashboard.html`；自定义看板由 `tests/javascript` 的套件覆盖。JavaScript 套件需要 Node.js 22 或更新版本，没有安装 Node.js 时会跳过并给出提示。
+测试共有 153 个套件：139 个 Python 套件 + 14 个 JavaScript 套件。看板的 JavaScript 套件位于 `tests/javascript`。JavaScript 套件需要 Node.js 22 或更新版本，没有安装 Node.js 时会跳过并给出提示。
 
 GitHub Actions 在三个环境里运行同一条命令：Ubuntu 的 Python 3.9 和 3.12，以及 Windows 的 Python 3.12。`tests/manual/_mobile_check.py` 是需要手动运行的 Playwright 布局检查器，不属于测试套件。
 
@@ -148,6 +148,7 @@ GitHub Actions 在三个环境里运行同一条命令：Ubuntu 的 Python 3.9 �
 - **模型名称**：填写 `/v1/models` 里列出的任意模型 ID，例如 `deepseek-v4.1-flash`、`glm-5.3`。
 
 **（1）Codex CLI 等 Responses 客户端**
+
 ```bash
 export OPENAI_BASE_URL="http://127.0.0.1:8788/v1"
 export OPENAI_API_KEY="你在“密钥”页添加的 API Key"
@@ -155,7 +156,7 @@ export OPENAI_API_KEY="你在“密钥”页添加的 API Key"
 
 **（2）Claude Code 等 Messages 客户端**
 
-> ⚠️ **积分风险**：网关把 Anthropic Messages 转换为 WorkBuddy 的 Chat / Responses 请求，`cache_control` 会被忽略。上游报告过长会话缓存命中率偏低、单次消耗偏高。因此这个入口默认关闭；确认理解风险后，才在启动前设置 `WB_ENABLE_ANTHROPIC_MESSAGES=1`。关闭时 `/v1/messages` 返回 400，请求不会转发到上游。
+**积分风险**：网关把 Anthropic Messages 转换为 WorkBuddy 的 Chat 或 Responses 请求，`cache_control` 会被忽略。上游报告过长会话的缓存命中率偏低、单次消耗偏高，因此这个入口默认关闭。确认理解风险后，再在启动前设置 `WB_ENABLE_ANTHROPIC_MESSAGES=1`。关闭时 `/v1/messages` 返回 400，请求不会转发到上游。
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8788"
@@ -163,7 +164,7 @@ export ANTHROPIC_AUTH_TOKEN="你在“密钥”页添加的 API Key"
 export ANTHROPIC_MODEL="deepseek-v4.1-flash"
 ```
 
-设置页的 `messages_format` 可以选择 `openai-completions` 或 `openai-responses` 管线。两者都不是原生透传；`thinking` 历史块、`top_k`、`cache_control` 与 `betas` 会被忽略，`count_tokens` 只提供网关自己的估算值。
+设置页的 `messages_format` 可以选择 `openai-completions` 或 `openai-responses` 管线。两种管线都会做协议转换：`thinking` 历史块、`top_k`、`cache_control` 与 `betas` 会被忽略，`count_tokens` 只返回网关自己的估算值。
 
 **（3）curl**
 
@@ -186,10 +187,10 @@ curl http://127.0.0.1:8788/v1/chat/completions \
 |---|---|
 | 仪表盘 | 账号数、可用账号、积分余额、今日请求与 Token；近 14 天调用趋势；切换网关默认出口；调度器状态 |
 | 账号 | 搜索、筛选与排序账号；每个账号的积分、有效期、出站身份、优先级、代理槽、备注与操作按钮 |
-| 任务 | 调度器状态与日志、国内版签到与成长任务、国际版每日活跃打卡、积分变动记录 |
+| 任务 | 调度器状态与日志、国内版任务与福利（Buddy 加油站、成长任务与猫猫日常，可选择单个账号执行）、国际版今日活跃打卡、积分变动记录 |
 | 积分 | 每个账号每一笔套餐的来源、已用、剩余与到期时间 |
 | 密钥 | API Key 的出口、模型限制、有效期、配额、IP 白名单、用量与接入示例 |
-| 模型 | 模型目录与能力规格；被筛选规则排除的模型会单独标注，只有明确取消勾选的模型会被网关拒绝，`/v1/models` 只列出启用的模型 |
+| 模型 | 模型目录与能力规格；可以按账号查看，也可以选「全部账号」看每个模型的账号覆盖率；被筛选规则排除的模型默认停止处理，勾选后才会放行 |
 | 测试台 | 用面板会话直接调试模型，可以指定账号 |
 | 用量 | 按时间范围统计请求、Token、积分与缓存命中，并按账号、密钥与模型细分 |
 | 请求日志 | 每条请求的全部字段，可以按时间、版本、密钥、状态、模型、账号与来源 IP 筛选 |
@@ -198,13 +199,15 @@ curl http://127.0.0.1:8788/v1/chat/completions \
 
 ### 账号
 
-- **添加账号**：点击“账号”页的“添加账号 (OAuth)”，选择国际版或国内版，然后扫码或打开授权链接登录。网关自动检测回调。
+- **添加账号**：点击“账号”页的“添加账号 (OAuth)”，选择国际版或国内版，再选择以 WB、VSC 或 CLI 哪个官方客户端登录，然后扫码或打开授权链接登录。网关自动检测回调。所选客户端就是新账号的出站身份。
 - **优先级**：数字越小，越先选中，默认值为 100。
 - **并发上限**：限制同一账号、同一模型同时在途的请求数，填 0 表示不限。提示里会显示当前在途数。
 - **出站身份**：在 WB、VSC、CLI 之间切换，切换后立即保存。
 - **测试**：向这个账号发送一条内容为 `hi` 的真实对话，确认它能否正常回复。
 - **备注**：最长 100 字，保存在账号文件里，可以用来搜索。
+- **模型排除**：国内版与国际版账号都可以设置排除名单，名单里的模型不再派给这个账号，其他账号照常接单。入口是账号行上的「模型排除」按钮，账号信息里会显示已排除的数量。
 - **导入与导出**：导出的文档可以再次导入，也可以手写账号列表导入。
+- **今日活动**：账号页顶部显示今天的完成情况。国内版是 Buddy 加油站与成长计划连登活跃，国际版是今日活跃打卡；每个账号的状态也标在账号行上。国际版可以只给今天还没打卡的账号补跑一次，已经打过的不再重复消耗额度。
 
 从桌面客户端导入账号的功能暂时停用。桌面客户端自 2026-09-24 起加密存储令牌，网关无法读出可用的令牌，因此看板隐藏了这个入口。相关代码保留在 `app/web/js/pages/accounts/dialogs.js` 的 `openDesktopScanDialog()` 和接口 `/accounts/import/desktop`。
 
@@ -257,6 +260,15 @@ Key 保存在 `accounts/settings.json`。在看板保存过 Key 之后，启动�
   - 整个出口的可用账号都已满时，网关返回 429。测试台指定的账号名额已满时，同样返回 429。
   - 在途数量只保存在内存里，重启后归零。账号页的“并发上限”列会提示当前正在服务的请求数。
 
+### 上游限制后的停止
+
+任何一个账号被上游按风控限制时，网关立即停止，不再把请求发给其他账号。限制发生后继续轮询下一个账号，正是把整个账号池关联起来的原因。
+
+- **判定**：HTTP 403，正文带 code 11140 或“账号存在异常行为，已被限制使用”。内容审核返回的 403 走原来的降级提示词重试，不会触发停止。
+- **动作**：停用全部账号并写回账号文件，调度器、积分刷新与模型目录获取一并暂停。
+- **返回**：所有对话请求返回 503，正文说明停止原因与恢复方式。
+- **恢复**：网关不自动恢复。确认上游已解封后，在账号页点“全部启用”或逐个启用账号。
+
 ### 出站身份
 
 每个账号有三种官方身份，分别对应不同的出站端点和配额。
@@ -273,6 +285,7 @@ Key 保存在 `accounts/settings.json`。在看板保存过 Key 之后，启动�
 
 - **来源**：上游 `GET /v3/config` 的 `agents[cli].models`，与官方桌面端一致。上游新增的模型不需要发布新版本，就会出现在 `/v1/models`。
 - **过滤**：去掉代码补全专用模型（如 `codewise-*`）、多云专线变体（如 `*-volc`）、档位别名、`auto`、`-sg` 和 `-x` 变体。同名模型只保留 0.00 倍率的一档。
+- **档位别名**：`default-model`、`fast-model`、`balanced-model`、`primary-model`、`deep-model` 与国内版的 `auto` 是上游的虚拟档位，不进入 `/v1/models`。被筛选规则排除的模型默认停止处理，请求会被直接拒绝；在模型页打开「显示被排除的模型」后勾选它，才会开始转发。
 - **缓存**：获取成功后，网关把目录保存到 `accounts/cache/model_catalog.json`，24 小时内直接使用。获取失败时，网关依次使用过期缓存、桌面端本地文件和内置快照。
 
 国际版和国内版的同名模型分别调度。请求只使用当前出口，网关暂时不跨区域混合轮询。
@@ -281,14 +294,19 @@ Key 保存在 `accounts/settings.json`。在看板保存过 Key 之后，启动�
 
 调度器按 UTC+8 时间运行，与机器的时区设置无关。
 
-| 时间 | 任务 |
+| 时间（默认） | 任务 |
 |---|---|
-| 每天 09:00 与 21:00 | 国内版签到与猫猫旅行；国际版每日活跃打卡 |
+| 每天 09:00 与 21:00 | 国内版 Buddy 加油站签到与猫猫旅行；国际版每日活跃打卡 |
 | 每天 22:00 | 自动刷新令牌剩余有效期不足 2 小时的账号 |
 | 每天 01:00 | 夜猫子任务 |
 
-在“任务”页可以手动触发巡检，停止或启动调度器，也可以按账号手动执行签到和打卡。
+这四组整点都可以在“设置 → 网关行为”里单独调整：填 0 到 23 的整点，用逗号分隔；留空表示这组不跑。默认值保持不变。
 
+在“任务”页可以手动触发巡检，停止或启动调度器，也可以按账号手动执行 Buddy 加油站签到和今日活跃打卡。
+
+- **Buddy 加油站**：国内版每天领取一次加油站积分。调度器在 09:00 与 21:00 补漏，签到记录同时出现在积分变动记录里。任务页可以选单个账号领取。
+- **随机间隔**：调度器在处理每个账号前随机等待 2 秒到设定值之间的时间，默认 5 秒。这个上限在“设置 → 网关行为 → 任务随机间隔”里调整，最小 2 秒，最大 600 秒。
+- **成长计划连登**：国内版每天上报一次活跃，点亮连续登录天数。上报失败不会影响 Buddy 加油站。
 - **国内版成长任务**：自动接取任务、上报行为事件并领取奖励。
 - **猫猫日常**：猫猫在家时自动派出；回来后先领奖再派出，以免奖励作废。
 - **国际版每日活跃打卡**：为当天还没有活跃的账号发送一条轻量对话。每个账号每天只执行一次，执行记录保存在账号文件的 `lastDailyChat`。
@@ -376,10 +394,10 @@ Key 保存在 `accounts/settings.json`。在看板保存过 Key 之后，启动�
 | POST | /accounts/set-all | 启用或停用全部账号 |
 | POST | /accounts/delete | 删除账号 |
 | POST | /accounts/product | 切换出站身份：WB、VSC、CLI |
-| POST | /accounts/checkin | 国内版签到 |
-| POST | /accounts/daily-chat | 国际版每日活跃，使用桌面端对话 |
+| POST | /accounts/checkin | 国内版 Buddy 加油站签到 |
+| POST | /accounts/daily-chat | 国际版每日活跃，使用桌面端对话；传 `uids` 只给名单里的账号打卡 |
 | POST | /accounts/daily-chat-web | 国际版每日活跃，使用网页通道 |
-| POST | /accounts/login/start | 发起 OAuth 登录，返回授权链接与二维码 |
+| POST | /accounts/login/start | 发起 OAuth 登录，`product` 取 `workbuddy`、`vscode` 或 `cli`，返回授权链接与二维码 |
 | GET | /accounts/login/poll | 查询登录状态 |
 | POST | /accounts/login/cancel | 取消登录 |
 | GET、POST | /accounts/credits | 刷新积分；GET 刷新全部账号，POST 可以用 `uid` 或 `realm` 指定范围 |

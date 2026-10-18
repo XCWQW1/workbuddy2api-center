@@ -123,34 +123,5 @@ class SetDisabledModelsTests(unittest.TestCase):
                          ["glm-5.3"])
 
 
-class DashboardWiringTests(unittest.TestCase):
-    def test_dashboard_has_denylist_editing(self):
-        with open(os.path.join(ROOT, "dashboard.html"), encoding="utf-8") as fh:
-            html = fh.read()
-        self.assertIn("editAccountDisabledModels", html)
-        self.assertIn("{uid: uid, disabledModels: denyList}", html)
-        self.assertIn("+ 禁用模型", html)
-        self.assertIn("禁用的模型: ", html)
-
-    def test_dashboard_uses_a_checkbox_picker_not_a_prompt(self):
-        """面板用「启用的模型」复选框列表：默认全选，取消勾选 = 禁用。"""
-        with open(os.path.join(ROOT, "dashboard.html"), encoding="utf-8") as fh:
-            html = fh.read()
-        # 默认全选：勾选状态 = 不在禁用名单里
-        self.assertIn("const picked = new Set(models.filter(m => !denied.has(m)));", html)
-        # 取消勾选 -> 落进禁用名单
-        self.assertIn("const denyList = models.filter(m => !picked.has(m));", html)
-        # 取该账号自己区域的清单，而不是看板当前视图那一份
-        self.assertIn("/v1/models?realm=' + encodeURIComponent(realm)", html)
-        # 有全选 / 全不选
-        self.assertIn("'#mdmAll'", html)
-        self.assertIn("'#mdmNone'", html)
-
-    def test_dashboard_reads_the_field_from_the_payload(self):
-        with open(os.path.join(ROOT, "dashboard.html"), encoding="utf-8") as fh:
-            html = fh.read()
-        self.assertIn("a.disabledModels || []", html)
-
-
 if __name__ == "__main__":
     unittest.main()

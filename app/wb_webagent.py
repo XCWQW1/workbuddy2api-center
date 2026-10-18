@@ -1,19 +1,8 @@
 # -*- coding: utf-8 -*-
-"""把一条网页端（云 agent）会话真正驱动起来（ACP over streamable HTTP）。
-
-issue #90：POST /console/as/conversations/ 只是**排队**了一条会话。agent 要等
-客户端接上这条会话的沙箱（GET /console/as/conversations/{id}/session 返回的
-`link`）并且请求这一轮才会跑。网页端就是这么做的：
-
-  1. GET <link>，Accept: text/event-stream —— 服务端返回一条 SSE 流，响应头里
-     带 Acp-Connection-Id；
-  2. POST <link>（带 Acp-Connection-Id、Content-Type: application/json），body 是
-     JSON-RPC 请求：initialize → session/load → session/prompt；
-  3. 服务端把 session/update 通知推回 SSE 流里，直到这一轮结束。
-
-只建会话、不接沙箱，会话会永远停在 CREATING 且没有任何输出——#90 抓到的就是
-这个。这里只实现打卡需要的那点协议：不带工具、不接终端、不回调文件系统。
-"""
+# 网页端会话的 ACP 驱动：GET 沙箱 link 拿到 SSE 流与 Acp-Connection-Id，
+# POST 同一 link 发 JSON-RPC 的 initialize / session/load / session/prompt，
+# 再从 SSE 流收 session/update 直到本轮结束。只建会话、不接沙箱时，上游会一直
+# 停在 CREATING，因此每日活跃必须由这里把这一轮真正跑完。
 
 import base64
 import http.client
@@ -33,20 +22,19 @@ CLIENT_CAPABILITIES = {
 
 
 def _proxy_parts(proxy_url):
-    """解析代理 URL → (host, port, CONNECT 头)。
+    """解析代理 URL，返回 host、port 与 CONNECT 头组成的元组。
 
     两种写法都要认：`http://user:pass@host:port`，以及无 scheme 的
-    `user:pass@host:port`（面板两种都有人填，urllib 那条路径也两种都收）。
-    凭据的取值口径与 urllib.request.ProxyHandler.proxy_open 一致（先 unquote
-    再 base64），这样同一个代理 URL 在桌面通道与网页通道上生成同一份凭据。
+    `user:pass@host:port`。凭据取值与 urllib.request.ProxyHandler.proxy_open
+    一致，先 unquote 再 base64，同一个代理 URL 在桌面通道与网页通道生成同一份凭据。
     """
     raw = str(proxy_url or "").strip()
     parsed = urllib.parse.urlparse(raw)
     host, port = parsed.hostname, parsed.port
     user, password = parsed.username, parsed.password
     if not host:
-        # 无 scheme 的写法 urlparse 认不出来（`user:pass@h:p` 会被当成 scheme），
-        # 手动切 authority。
+        # 无 scheme 的写法 urlparse 认不出来，`user:pass@h:p` 会被当成 scheme，
+        # 这里手动切出 authority。
         authority = raw.split("://")[-1].split("/")[0]
         userinfo, _, hostport = authority.rpartition("@")
         host, _, port_text = hostport.rpartition(":")
@@ -75,7 +63,7 @@ def _request_target(parsed):
 
 
 class AcpError(Exception):
-    """驱动失败时抛这个（调用方转成可读的错误文本）。"""
+    """驱动失败时抛出，调用方转成可读的错误文本。"""
 
 
 class AcpChannel(object):
@@ -109,10 +97,10 @@ class AcpChannel(object):
         cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
         conn = cls(parsed.hostname, port, timeout=self.timeout)
         if self.proxy:
-            # 账号配了代理时走 CONNECT，和 urlopen 那条路径保持一致。
+            # 账号配了代理时走 CONNECT，与 urlopen 那条路径保持一致。
             # 凭据必须显式塞进 CONNECT：urllib 的 ProxyHandler 会替我们加
-            # Proxy-Authorization，裸 http.client + set_tunnel 不会，缺了它
-            # 认证代理一律回 407（桌面通道正常、网页通道 407 就是这个原因）。
+            # Proxy-Authorization，裸 http.client + set_tunnel 不会；缺失时
+            # 认证代理一律回 407。
             host, proxy_port, tunnel_headers = _proxy_parts(self.proxy)
             conn = cls(host, proxy_port or 80, timeout=self.timeout)
             conn.set_tunnel(parsed.hostname, port, headers=tunnel_headers)
@@ -173,7 +161,7 @@ class AcpChannel(object):
             self.events.put(None)     # 流结束的哨兵
 
     def request(self, method, params, request_id):
-        """发一个 JSON-RPC 请求；成功返回 HTTP 状态码（正常是 202）。"""
+        """发一个 JSON-RPC 请求；成功返回 HTTP 状态码，正常是 202。"""
         parsed, _port = self._target()
         body = json.dumps({"jsonrpc": "2.0", "id": request_id,
                            "method": method, "params": params}).encode("utf-8")
@@ -208,12 +196,12 @@ class AcpChannel(object):
 
 
 def _set_model(channel, session_id, model, log):
-    """把这一轮用的模型钉到会话上（网页端的做法）。
+    """把这一轮用的模型固定到会话上，与网页端的做法一致。
 
     建会话请求体里的 model 只写进会话的 manifest，真正决定这一轮用哪个模型的
     是这条 ACP 扩展请求：网页端在 session/load 之后、session/prompt 之前单独
-    发它（客户端 SDK 里就是 extMethod("session/set_model", {sessionId,
-    modelId})）。少了它，会话跑的是账号的默认模型——网页端默认是 Auto，按付费
+    发它，客户端 SDK 里就是 extMethod("session/set_model", {sessionId,
+    modelId})。少了它，会话跑的是账号的默认模型——网页端默认是 Auto，按付费
     模型计费，于是每天的活跃都在扣积分。
 
     失败不当致命错：这一轮还是要跑完，只是模型可能没切成，日志里留一句。
@@ -249,9 +237,9 @@ def run_turn(link, token, session_id, cwd, prompt, user_agent, poll_status=None,
              channel_factory=AcpChannel, model=None):
     """接上沙箱、把这一轮跑完。
 
-    poll_status 是调用方给的「这条会话现在什么状态」（查 console API）；看到
-    completed 就算跑完，failed/error 直接停。返回结果里带事件数与输出段数，
-    方便在打卡结果里一眼看出到底跑没跑。
+    poll_status 是调用方给的「这条会话现在什么状态」，状态来自调用方查询
+    console API；看到 completed 就算跑完，failed/error 直接停。返回结果里带
+    事件数与输出段数，方便在打卡结果里看出这一轮到底跑没跑。
 
     model 非空时，在 session/load 之后补一条 session/set_model —— 见 _set_model。
     """

@@ -3,9 +3,10 @@
  */
 import assert from 'node:assert/strict';
 import {
-  LONG_CONTEXT_TOKENS, capabilityBadges, contextText, creditInfo, creditsValue, disabledIds,
-  fmtTokens, hasCredits, hasReasoning, hasVision, hiddenExcludedCount, reasoningLevels,
-  panelModelsUrl, selectModels, sourceLabel, summary, withEnabled,
+  LONG_CONTEXT_TOKENS, accountAvailableCount, accountCanUse, capabilityBadges, contextText,
+  coverageFor, creditInfo, creditsValue, disabledIds, fmtTokens, hasCredits, hasReasoning,
+  hasVision, hiddenExcludedCount, realmAccounts, reasoningLevels, panelModelsUrl,
+  selectModels, sourceLabel, summary, withEnabled,
 } from '../../app/web/js/pages/models/logic.js';
 
 const MODELS = [
@@ -132,5 +133,23 @@ assert.deepEqual(disabledIds(withEnabled(MODELS, 'kimi-k2.6', false)),
 assert.deepEqual(disabledIds(withEnabled(MODELS, 'default-model', true)), ['deepseek-v4.1-flash-sg']);
 assert.notEqual(withEnabled(MODELS, 'kimi-k2.6', false), MODELS, '返回新数组');
 assert.equal(MODELS[4].enabled, true, '不修改传入的数据');
+
+// 分账号查看：账号名单、模型可用性与聚合覆盖
+const ACCOUNTS = [
+  { uid: 'a', realm: 'intl', enabled: true, disabledModels: ['glm-5.3'] },
+  { uid: 'b', realm: 'intl', enabled: true, disabledModels: [] },
+  { uid: 'c', realm: 'intl', enabled: false, disabledModels: ['hy3'] },
+  { uid: 'd', realm: 'cn', enabled: true, disabledModels: [] },
+];
+assert.deepEqual(realmAccounts(ACCOUNTS, 'intl').map((a) => a.uid), ['a', 'b', 'c']);
+assert.equal(accountCanUse({ id: 'GLM-5.3' }, ACCOUNTS[0]), false, '排除名单大小写不敏感');
+assert.equal(accountCanUse({ id: 'glm-5.3' }, ACCOUNTS[1]), true);
+assert.deepEqual(coverageFor({ id: 'glm-5.3' }, realmAccounts(ACCOUNTS, 'intl')),
+  { can: 1, total: 2, text: '1/2' }, '停用账号不计入覆盖');
+assert.deepEqual(coverageFor({ id: 'hy3' }, realmAccounts(ACCOUNTS, 'intl')),
+  { can: 2, total: 2, text: '2/2' });
+assert.equal(accountAvailableCount(MODELS, ACCOUNTS[0]),
+  MODELS.filter((m) => m.enabled && m.id !== 'glm-5.3').length);
+assert.equal(accountAvailableCount(MODELS, ACCOUNTS[1]), stats.enabled);
 
 console.log('models logic checks passed');

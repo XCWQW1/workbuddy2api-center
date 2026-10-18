@@ -8,11 +8,12 @@ import { confirmDialog } from '../ui/dialog.js';
 import { toast, toastError } from '../ui/toast.js';
 import {
   badge, busyClick, chip, emptyState, loadErrorInline, loadErrorPage, pageHeader, pager,
-  progressBar, realmBadge, skeletonRows,
+  progressBar, realmBadge, skeletonRows, statCard,
 } from '../ui/widgets.js';
 import * as logic from './accounts/logic.js';
+import * as activity from './accounts/activity.js';
 import * as acct from './accounts/actions.js';
-import { openAddAccountDialog, openImportDialog, openNoteDialog } from './accounts/dialogs.js';
+import { openAddAccountDialog, openImportDialog, openModelExcludeDialog, openNoteDialog } from './accounts/dialogs.js';
 
 export const autoRefresh = true;
 
@@ -21,6 +22,8 @@ export function mount(host) {
     accounts: [],
     usage: {},
     slots: [],
+    activity: {},
+    standDown: null,
     query: '',
     filter: 'all',
     sort: 'default',
@@ -88,16 +91,20 @@ export function mount(host) {
       return;
     }
     S.accounts = payload.accounts || [];
+    S.standDown = payload.stand_down || null;
     S.error = '';
     S.loading = false;
     try {
-      const [usage, slots] = await Promise.all([acct.loadUsageByAccount(), acct.loadProxySlots()]);
+      const [usage, slots, today] = await Promise.all([
+        acct.loadUsageByAccount(), acct.loadProxySlots(), acct.loadActivityToday(),
+      ]);
       S.usage = {};
       for (const row of usage.accounts || []) S.usage[row.account] = row;
       S.slots = slots.slots || [];
+      S.activity = activity.latestByUid(today.rows || []);
       S.partial = '';
     } catch (err) {
-      S.partial = '用量或代理槽这次没有读取成功，相关列可能是旧的：' + err.message;
+      S.partial = '用量、代理槽或今日活动这次没有读取成功，相关列可能是旧的：' + err.message;
     }
     draw();
     fillMissingCredits();
@@ -151,9 +158,9 @@ export function mount(host) {
       const results = result.results || [];
       applyAccountPayload(result);
       draw();
-      if (!results.length) toast.warn('没有可签到的国内版账号');
-      else if (logic.anyOk(results)) toast.success('每日签到', logic.summarizeResults(results, { okText: '签到成功' }));
-      else toast.warn('每日签到', logic.summarizeResults(results));
+      if (!results.length) toast.warn('没有可领的国内版账号');
+      else if (logic.anyOk(results)) toast.success(activity.BUDDY_LABEL + '签到', logic.summarizeResults(results, { okText: '已领取' }));
+      else toast.warn(activity.BUDDY_LABEL + '签到', logic.summarizeResults(results));
     } catch (err) {
       toastError('签到失败', err);
     }
@@ -168,6 +175,25 @@ export function mount(host) {
       if (!results.length) toast.warn('没有可打卡的国际版账号');
       else if (logic.anyOk(results)) toast.success('每日活跃打卡', logic.summarizeResults(results, { okText: '活跃打卡成功' }));
       else toast.warn('每日活跃打卡', logic.summarizeResults(results));
+    } catch (err) {
+      toastError('打卡失败', err);
+    }
+  }
+
+  async function doDailyChatPending() {
+    const pending = activity.pendingDailyChat(S.accounts, S.activity);
+    if (!pending.length) {
+      toast.success('国际版账号今天都已打卡');
+      return;
+    }
+    try {
+      const result = await acct.dailyChatPending(pending.map((account) => account.uid));
+      const results = result.results || [];
+      applyAccountPayload(result);
+      await refresh();
+      if (!results.length) toast.warn('名单里的账号没有执行');
+      else if (logic.anyOk(results)) toast.success('未活跃打卡', logic.summarizeResults(results, { okText: '打卡成功' }));
+      else toast.warn('未活跃打卡', logic.summarizeResults(results));
     } catch (err) {
       toastError('打卡失败', err);
     }
@@ -406,6 +432,9 @@ export function mount(host) {
           <div class="row-wrap">
             <span class="strong">${account.nickname || uid.slice(0, 8)}</span>
             ${realmBadge(account.realm)}
+            ${(account.disabledModels || []).length ? badge(
+              '排除 ' + account.disabledModels.length + ' 个模型', 'muted',
+              { small: true, title: logic.disabledModelsTitle(account) }) : nothing}
           </div>
           ${account.note ? html`<div class="cell-sub">备注：${account.note}</div>` : nothing}
           ${S.showTech
@@ -417,6 +446,80 @@ export function mount(host) {
       </div>`;
   }
 
+  function standDownCard() {
+    return html`
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title tone-warning">${icon('TriangleAlert')}网关已停止</h2>
+            <p class="card-sub">一个账号被上游限制（403），网关已停用全部账号，不再发送任何请求，避免把其他账号关联进来。确认上游已解封后点「全部启用」恢复。</p>
+          </div>
+          <button class="btn btn-primary btn-sm" @click=${busyClick(() => setAll(true))}>${icon('CircleCheck')}全部启用</button>
+        </div>
+      </div>`;
+  }
+
+  function activityCards(realm) {
+    const summary = activity.todaySummary(S.accounts, S.activity, realm);
+    const pendingHint = summary.pending.length
+      ? '待处理：' + activity.namesOf(summary.pending).join('、')
+      : '今天全部完成';
+    if (realm === 'cn') {
+      const streak = activity.streakSummary(S.accounts);
+      return html`
+        <div class="grid-stats">
+          ${statCard({
+            label: '本期 Buddy 加油站活动',
+            value: activity.summaryText(summary, '已领', '未领'),
+            icon: 'Fuel',
+            tone: summary.total && summary.done === summary.total ? 'success' : 'warning',
+            hint: pendingHint,
+          })}
+          ${statCard({
+            label: '成长计划今日上报',
+            value: streak.total ? streak.done + '/' + streak.total : '无账号',
+            icon: 'Flame',
+            tone: streak.total && streak.done === streak.total ? 'success' : 'warning',
+            hint: '今天已完成活跃上报的账号数；连续天数在任务页查看',
+          })}
+        </div>`;
+    }
+    return html`
+      <div class="grid-stats">
+        ${statCard({
+          label: '今日活跃打卡状态',
+          value: activity.summaryText(summary, '已打卡', '未打卡'),
+          icon: 'CalendarCheck',
+          tone: summary.total && summary.done === summary.total ? 'success' : 'warning',
+          hint: pendingHint,
+        })}
+      </div>`;
+  }
+
+  function activityBadges(account) {
+    const status = activity.activityView(account, S.activity);
+    const tone = (item) => (item.kind === 'ok' || item.kind === 'done' ? 'success'
+      : item.kind === 'failed' ? 'danger' : 'muted');
+    if (status.realm === 'cn') {
+      const gas = status.gas;
+      const streak = status.streak;
+      return html`
+        ${badge(activity.BUDDY_LABEL + ' · ' + gas.text, tone(gas), {
+          small: true,
+          title: gas.hint + (gas.at ? ' · ' + gas.at : ''),
+        })}
+        ${badge('成长计划 · ' + streak.text, tone(streak), {
+          small: true,
+          title: streak.hint + (streak.at ? ' · ' + streak.at : ''),
+        })}`;
+    }
+    const daily = status.daily;
+    return badge('今日活跃 · ' + daily.text, tone(daily), {
+      small: true,
+      title: daily.hint + (daily.at ? ' · ' + daily.at : ''),
+    });
+  }
+
   function statusInfo(account, now) {
     const view = logic.availabilityBadge(account, now);
     const pills = logic.cooldownPills(account, now);
@@ -425,6 +528,7 @@ export function mount(host) {
       <div class="status-cell">
         ${badge(view.text, view.tone, { title: view.title })}
         ${pills.map((pill) => badge(pill.text, 'warning', { small: true, title: pill.title }))}
+        ${activityBadges(account)}
       </div>
       ${error ? html`<div class="cell-sub tone-warning">${error}</div>` : nothing}`;
   }
@@ -470,16 +574,18 @@ export function mount(host) {
     return html`
       <select class="select input-sm" .value=${view.selected} title="这个账号的出站线路，直连表示不经过代理槽，旧代理是账号上遗留的单账号代理"
               @change=${(event) => onSlotChange(account, event.target.value)}>
-        ${view.options.map((option) => html`<option value=${option.value}>${option.label}</option>`)}
+        ${view.options.map((option) => html`<option value=${option.value} .selected=${option.value === view.selected}>${option.label}</option>`)}
       </select>`;
   }
 
   function identitySelect(account) {
     const view = logic.productOptions(account);
+    // 选中项写在 option 上：lit 先设置 select.value 再插入 option，首次渲染时
+    // select 里还没有选项，只靠 .value 会退回第一项，刷新后显示成 WB。
     return html`
       <select class="select input-sm" .value=${view.selected} title=${logic.IDENTITY_TIP}
               @change=${(event) => onProductChange(account, event.target.value)}>
-        ${view.options.map((option) => html`<option value=${option.value}>${option.label}</option>`)}
+        ${view.options.map((option) => html`<option value=${option.value} .selected=${option.value === view.selected}>${option.label}</option>`)}
       </select>`;
   }
 
@@ -539,6 +645,8 @@ export function mount(host) {
                 @click=${busyClick(() => testAccount(account))}>${icon('Zap')}</button>
         <button class="btn btn-ghost btn-icon btn-xs" title="刷新 Token：向腾讯换取新的访问令牌并保存"
                 @click=${busyClick(() => refreshToken(account))}>${icon('KeyRound')}</button>
+        <button class="btn btn-ghost btn-icon btn-xs" title="模型排除：这个账号不接的模型"
+                @click=${() => openModelExcludeDialog(account, { onDone: () => refresh() })}>${icon('CircleSlash')}</button>
         <button class="btn btn-ghost btn-icon btn-xs" title="备注：只保存在本机，最长 100 字"
                 @click=${() => openNoteDialog(account)}>${icon('StickyNote')}</button>
         <button class="btn btn-ghost btn-icon btn-xs" title="导出这个账号"
@@ -720,11 +828,13 @@ export function mount(host) {
       <button class="btn btn-outline btn-sm" title="直接向腾讯查询各账号当前积分，上游缓存的积分可能滞后数小时"
               @click=${busyClick(refreshCredits)}>${icon('RefreshCw')}刷新积分</button>
       ${acts.checkin ? html`
-        <button class="btn btn-outline btn-sm" title="为每个国内版账号签到一次，领取当天的签到积分"
-                @click=${busyClick(doCheckin)}>${icon('CalendarCheck')}每日签到</button>` : nothing}
+        <button class="btn btn-outline btn-sm" title="为每个国内版账号领取当天的 Buddy 加油站积分"
+                @click=${busyClick(doCheckin)}>${icon('Fuel')}${activity.BUDDY_LABEL}签到</button>` : nothing}
       ${acts.dailyChat ? html`
         <button class="btn btn-outline btn-sm" title="为每个已启用的国际版账号发送一条轻量对话，计入官方每日活跃"
-                @click=${busyClick(doDailyChat)}>${icon('CalendarCheck')}每日活跃打卡</button>` : nothing}
+                @click=${busyClick(doDailyChat)}>${icon('CalendarCheck')}每日活跃打卡</button>
+        <button class="btn btn-outline btn-sm" title="今天还没打卡的已启用国际版账号；已经打过的不再打第二遍"
+                @click=${busyClick(doDailyChatPending)}>${icon('CalendarCheck')}未活跃打卡一键打卡</button>` : nothing}
       ${acts.dailyChatWeb ? html`
         <button class="btn btn-outline btn-sm" title="只建网页端会话，官方每日活跃只认网页端对话；会消耗少量积分"
                 @click=${doDailyChatWeb}>${icon('Globe')}网页通道打卡</button>` : nothing}
@@ -762,12 +872,14 @@ export function mount(host) {
           path: 'accounts',
           title: '账号管理',
           desc: realm === 'cn'
-            ? '国内版账号池：访问令牌有效期、积分、签到与连通性'
+            ? '国内版账号池：访问令牌有效期、积分、Buddy 加油站与连通性'
             : '国际版账号池：访问令牌有效期、积分、出口线路与连通性',
           actions: headerActions(realm),
         })}
         ${S.error ? loadErrorPage(S.error, refresh) : nothing}
         ${!S.error && S.partial ? loadErrorInline(S.partial, refresh) : nothing}
+        ${S.standDown && S.standDown.active ? standDownCard() : nothing}
+        ${!S.error && visible.length ? activityCards(realm) : nothing}
         ${!S.error && visible.length ? filterCard(counts) : nothing}
         ${firstScreen ? skeletonRows(6) : nothing}
         ${!firstScreen && !S.error ? listCard(page, kind, now) : nothing}

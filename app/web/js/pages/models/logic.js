@@ -200,3 +200,32 @@ export function withEnabled(data, id, enabled) {
 export function disabledIds(data) {
   return (data || []).filter((m) => !m.enabled).map((m) => m.id);
 }
+
+/** 当前版本的账号，用于模型页的「分账号查看」。 */
+export function realmAccounts(accounts, realm) {
+  return (accounts || []).filter((a) => (a.realm || '') === realm);
+}
+
+/** 账号模型排除名单的小写集合。 */
+export function accountDeniedSet(account) {
+  return new Set(((account && account.disabledModels) || [])
+    .map((id) => String(id).toLowerCase()));
+}
+
+/** 这个模型是否会派给该账号。 */
+export function accountCanUse(model, account) {
+  const id = String((model && model.id) || '').toLowerCase();
+  return !accountDeniedSet(account).has(id);
+}
+
+/** 聚合视图的账号覆盖：这个模型在多少个已启用账号里可用。 */
+export function coverageFor(model, accounts) {
+  const list = (accounts || []).filter((a) => a.enabled !== false);
+  const can = list.filter((a) => accountCanUse(model, a)).length;
+  return { can, total: list.length, text: list.length ? can + '/' + list.length : '—' };
+}
+
+/** 某个账号视图下可用的模型数：全局开启，并且没有被该账号排除。 */
+export function accountAvailableCount(data, account) {
+  return (data || []).filter((m) => m.enabled && accountCanUse(m, account)).length;
+}

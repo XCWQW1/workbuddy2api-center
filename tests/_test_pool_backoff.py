@@ -1,15 +1,3 @@
-"""Pin the account-level failure governance: soft backoff, breaker, degrade.
-
-Repeated soft limits used to get the same short cooldown every time, so an
-account that was clearly being throttled kept getting handed out; hard and
-unknown failures had no accumulated penalty at all. The panel project's pool
-cools a soft-limited credential exponentially (10m, 20m, ... capped at 2h),
-trips a breaker after 3 consecutive hard failures (30m doubling to 6h) and
-degrades after 5 unknown ones (10m doubling to 2h). A served request clears
-everything.
-
-No network: accounts are built from dicts and written to a temp directory.
-"""
 import base64
 import json
 import os
@@ -31,14 +19,12 @@ import wb_proxy
 
 INTL_ISS = "https://www.workbuddy.ai/auth/realms/copilot"
 
-# The real 429 shapes from the incident environment (issue #70, sanitized:
-# requestId removed, UIDs/hosts never present). S1 is 229 of the 263 recorded
-# 429s; S2 is the one provably intl body with no reset field; S3/S4 name a reset
-# clock and are the controls.
+# 事件环境里的真实 429 报文，对应 issue #70，已脱敏：去掉 requestId，
+# UID 与主机从未写入。记录中的 263 个 429 里有 229 个是 S1；S2 是唯一可证实
+# 为 intl 且没有 reset 字段的报文；S3/S4 带 reset 时钟，作为对照。
 S1_BARE = "usage exceeds frequency limit"
-# The log keeps str(message)[:200], so S2 survives only as this truncated
-# prefix; S2_INTL_JSON is the same body closed into valid JSON, which is the
-# form that exercises the code-number path.
+# 日志只保留 str(message)[:200]，所以 S2 只剩这段被截断的前缀；
+# S2_INTL_JSON 是同一报文补全为合法 JSON 的形态，用于覆盖 code 数字路径。
 S2_INTL_RECORDED = ('{"code":14003,"msg":"too many requests",'
                     '"retry_policy":{"retry":true},'
                     '"displayMsg":{"en":"Too many requests. Please retry later.",'
@@ -47,9 +33,9 @@ S2_INTL_JSON = ('{"code":14003,"msg":"too many requests",'
                 '"retry_policy":{"retry":true},'
                 '"displayMsg":{"en":"Too many requests. Please retry later.",'
                 '"zh":"请求过于频繁，请稍后重试。"}}')
-# The gateway reads up to 600 characters while the usage log kept only 200, so
-# the real body carries more than the recorded prefix. The tail below is the
-# shape that tail can have; `accountId` / `credentialId` are field names.
+# 网关最多读取 600 个字符，而用量日志只留 200 个，所以真实报文比记录的
+# 前缀更长。下面的结尾是这种结尾可能的形态；`accountId` / `credentialId`
+# 只是字段名。
 S2_INTL_FULL = ('{"code":14003,"msg":"too many requests",'
                 '"accountId":"<redacted>","credentialId":"<redacted>",'
                 '"requestId":"<redacted>","retry_policy":{"retry":true},'
@@ -104,44 +90,40 @@ class BackoffMathTests(unittest.TestCase):
         self.assertEqual(A.degrade_backoff(99), A.DEGRADE_COOLDOWN_MAX)
 
     def test_the_real_unscoped_shapes_are_recognised(self):
-        """S1 (87% of the recorded 429s) and the intl 14003 body."""
+        """S1 占记录 429 的 87%，intl 的 14003 报文也要识别。"""
         self.assertTrue(wb_proxy.rate_limit_is_soft_shape(S1_BARE))
         self.assertTrue(wb_proxy.rate_limit_is_soft_shape(S2_INTL_JSON))
-        # The recorded form is truncated mid-JSON and still matches on the text.
+        # 记录形态在 JSON 中途被截断，仍按文本匹配。
         self.assertTrue(wb_proxy.rate_limit_is_soft_shape(S2_INTL_RECORDED))
         self.assertEqual(wb_proxy.rate_limit_code(S2_INTL_JSON), 14003)
         self.assertIsNone(wb_proxy.rate_limit_code(S1_BARE), "S1 is not JSON")
-        # An unrelated 429 body must not be claimed as a rate-limit shape.
+        # 无关的 429 报文不能被认作限流形态。
         self.assertFalse(wb_proxy.rate_limit_is_soft_shape("<html>bad gateway</html>"))
         self.assertFalse(wb_proxy.rate_limit_is_soft_shape(""))
 
     def test_none_of_the_real_shapes_is_account_level_without_evidence(self):
-        """S1/S2 carry no timestamp; S3/S4 are the parsed controls.
+        """S1/S2 没有时间戳，S3/S4 是能解析出 reset 的对照。
 
-        This used to be `rate_limit_is_account_level(d, None) == True`, which
-        made "no parsable timestamp" itself the account-level evidence: S1 and
-        S2 each bought the credential 600s doubling to 7200s, so a handful of
-        them left a whole realm cooling while the panel test still reported the
-        credential healthy.
+        无可解析时间戳时，账号级判定必须为 False：否则几个 S1/S2 就能让
+        整个 realm 冷却，而面板测试仍报告凭证健康。
         """
         for detail in (S1_BARE, S2_INTL_JSON, S2_INTL_RECORDED):
             self.assertIsNone(wb_proxy.parse_rate_limit_reset(detail), detail)
             self.assertFalse(wb_proxy.rate_limit_is_account_level(detail, None), detail)
-        # S3/S4 parse to exactly the instant their text names (H's table).
+        # S3/S4 精确解析到文本里写明的时刻。
         self.assertEqual(wb_proxy.parse_rate_limit_reset(S3_INTL_6004), 1791291609)
         self.assertEqual(wb_proxy.parse_rate_limit_reset(S4_CN_6004), 1791269104)
         for detail in (S3_INTL_6004, S4_CN_6004):
             reset_at = wb_proxy.parse_rate_limit_reset(detail)
             self.assertFalse(wb_proxy.rate_limit_is_account_level(detail, reset_at), detail)
-        # Nor is a body we cannot read at all.
+        # 完全无法读取的报文同样不算。
         self.assertFalse(wb_proxy.rate_limit_is_account_level("", None))
 
     def test_metadata_field_names_are_not_scope_evidence(self):
-        """`accountId` is a field name, not "the account is rate limited".
+        """`accountId` 只是字段名，不能说明账号被限流。
 
-        The gateway reads up to 600 characters of the 429 body; a substring test
-        read that metadata tail as credential evidence and put the 600s -> 7200s
-        ladder back in play for the most common intl shape.
+        网关最多读取 429 报文的 600 个字符，字段名出现在元数据尾部；按子串
+        判定会让最常见的 intl 形态重新走上 600s 到 7200s 的阶梯。
         """
         self.assertTrue(wb_proxy.rate_limit_is_soft_shape(S2_INTL_FULL))
         self.assertIsNone(wb_proxy.parse_rate_limit_reset(S2_INTL_FULL))
@@ -152,7 +134,7 @@ class BackoffMathTests(unittest.TestCase):
                          '{"subaccount":"x"}', '{"accountIds":["x"]}'):
             self.assertFalse(wb_proxy.rate_limit_is_account_level(metadata, None),
                              metadata)
-        # Scope has to be said, not implied by a field name.
+        # 作用域必须写明，不能由字段名暗示。
         self.assertTrue(wb_proxy.rate_limit_is_account_level(
             '{"msg":"account-level rate limit reached"}', None))
         self.assertTrue(wb_proxy.rate_limit_is_account_level(
@@ -164,12 +146,10 @@ class BackoffMathTests(unittest.TestCase):
         self.assertIsNone(wb_proxy.credential_scope_phrase(S1_BARE))
 
     def test_the_two_ladders_do_not_feed_each_other(self):
-        """One shared counter pushed either ladder to the other's ceiling.
+        """两条阶梯各自计数，互不抬高对方的上限。
 
-        Four unscoped 429s left soft_streak at 4, so the first genuinely
-        credential-scoped 429 started at 600 * 2**4 and reached the 7200s cap
-        instead of starting at 600s; the reverse direction lifted the unscoped
-        ladder the same way.
+        4 次无作用域 429 不会让 soft_streak 变成 4，首次真正的凭证级 429
+        仍从 600s 起步；反向也一样，凭证级失败不会抬高无作用域阶梯。
         """
         account = load_account("u-domains")
         for _ in range(4):
@@ -200,7 +180,7 @@ class BackoffMathTests(unittest.TestCase):
         self.assertEqual(account.public()["unscopedStreak"], 0)
 
     def test_the_unscoped_ladder_starts_short_and_caps_at_one_credential_tier(self):
-        """S1 is the most common shape, so its ceiling cannot be the 2h one."""
+        """S1 是最常见的形态，其上限不能是 2 小时那一档。"""
         self.assertEqual(A.unverified_soft_backoff(1), 60.0)
         self.assertEqual(A.unverified_soft_backoff(2), 120.0)
         self.assertEqual(A.unverified_soft_backoff(4), 480.0)
@@ -221,24 +201,24 @@ class BackoffMathTests(unittest.TestCase):
                            cooldown=second)
         self.assertEqual(account.unscoped_streak, 2)
         self.assertEqual(account.soft_streak, 0, "the credential counter is untouched")
-        # The credential is never parked, and a sibling model stays usable -
-        # that is the difference from note_soft_rate().
+        # 凭证本身不被停用，同账号的其他模型仍可用，这是与 note_soft_rate
+        # 的区别。
         self.assertEqual(account.cooldown_until, 0.0)
         self.assertEqual(account.throttle_wait(), 0)
         self.assertTrue(account.ready(model="another-model"))
         self.assertFalse(account.ready(model="glm-5.3"))
 
     def test_only_credential_wording_is_account_level(self):
-        """Positive evidence keeps the 10m -> 2h ladder reachable.
+        """正向证据仍能触发 10m 到 2h 的阶梯。
 
-        Provisional by design: the phrase list is short because no captured body
-        has shown yet what a genuine account-level 429 says.
+        措辞列表有意保持简短：目前还没有抓到真正的账号级 429 报文，无法
+        确定它会怎么说。
         """
         self.assertTrue(wb_proxy.rate_limit_is_account_level(
             '{"message":"too many requests for this account"}', None))
         self.assertTrue(wb_proxy.rate_limit_is_account_level(
             '{"msg":"该账号请求过于频繁"}', None))
-        # A reset clock still wins - that is the model-scoped form.
+        # reset 时钟优先，这属于模型级形态。
         self.assertFalse(wb_proxy.rate_limit_is_account_level(
             '{"message":"account rate limit, reset at 2026-10-09 12:00:00 UTC"}',
             time.time() + 60))
@@ -261,7 +241,7 @@ class BackoffMathTests(unittest.TestCase):
         cn_reset = wb_proxy.parse_rate_limit_reset(cn)
         self.assertEqual(cn_reset, wb_proxy.parse_rate_limit_reset(intl))
         self.assertIsNotNone(cn_reset)
-        # 14:44:59 UTC+8 is the same wall clock as 06:44:59 UTC.
+        # 14:44:59 UTC+8 与 06:44:59 UTC 是同一墙钟时刻。
         self.assertEqual(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(cn_reset)),
                          "2026-10-09 06:44:59")
         self.assertIsNone(wb_proxy.parse_rate_limit_reset('{"code":429}'))
@@ -295,9 +275,8 @@ class AccountGovernanceTests(unittest.TestCase):
         account.note_unknown_failure("connection: TimeoutError")
         account.note_unknown_failure("connection: TimeoutError")
         self.assertEqual(account.throttle_wait(), 0)
-        # Unknown failures also feed the shared breaker counter, so the wrap
-        # is asserted past both thresholds; the degrade window itself starts
-        # at DEGRADE_THRESHOLD.
+        # 未知失败也计入共享 breaker 计数，所以循环越过两个阈值再断言；
+        # degrade 窗口本身从 DEGRADE_THRESHOLD 开始。
         for _ in range(A.DEGRADE_THRESHOLD - 2):
             account.note_unknown_failure("connection: TimeoutError")
         self.assertEqual(account.degrade_count, A.DEGRADE_THRESHOLD)
@@ -322,16 +301,15 @@ class AccountGovernanceTests(unittest.TestCase):
 
 
 class PanelTestSuccessTests(unittest.TestCase):
-    """A green panel test is a served request, so it must clear the streak.
+    """面板测试成功等于真正服务过一次请求，必须清零 soft_streak。
 
-    /accounts/test calls clear_error() on success, which clears the visible
-    cooldown fields but never touched soft_streak - the counter note_success()
-    resets. The panel could therefore show an account as usable while the next
-    account-level 429 resumed the backoff ladder from the stale streak.
+    /accounts/test 成功时调用 clear_error，只清可见的冷却字段，不清
+    soft_streak；计数由 note_success 重置。否则下一次账号级 429 会从残留
+    的 streak 继续退避阶梯。
     """
 
     class _Route(object):
-        """Just enough handler for the real _route_accounts_test()."""
+        """供真实 _route_accounts_test 使用的极小 handler。"""
 
         def _json(self, code, obj):
             self.code, self.body = code, obj
@@ -345,7 +323,7 @@ class PanelTestSuccessTests(unittest.TestCase):
             return False
 
     def _drive_panel_test(self, account):
-        """Run the real route with a stubbed upstream answer."""
+        """用打桩的上游应答跑真实路由。"""
         class Pool(object):
             def get(self, uid):
                 return account if uid == account.uid else None
@@ -383,14 +361,13 @@ class PanelTestSuccessTests(unittest.TestCase):
 
         self._drive_panel_test(account)
 
-        # The next account-level 429 starts the ladder over rather than
-        # continuing from the streak the panel test should have cleared.
+        # 下一次账号级 429 从头开始，而不是接着面板测试本应清零的 streak。
         wait = account.note_soft_rate("HTTP 429 (account soft rate)")
         self.assertEqual(account.soft_streak, 1)
         self.assertEqual(wait, A.SOFT_RATE_BASE)
 
     def test_a_panel_test_keeps_other_models_throttled(self):
-        """The narrow success path must not lift sibling model cooldowns."""
+        """这条窄成功路径不能解除同账号其他模型的冷却。"""
         account = load_account("u-panel-test-siblings")
         account.note_error("HTTP 429 (model throttled)", model="glm-5.3",
                            cooldown=600)
@@ -403,14 +380,11 @@ class PanelTestSuccessTests(unittest.TestCase):
 
 
 class RetryRoundChargeTests(unittest.TestCase):
-    """One client request must not charge the same account twice (issue #271).
+    """一次客户端请求不能对同一账号记两次失败，对应 issue #271。
 
-    After a transient the retry loop clears `tried` so the whole pool is
-    re-scanned. With a single usable account that hands the same account back,
-    and before this guard it was charged again: two fails out of one request,
-    so two blips could trip the 3-failure breaker instead of three. The pool
-    being nearly empty is exactly when this bites, which is the incident
-    environment.
+    出现瞬时故障后重试轮会清空 `tried` 并重扫整个池。只剩一个可用账号时，
+    重扫会把同一个账号再交回来，若无按请求去重就会在一条请求里记两次失败，
+    两次抖动即可触发 3 次失败阈值。池接近空正是事故环境的场景。
     """
 
     def _drive(self, account, urlopen):
@@ -466,7 +440,7 @@ class RetryRoundChargeTests(unittest.TestCase):
 
         with mock.patch.object(time, "sleep"):
             self._drive(account, urlopen)
-        # The retry round re-picked the account; it must still be one charge.
+        # 重试轮重新选中了该账号，仍只能记一次。
         self.assertEqual(account.fails, 1)
         self.assertEqual(account.degrade_count, 1)
 
@@ -481,8 +455,8 @@ class RetryRoundChargeTests(unittest.TestCase):
         self.assertEqual(account.fails, 1)
 
     def test_the_guard_is_per_request_not_per_process(self):
-        # A second request is a second chance to be charged: the guard must not
-        # leak across requests (it would hide a genuinely failing account).
+        # 第二条请求可以再记一次：守卫不能跨请求泄漏，否则会掩盖真正故障
+        # 的账号。
         account = load_account("u-charge-two-requests")
 
         def urlopen(req, timeout=30, proxy=""):

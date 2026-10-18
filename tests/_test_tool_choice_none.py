@@ -2,7 +2,7 @@
 
 上游把 tool_choice 当字符串，对象形式要降级；出站请求体的形状由这里的用例锁住。
 """
-import json, os, sys, tempfile
+import json, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)

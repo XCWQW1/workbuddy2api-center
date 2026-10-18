@@ -2,7 +2,7 @@
 
 No network: synthetic chat-completion chunks go through the translation functions.
 """
-import json, os, sys, tempfile
+import json, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)

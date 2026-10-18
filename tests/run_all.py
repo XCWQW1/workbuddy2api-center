@@ -1,29 +1,3 @@
-"""Run every bundled suite and print one line per file.
-
-    python tests/run_all.py                  # everything
-    python tests/run_all.py realm            # only suites whose name contains "realm"
-    python tests/run_all.py --jobs 1         # one suite at a time (default: min(4, cpus))
-    python tests/run_all.py --timeout 300    # per-suite wall clock, seconds
-    python tests/run_all.py --logs DIR       # keep every suite's full output in DIR
-
-Python suites run under the current interpreter; the JS suites need `node` on
-PATH and are reported as skipped when it is missing. `manual/_mobile_check.py`
-is not part of this set: it drives the dashboard with Playwright/Firefox and is
-run by hand.
-
-Each suite's output goes to a file rather than a pipe, so a suite that spawns
-the gateway still sees a normal console.
-
-Two things the runner is responsible for, because a suite cannot be:
-
-  - bounding a suite. Several of them start the gateway and wait on it; a hang
-    used to hold the whole job until its own timeout, so every suite now has a
-    wall clock and is killed - together with anything it started - when it runs
-    out.
-  - saying what went wrong. The last line of a crashed JS suite is a bare
-    "Node.js v20.20.2", so a failure line carries the first error instead, and
-    `--logs` keeps every suite's full output for the CI artifact.
-"""
 import argparse
 import os
 import re
@@ -37,13 +11,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-APP = os.path.join(ROOT, "app")      # the gateway modules live here
+APP = os.path.join(ROOT, "app")      # 网关模块所在目录
 JS_DIR = os.path.join(HERE, "javascript")
 TAIL_LINES = 25
 DEFAULT_TIMEOUT = 300
 
-# The first line that looks like the reason the suite stopped. A traceback's
-# last line is the actual exception, so both ends of the log are candidates.
+# 套件中断原因的首选行：traceback 的末行是真正的异常，日志两端都算候选。
 ERROR_HINTS = re.compile(
     r"(Traceback \(most recent call last\)"
     r"|^\s*[\w.]*(Error|Exception)\b"
@@ -54,15 +27,11 @@ ERROR_HINTS = re.compile(
 
 
 def _force_utf8_output():
-    """Make this process's stdout/stderr survive non-ASCII suite summaries.
+    """把本进程的标准输出与标准错误固定为 UTF-8。
 
-    The suites are run with PYTHONIOENCODING=utf-8 so a child can print its
-    Chinese labels, and their output is read back from a utf-8 log file. This
-    process then re-prints those same lines, and on the Windows CI runner its
-    own stdout is cp1252 - so the very first Chinese summary line aborted the
-    whole run with UnicodeEncodeError, after the suites themselves had passed.
-    Reconfiguring here keeps the two halves consistent; errors="replace" means
-    an exotic code point degrades to '?' instead of killing the run.
+    子套件以 PYTHONIOENCODING=utf-8 运行，日志按 utf-8 读回；本进程再回显同一批行。
+    Windows CI 的默认编码是 cp1252，遇到中文摘要会抛 UnicodeEncodeError。
+    errors="replace" 让无法编码的字符降级为 '?'，不会中断整轮运行。
     """
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -103,11 +72,10 @@ def read_lines(path):
 
 
 def first_error(lines):
-    """The most useful single line from a failed suite's output.
+    """从失败套件的输出里挑出最有用的那一行。
 
-    A Python suite ends with its exception; a JS suite that dies during load ends
-    with "Node.js v20.20.2" and the reason is a dozen lines above. Prefer the
-    last line that looks like an error, fall back to the last line at all.
+    Python 套件以异常收尾；加载期就崩溃的 JS 套件末行只是 "Node.js v20.20.2"，
+    原因在十几行之前。优先取最后一条像错误的行，否则取末行。
     """
     for line in reversed(lines):
         if ERROR_HINTS.search(line):
@@ -116,18 +84,17 @@ def first_error(lines):
 
 
 def start_kwargs():
-    """Put the suite in its own process group, so its tree can be killed."""
+    """让套件独占进程组，便于整棵进程树一起结束。"""
     if os.name == "nt":
         return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
     return {"start_new_session": True}
 
 
 def kill_tree(proc):
-    """Kill a suite and everything it started.
+    """结束套件及其启动的全部进程。
 
-    Killing only the direct child leaves its grandchildren behind: the suites
-    that start wb_proxy.py would leave a gateway holding a port, and the next
-    suite would inherit a machine that is not in the state the first one saw.
+    只结束直接子进程会留下孙进程：启动 wb_proxy.py 的套件会遗留一个占着端口的网关，
+    下一个套件看到的环境就与第一个套件不同。
     """
     if proc.poll() is not None:
         return
@@ -137,7 +104,7 @@ def kill_tree(proc):
                                   stdout=subprocess.DEVNULL,
                                   stderr=subprocess.DEVNULL, timeout=30)
             if done.returncode != 0:
-                # taskkill refused (a locked-down host, or the pid is gone).
+                # taskkill 拒绝执行：主机受限或进程已退出。
                 proc.kill()
         else:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -153,7 +120,7 @@ def kill_tree(proc):
 
 
 def run_one(name, env, timeout, logs_dir):
-    """Run one suite; return everything the caller needs to report it."""
+    """运行一个套件，返回调用方汇报所需的全部信息。"""
     started = time.time()
     handle, log_path = tempfile.mkstemp(suffix=".log", prefix=name + ".")
     os.close(handle)
@@ -225,19 +192,17 @@ def main(argv):
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONPATH"] = os.pathsep.join(
         [APP, ROOT] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
-    # A suite may print non-ASCII (Chinese labels are common here). The child
-    # writes straight into a utf-8 log file, so its own stdout encoding has to
-    # be utf-8 too - on the CI Windows runner the locale is cp1252 and a
-    # Chinese label would otherwise abort the suite with UnicodeEncodeError.
+    # 套件可能打印非 ASCII 文本，中文标签很常见。子进程直接写入 utf-8 日志文件，
+    # 自身标准输出也必须是 utf-8：Windows CI 的区域设置是 cp1252，中文标签会让
+    # 套件抛 UnicodeEncodeError 而中断。
     env["PYTHONIOENCODING"] = "utf-8"
-    # This script echoes each suite's last line (and its whole tail on
-    # failure) on its own stdout; `_force_utf8_output` already pinned both
-    # streams to UTF-8 at import time.
+    # 本脚本在自身标准输出回显各套件末行与失败时的完整尾部，
+    # import 时已由 _force_utf8_output 固定为 UTF-8。
     have_node = shutil.which("node") is not None
 
     selected = suites(pattern)
     if not selected:
-        # 筛选词打错或套件被删光时按错误退出，避免「0 passed, 0 failed」的退出码 0 被 CI 当成通过。
+        # 筛选词打错或套件被删光时按错误退出，避免 0 passed, 0 failed 且退出码为 0 被 CI 当成通过。
         print("  no suite matches %r in %s" % (pattern, HERE))
         return 2
 
@@ -259,7 +224,7 @@ def main(argv):
             todo.append(name)
 
     def report(item):
-        """One line per suite, plus where to read more when it failed."""
+        """每个套件一行；失败时附上查看更多输出的位置。"""
         name = item["name"]
         durations.append((item["seconds"], name))
         if item["ok"]:
@@ -282,9 +247,8 @@ def main(argv):
 
     started = time.time()
     if args.jobs > 1:
-        # The suites are separate processes and were made independent of each
-        # other first (own temp dirs, spare ports), so they can overlap. Reported
-        # as they finish: a run that takes a minute should not go quiet.
+        # 各套件是独立进程，且已先做成互不依赖：各自临时目录、备用端口，
+        # 因此可以并行。按完成顺序汇报，整轮跑一分钟也不会毫无输出。
         with ThreadPoolExecutor(max_workers=args.jobs) as pool:
             futures = [pool.submit(run_one, name, env, args.timeout, logs_dir)
                        for name in todo]

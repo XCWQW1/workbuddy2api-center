@@ -10,24 +10,14 @@ import time
 import urllib.error
 
 
-# The running gateway module. wb_proxy binds this to itself after importing
-# this module; importing wb_proxy here would load a second copy when the
-# gateway runs as __main__ (python app/wb_proxy.py).
+# 运行中的网关模块。wb_proxy 导入本模块后调用 bind 注入自身；在这里 import
+# wb_proxy 会在网关以 __main__ 运行时载入第二份副本。
 P = None
 
 
 def bind(module):
     global P
     P = module
-
-
-ANTHROPIC_STOP_REASONS = {
-    "stop": "end_turn",
-    "length": "max_tokens",
-    "tool_calls": "tool_use",
-    "function_call": "tool_use",
-    "content_filter": "end_turn",
-}
 
 
 def _text(content):
@@ -121,22 +111,17 @@ def _tools(tools):
 
 def _choice(choice):
     if not isinstance(choice, dict):
-        return None, None, None
+        return None, None
     ctype = str(choice.get("type") or "").strip().lower()
     disabled = choice.get("disable_parallel_tool_use")
     parallel = None if disabled is None else (not bool(disabled))
-    if ctype == "auto":
-        return "auto", "auto", parallel
-    if ctype == "any":
-        return "required", "required", parallel
-    if ctype == "none":
-        return "none", "none", parallel
+    if ctype in ("auto", "any", "none"):
+        return ("required" if ctype == "any" else ctype), parallel
     if ctype == "tool":
         name = str(choice.get("name") or "").strip()
         if name:
-            return ({"type": "function", "function": {"name": name}},
-                    {"type": "function", "name": name}, parallel)
-    return None, None, parallel
+            return {"type": "function", "name": name}, parallel
+    return None, parallel
 
 
 def messages_to_responses(payload):
@@ -203,7 +188,7 @@ def messages_to_responses(payload):
         out["tools"] = [{"type": "function", "name": fn["name"],
                          "description": fn["description"],
                          "parameters": fn["parameters"]} for fn in tools]
-    _chat_choice, resp_choice, parallel = _choice(payload.get("tool_choice"))
+    resp_choice, parallel = _choice(payload.get("tool_choice"))
     if resp_choice is not None:
         out["tool_choice"] = resp_choice
     if parallel is not None:
@@ -223,13 +208,6 @@ def _usage(usage):
         "input_tokens": usage.get("prompt_tokens") or 0,
         "output_tokens": usage.get("completion_tokens") or 0,
     }
-
-
-def _stop_reason(finish, content):
-    reason = ANTHROPIC_STOP_REASONS.get(str(finish or "stop"), "end_turn")
-    if reason == "end_turn" and any(b.get("type") == "tool_use" for b in content):
-        reason = "tool_use"
-    return reason
 
 
 def response_to_message(obj, model=None):

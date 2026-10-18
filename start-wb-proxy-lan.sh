@@ -68,13 +68,10 @@ try_py() {
   return 0
 }
 
-# The shipped ZIP only carries a Windows python/ tree, so on macOS and
-# Linux nothing here matches and we fall back to the system Python below.
-BUNDLED=""
 for cand in "$HERE/python/bin/python3" "$HERE/python/bin/python" \
             "$HERE/python3/bin/python3" "$HERE/python/python.exe"; do
   [ -n "$PYEXE" ] && break
-  if try_py "$cand"; then BUNDLED="$cand"; fi
+  try_py "$cand"
 done
 
 if [ -z "$PYEXE" ]; then
@@ -99,7 +96,6 @@ if [ -z "$PYEXE" ]; then
 fi
 
 PYREAL="$("$PYEXE" -c 'import sys; print(sys.executable)' 2>/dev/null || echo "$PYEXE")"
-PYVER="$("$PYEXE" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || echo "?")"
 
 echo "==========================================================="
 echo "  WorkBuddy proxy - LAN MODE"
@@ -107,12 +103,7 @@ echo
 echo "  Port $PORT - your API address, dashboard link and API"
 echo "  key are printed below once the server is up."
 echo
-echo "  Python: $PYREAL ($PYVER)"
-if [ -z "$BUNDLED" ]; then
-  echo
-  echo "  note: this package ships no Python runtime for macOS / Linux,"
-  echo "        so the system Python above is used (3.9+ required)."
-fi
+echo "  Python: $PYREAL"
 echo
 echo "  If other devices cannot connect:"
 echo "    - macOS may ask to allow incoming connections the first"

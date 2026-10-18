@@ -1,7 +1,3 @@
-"""The daily token guard parks an account once today's usage reaches the limit; upstream code 6004 caps a free window.
-
-No network: usage.jsonl is folded incrementally from local midnight, skipping client cancellations; an unknown count never parks anyone.
-"""
 import io
 import json
 import os
@@ -44,14 +40,14 @@ class DailyTokenLimitTests(unittest.TestCase):
             self.assertEqual(
                 wb_settings.set_daily_token_limit(directory, 200000000), 200000000)
             self.assertEqual(wb_settings.daily_token_limit(directory), 200000000)
-            # Garbage and negatives collapse to "off" instead of raising.
+            # 乱填的值与负数都归一为关闭，不抛出异常。
             self.assertEqual(wb_settings.set_daily_token_limit(directory, -5), 0)
             self.assertEqual(wb_settings.set_daily_token_limit(directory, "abc"), 0)
 
     def test_scan_counts_today_only_and_resumes_incrementally(self):
         midnight = P._local_midnight()
         rows = [
-            row(midnight - 3600, "acct-A", 999999),   # yesterday: ignored
+            row(midnight - 3600, "acct-A", 999999),   # 昨天，忽略
             row(midnight + 60, "acct-A", 1200),
             row(midnight + 120, "acct-A", 800),
             row(midnight + 180, "acct-B", 300),
@@ -63,13 +59,13 @@ class DailyTokenLimitTests(unittest.TestCase):
         self.assertEqual(P.daily_tokens_by_account(ttl=0),
                     {"acct-A": 2000, "acct-B": 300})
 
-        # Resume from the byte offset: a row appended after the first scan is folded in without recounting.
+        # 按字节偏移续折：首次扫描后追加的行直接折入，不重数整个文件。
         with io.open(P.USAGE_LOG, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row(midnight + 300, "acct-B", 100)) + "\n")
         self.assertEqual(P.daily_tokens_by_account(ttl=0),
                     {"acct-A": 2000, "acct-B": 400})
 
-        # A row with no trailing newline waits for the next scan instead of being half-counted.
+        # 末尾没有换行的行留到下次扫描，避免只数一半。
         with io.open(P.USAGE_LOG, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row(midnight + 400, "acct-A", 50)))
         self.assertEqual(P.daily_tokens_by_account(ttl=0),
@@ -82,7 +78,7 @@ class DailyTokenLimitTests(unittest.TestCase):
     def test_guard_blocks_at_threshold_and_needs_a_count(self):
         account = wb_accounts.Account({"uid": "uid-a", "accessToken": "t"})
         account.daily_token_limit = 1000
-        self.assertFalse(account.daily_limit_blocked())  # not counted yet
+        self.assertFalse(account.daily_limit_blocked())  # 尚未计数
         self.assertTrue(account.ready())
         account.daily_tokens_today = 999
         self.assertFalse(account.daily_limit_blocked())
@@ -90,7 +86,7 @@ class DailyTokenLimitTests(unittest.TestCase):
         account.daily_tokens_today = 1000
         self.assertTrue(account.daily_limit_blocked())
         self.assertFalse(account.ready())
-        account.daily_token_limit = 0            # guard off
+        account.daily_token_limit = 0            # 关闭守卫
         self.assertFalse(account.daily_limit_blocked())
         self.assertTrue(account.ready())
 
@@ -121,7 +117,7 @@ class DailyTokenLimitTests(unittest.TestCase):
             account = wb_accounts.Account({"uid": "uid-one", "accessToken": "t"})
             account.daily_tokens_today = 600
             pool.accounts = [account]
-            self.assertFalse(account.daily_limit_blocked())  # limit not applied yet
+            self.assertFalse(account.daily_limit_blocked())  # 限额尚未下发
             pool.apply_daily_token_limit()
             self.assertEqual(account.daily_token_limit, 500)
             self.assertTrue(account.daily_limit_blocked())

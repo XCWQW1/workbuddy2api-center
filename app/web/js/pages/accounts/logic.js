@@ -420,6 +420,25 @@ export function productLabel(id) {
   return hit ? hit.label : String(id);
 }
 
+/** 模型排除对话框的初始勾选：名单里的模型默认勾选，已排除的不勾。 */
+export function modelSelection(modelIds, denied) {
+  const deniedSet = new Set((denied || []).map((id) => String(id).toLowerCase()));
+  const ids = (modelIds || []).map((id) => String(id));
+  return { ids, picked: new Set(ids.filter((id) => !deniedSet.has(id.toLowerCase()))) };
+}
+
+/** 保存时要提交的排除名单：所有没有勾选的模型。 */
+export function deniedModels(modelIds, picked) {
+  const chosen = new Set([...picked].map((id) => String(id)));
+  return (modelIds || []).map((id) => String(id)).filter((id) => !chosen.has(id));
+}
+
+/** 账号的行内提示：排除名单的标题。 */
+export function disabledModelsTitle(account) {
+  const ids = (account && account.disabledModels) || [];
+  return ids.length ? '不派给这个账号的模型：' + ids.join('、') : '';
+}
+
 /** 账号的累计用量，没有记录时返回零值。 */
 export function usageFor(usageMap, uid) {
   const row = (usageMap || {})[uid];

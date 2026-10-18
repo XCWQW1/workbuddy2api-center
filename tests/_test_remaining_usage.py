@@ -1,46 +1,3 @@
-"""Remaining-usage estimate: budget learned from cap events, counted per window.
-
-The upstream caps each account's usage of a model inside a 24h window and names
-the reset clock on the 429 (code 6004). The budget itself is never told to the
-gateway, so this feature infers it from accounts that actually hit the cap: the
-usage of that model in the 24h ending at the reset is one sample, and the
-per-realm average of those samples is the estimated budget. Remaining usage for
-an account is then the budget minus what it burned since its own window started
-(the reset clock it was last handed).
-
-Pinned here, with the usage log synthesised in a temp directory and `now`
-injected so nothing depends on the wall clock:
-
-  - the sample is the 24h before the reset, successful rows only, and the 429
-    rows themselves never count as usage;
-  - an account that capped repeatedly weighs once (per-account mean first, then
-    across accounts) and repeated 429 rows for one reset collapse to one event;
-  - both the intl and the cn reset wordings produce cap events;
-  - the window usage counts from the last reset; a pair still cooling reports
-    remaining 0 with the reset clock that hands the quota back;
-  - a pair with no cap event falls back to the trailing 24h (conservative) and
-    is flagged estimated;
-  - segmented accounting: the spent window's usage is truncated at the cap,
-    the window after the reset re-counts from scratch (the old window's usage
-    never counts into the new one), the payload carries both segments, chained
-    caps' samples start at the previous reset, and a cap persisted in the
-    credential file anchors the pair even when the event journal has none;
-  - the per-model total is the sum of the usable groups' remaining (cooling
-    groups count 0 and never drag it down);
-  - models with no usage yesterday or today do not take part (rows and totals),
-    while their budget samples stay in the payload marked inactive;
-  - the budget is the weighted mean of the last three local days (today 6 /
-    yesterday 3 / the day before 1, normalised over the days that have
-    samples), the earlier days read back from usage/estimate-daily.json
-    instead of recomputed; a pair with no sample in three days has no budget;
-  - crossing local midnight (or the first build after a restart) archives the
-    day that just passed into estimate-daily.json: its per-day budget (account
-    mean first, then across accounts) and each pair's pre/post usage (pre + post
-    == that day's usage, the truncation figures the panel asks for) — merged
-    idempotently, never overwriting a day already persisted;
-  - the archive keeps the last three days and only the last two days' segments;
-  - the fold resumes incrementally from its byte offset.
-"""
 import io
 import json
 import os
@@ -67,11 +24,10 @@ HOUR = 3600
 
 
 def reset_epoch(stamp):
-    """The epoch parse_rate_limit_reset() reads out of an intl 6004 body.
+    """intl 6004 文本经 parse_rate_limit_reset 解析出的 epoch。
 
-    Built through the parser itself so the expectation never depends on the
-    host timezone: the body names a wall clock, and the parser is the one
-    thing that decides what that clock means on this machine.
+    期望值也走同一个解析器：文本给出的是墙钟，解析结果由本机时区决定，
+    这样就不依赖主机时区。
     """
     detail = ('{"code":6004,"msg":"usage exceeds frequency limit, but don\'t '
               'worry, your usage will reset at %s UTC+8, alternatively, you can '
@@ -83,25 +39,24 @@ def reset_epoch(stamp):
 
 
 def local_epoch(year, month, day, hour=0, minute=0, second=0):
-    """本地墙钟 -> epoch（日敏感用例的锚点，与主机时区无关）。
+    """本地墙钟 -> epoch，日敏感用例的锚点，与主机时区无关。
 
-    预算按撞线当天的**本地日期**分桶，所以「哪一天」必须由本地墙钟决定：
-    reset_epoch() 的 UTC+8 墙钟在别的时区会落到另一天。mktime 按本地时区
-    解释，tm_isdst=-1 让它自己判夏令时——构造出的 epoch 的本地日就是这里
+    预算按撞线当天的本地日期分桶，所以哪一天必须由本地墙钟决定：
+    reset_epoch 的 UTC+8 墙钟在别的时区会落到另一天。mktime 按本地时区
+    解释，tm_isdst=-1 让它自己判定夏令时，构造出的 epoch 的本地日就是这里
     写的那个日期。
     """
     return time.mktime((year, month, day, hour, minute, second, 0, 0, -1))
 
 
 def cap_detail(reset):
-    """一段 6004 文本，其 UTC+8 墙钟解析回给定的 reset（任意主机时区）。
+    """生成一段 6004 文本，其 UTC+8 墙钟解析回给定的 reset，任意主机时区均可。
 
-    reset_epoch() 是「先写墙钟、再解析」；这里反过来：先有 epoch（local_epoch
-    锚住的本地日），再把它格式化成 UTC+8 墙钟——解析器对 UTC+8 的换算是纯
-    算术，与主机时区无关，解回来就是同一个时刻。文本只有整秒，所以 reset
-    取整。夏令时区里解析器拿标准偏移（time.timezone）换算、与 mktime 的
-    夏令时偏移差一小时，这里用真解析结果反过来校正戳（映射是分段线性的，
-    校正一两次就精确命中）。
+    reset_epoch 是先写墙钟、再解析；这里反过来，先有 epoch，再把它格式化成
+    UTC+8 墙钟。解析器对 UTC+8 的换算是纯算术，与主机时区无关，解回来就是
+    同一个时刻。文本只有整秒，所以 reset 取整。夏令时区里解析器拿标准偏移
+    time.timezone 换算，与 mktime 的夏令时偏移差一小时，这里用真解析结果
+    反过来校正戳，映射是分段线性的，校正一两次就精确命中。
     """
     reset = int(reset)
     offset = reset + 8 * HOUR
@@ -154,7 +109,7 @@ def clear_events():
 
 
 def clear_daily():
-    """清掉按天归档文件与它的解析缓存（每个用例从空归档开始）。"""
+    """清掉按天归档文件及其解析缓存，每个用例从空归档开始。"""
     try:
         os.unlink(P.ESTIMATE_DAILY_FILE)
     except OSError:
@@ -163,13 +118,12 @@ def clear_daily():
 
 
 def clear_log():
-    """清掉 usage.jsonl（每个用例从空日志开始）。
+    """清掉 usage.jsonl，每个用例从空日志开始。
 
-    整套用例共用一个 USAGE_LOG：write_log() 截断，append_log() 只追加。于是
-    「跨天归档」那条把行追加进了上一个用例留下的日志里，而留下的那些行用的是
-    **真实时钟**（含 429 行的重置时刻），它们的重置时刻会插进本用例的窗口、被
-    _cap_window_start 当成链式起点，样本从 820 被截成 120。真实部署只有一个
-    进程、一个日志，不存在「上一个用例」，所以这是测试隔离问题。
+    整套用例共用一个 USAGE_LOG：write_log 截断，append_log 只追加。残留行
+    用的是真实时钟，重置时刻会插进本用例的窗口、被 _cap_window_start 当成
+    链式起点，样本因此被截短。真实部署只有一个进程、一个日志，所以每个
+    用例都要清空。
     """
     try:
         os.unlink(P.USAGE_LOG)
@@ -178,7 +132,7 @@ def clear_log():
 
 
 def restart_fold():
-    """Drop the in-memory fold the way a process restart would."""
+    """按进程重启的方式丢掉内存折叠状态。"""
     with P._remaining_state_lock:
         P._remaining_state.clear()
         P._remaining_state.update({
@@ -191,17 +145,17 @@ def restart_fold():
 
 
 def remaining_checkpoint_path():
-    """remaining 这一类状态的 checkpoint 文件（v4 起一类一份）。"""
+    """remaining 状态的 checkpoint 文件，一类一份。"""
     return P._usage_cache_kind_path("remaining")
 
 
 def reload_checkpoint_cache():
-    """忘掉已读的 checkpoint（新进程只读一次，测试要重放）。"""
+    """忘掉已读的 checkpoint，新进程只读一次，测试需要重放。"""
     P._usage_cache_forget()
 
 
 def cache_env(min_bytes=None, min_seconds=None):
-    """测试用写盘节流：默认值（1MB / 900s）在测试里几乎永远不落盘。"""
+    """测试用写盘节流：默认值 1MB / 900s 在测试里几乎永远不落盘。"""
     if min_bytes is None:
         os.environ.pop("WB_USAGE_CACHE_MIN_BYTES", None)
     else:
@@ -237,15 +191,15 @@ class RemainingUsageTests(unittest.TestCase):
     def test_sample_is_the_24h_before_the_reset(self):
         reset, detail = reset_epoch("2026-10-10 15:18:17")
         write_log([
-            # outside the window: must not count
+            # 窗口之外，不计入
             usage_row(reset - 25 * HOUR, "acct-A", 111111),
-            # inside the window: counted
+            # 窗口之内，计入
             usage_row(reset - 23 * HOUR, "acct-A", 1000),
             usage_row(reset - 2 * HOUR, "acct-A", 2000),
-            # failed rows never count
+            # 失败行不计入
             dict(usage_row(reset - HOUR, "acct-A", 999999),
                  error=True, outcome="failed", status=500),
-            # the 429 that reports the cap
+            # 报告撞线的 429
             cap_row(reset - HOUR + 60, "acct-A", detail),
         ])
         data = payload([account("acct-A")], now=reset + HOUR)
@@ -257,30 +211,29 @@ class RemainingUsageTests(unittest.TestCase):
         self.assertEqual(budget["n"], 1)
 
     def test_budget_averages_accounts_not_events(self):
-        # 新口径（近 3 天加权）下这条同时钉两件事：同一天内一个账号的多个
-        # 样本先按账号平均（撞两次的账号在当天只算一个均值），跨天再按
-        # 6/3/1 加权。时间锚在本地日上（跨天分桶看的是撞线当天的本地日期）。
+        # 近 3 天加权下这条同时验证两件事：同一天内一个账号的多个样本先按
+        # 账号平均，撞两次的账号在当天只算一个均值；跨天再按 6/3/1 加权。
+        # 时间锚在本地日上，跨天分桶看的是撞线当天的本地日期。
         r1 = local_epoch(2026, 10, 9, 10, 0, 0)         # 昨天
         r2 = local_epoch(2026, 10, 10, 10, 0, 0)        # 今天
         r3 = local_epoch(2026, 10, 10, 12, 0, 0)        # 今天
         r4 = local_epoch(2026, 10, 10, 14, 0, 0)        # 今天，acct-A 当天第二次
         write_log([
-            # acct-A caps on both days: yesterday's sample 1000, today's two
-            # samples average (2000 + 3000) / 2 = 2500.
+            # acct-A 两天都撞线：昨天样本 1000，今天两个样本均值 2500。
             usage_row(r1 - 2 * HOUR, "acct-A", 1000),
             cap_row(r1 - HOUR, "acct-A", cap_detail(r1)),
             usage_row(r2 - 2 * HOUR, "acct-A", 2000),
             cap_row(r2 - HOUR, "acct-A", cap_detail(r2)),
             usage_row(r4 - 2 * HOUR, "acct-A", 3000),
             cap_row(r4 - HOUR, "acct-A", cap_detail(r4)),
-            # acct-B caps once today: sample 3000
+            # acct-B 今天撞线一次：样本 3000
             usage_row(r3 - 2 * HOUR, "acct-B", 3000),
             cap_row(r3 - HOUR, "acct-B", cap_detail(r3)),
         ])
         data = payload([account("acct-A"), account("acct-B")], now=r3 + HOUR)
         budget = data["budgets"][0]
-        # 今天 {A: mean(2000,3000)=2500, B: 3000} → 2750（权重 6）；
-        # 昨天 {A: 1000} → 1000（权重 3）；(6×2750 + 3×1000)/9 = 2167。
+        # 今天 A 的均值 2500、B 3000，合计 2750，权重 6；
+        # 昨天 A 为 1000，权重 3；6×2750 + 3×1000 再除以 9 = 2167。
         self.assertEqual(budget["avg"], 2167)
         self.assertEqual(budget["min"], 1000)            # 各天账号均值的极值
         self.assertEqual(budget["max"], 3000)
@@ -290,13 +243,14 @@ class RemainingUsageTests(unittest.TestCase):
                          [("2026-10-10", 6, 2750, 2), ("2026-10-09", 3, 1000, 1)])
 
     def test_budget_weights_the_last_three_days_six_three_one(self):
-        """近 3 天加权：今天 6 / 昨天 3 / 前天 1，只在有样本的天之间归一。
+        """近 3 天加权：今天 6、昨天 3、前天 1，只在有样本的天之间归一。
 
-        三天各撞一次线（样本 300/200/100）：估算 = (6×300 + 3×200 + 1×100)/10
-        = 250；min/max 取各天账号均值的极值、n 为各天账号数之和；载荷里 days
-        列出各天构成。前两天的口径在跨天时归档，最后这次构建直接读文件。
+        三天各撞一次线，样本为 300、200、100，估算为
+        6×300 + 3×200 + 1×100 再除以 10 = 250；min/max 取各天账号均值的
+        极值，n 为各天账号数之和；载荷里的 days 列出各天构成。前两天在跨天
+        时归档，最后这次构建直接读文件。
         """
-        days = [local_epoch(2026, 10, 13),               # 前天（本地零点）
+        days = [local_epoch(2026, 10, 13),               # 前天本地零点
                 local_epoch(2026, 10, 14),               # 昨天
                 local_epoch(2026, 10, 15)]               # 今天
         now = local_epoch(2026, 10, 15, 12, 0, 0)
@@ -304,8 +258,8 @@ class RemainingUsageTests(unittest.TestCase):
         clock = {"now": now}
         time.time = lambda: clock["now"]
         try:
-            # 逐天追加（真实日志就是这样长出来的：写入时当天的行才是最新的，
-            # 26h 缓冲的裁剪按最后一行算）。
+            # 逐天追加：真实日志就是这样长出来的，写入时当天的行才是最新的，
+            # 26h 缓冲的裁剪按最后一行算。
             for day, tokens in zip(days, (100, 200, 300)):
                 with io.open(P.USAGE_LOG, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(usage_row(day + 8 * HOUR, "acct-A", tokens),
@@ -313,7 +267,7 @@ class RemainingUsageTests(unittest.TestCase):
                 clock["now"] = day + 9 * HOUR            # 撞线时刻
                 P.note_limit_event(account("acct-A"), MODEL,
                                    day + 9 * HOUR + 30 * 60)
-            # 进程在昨天与今天各构建过一次：前两天的口径依次归档落盘。
+            # 进程在昨天与今天各构建过一次，前两天依次归档落盘。
             clock["now"] = days[1] + 12 * HOUR
             payload([account("acct-A")], now=clock["now"])
             clock["now"] = days[2] + 8 * HOUR
@@ -323,7 +277,7 @@ class RemainingUsageTests(unittest.TestCase):
         finally:
             time.time = real_time
         budget = data["budgets"][0]
-        # (6×300 + 3×200 + 1×100)/10 = 250
+        # 6×300 + 3×200 + 1×100 再除以 10 = 250
         self.assertEqual(budget["avg"], 250)
         self.assertEqual(budget["min"], 100)             # 各天账号均值的极值
         self.assertEqual(budget["max"], 300)
@@ -333,7 +287,7 @@ class RemainingUsageTests(unittest.TestCase):
                          [("2026-10-15", 6, 300, 1),
                           ("2026-10-14", 3, 200, 1),
                           ("2026-10-13", 1, 100, 1)])
-        # 载荷里的行按加权后的预算算剩余（今天没用过，剩全额）。
+        # 载荷里的行按加权后的预算算剩余，今天没用过，剩全额。
         row = find_row(data, "acct-A")
         self.assertEqual(row["budget"], 250)
         self.assertEqual(row["samples"], 3)
@@ -342,13 +296,13 @@ class RemainingUsageTests(unittest.TestCase):
     def test_crossing_midnight_archives_the_finished_day(self):
         """跨天归档：刚过去的那天的预算与分段写进 estimate-daily.json。
 
-        预算是撞线时刻落在那天的样本（先按账号平均、再跨账号平均）；分段是
-        那天每个 (uid, model) 的「截断前 / 截断后」用量：post = 恢复时刻落
-        在当天的窗口在当天内的用量（从恢复时刻到「下一个撞线时刻或当天
-        结束」），pre = 当天用量 − post。该天已在文件里就不覆盖（幂等），
-        之后构建直接读文件里的值、不重算。
+        预算是撞线时刻落在那天的样本，先按账号平均、再跨账号平均；分段是
+        那天每个账号与模型组合的截断前、截断后用量：post 是恢复时刻落在当天
+        的窗口在当天内的用量，从恢复时刻到下一个撞线时刻或当天结束，pre =
+        当天用量 − post。该天已在文件里就不覆盖，保持幂等，之后构建直接读
+        文件里的值、不重算。
         """
-        reset1 = local_epoch(2026, 10, 14, 7, 30, 0)     # 昨天 07:30（本地）
+        reset1 = local_epoch(2026, 10, 14, 7, 30, 0)     # 昨天 07:30 本地
         reset2 = local_epoch(2026, 10, 14, 20, 30, 0)    # 昨天第二次撞线
         day_end = local_epoch(2026, 10, 15, 0, 0, 0)     # 今天 00:00
         now = day_end + 30 * 60                          # 今天 00:30
@@ -356,7 +310,7 @@ class RemainingUsageTests(unittest.TestCase):
         clock = {"now": reset1 - 30 * 60}                # 撞线时刻：昨天 07:00
         time.time = lambda: clock["now"]
         try:
-            # 逐条追加（真实日志就是这样长出来的：26h 缓冲的裁剪按最后一行算）。
+            # 逐条追加：真实日志就是这样长出来的，26h 缓冲的裁剪按最后一行算。
             append_log([usage_row(reset1 - 90 * 60, "acct-A", 4000),   # 截断前
                         usage_row(reset1 - 15 * 60, "acct-A", 50)])    # 截断前残行
             P.note_limit_event(account("acct-A"), MODEL, reset1)
@@ -377,28 +331,28 @@ class RemainingUsageTests(unittest.TestCase):
             stored = json.load(fh)
         self.assertEqual(stored["schema"], 1)
         day = stored["days"]["2026-10-14"]
-        # 两个样本（4000 与 820）同属一个账号：先按账号平均 = 2410。
+        # 两个样本 4000 与 820 同属一个账号，先按账号平均 = 2410。
         self.assertEqual(day["budgets"]["intl\x1f" + MODEL],
                          {"avg": 2410, "min": 2410, "max": 2410, "n": 1})
         segments = day["segments"]
-        # post：窗口 1 = [07:30, 20:00) = 820（到下一个撞线时刻为止），
-        # 窗口 2 = [20:30, 当天结束) = 480；合计 1300。
+        # post：窗口 1 为 07:30 到 20:00，共 820，到下一个撞线时刻为止；
+        # 窗口 2 为 20:30 到当天结束，共 480；合计 1300。
         self.assertEqual(segments["acct-A\x1f" + MODEL],
                          {"pre": 4050, "post": 1300})
         self.assertEqual(segments["acct-B\x1f" + MODEL],
                          {"pre": 200, "post": 0})
-        # 两个都是 0 的组合不写（acct-C 昨天没有用量）。
+        # 两个都是 0 的组合不写，acct-C 昨天没有用量。
         self.assertNotIn("acct-C\x1f" + MODEL, segments)
-        # 不变式：pre + post == 当天该组合的用量（A：4000+50+700+120+180+300）。
+        # 不变式：pre + post == 当天该组合的用量，A 为 4000+50+700+120+180+300。
         self.assertEqual(segments["acct-A\x1f" + MODEL]["pre"]
                          + segments["acct-A\x1f" + MODEL]["post"], 5350)
-        # 本次构建的估算直接吃这份归档（今天没有样本，昨天权重 3）。
+        # 本次构建的估算直接吃这份归档；今天没有样本，昨天权重 3。
         self.assertEqual(data["budgets"][0]["avg"], 2410)
         self.assertEqual([(d["day"], d["w"]) for d in data["budgets"][0]["days"]],
                          [("2026-10-14", 3)])
 
-        # 幂等 + 「调昨天的数据不重新计算」：改掉文件里的值再构建一次——估算
-        # 读的是文件里的 999999，文件也不会被重算的值覆盖。
+        # 幂等与「改昨天数据不重算」：改掉文件里的值再构建一次，估算读的是
+        # 文件里的 999999，文件也不会被重算的值覆盖。
         with io.open(P.ESTIMATE_DAILY_FILE, encoding="utf-8") as fh:
             tampered = json.load(fh)
         tampered["days"]["2026-10-14"]["budgets"]["intl\x1f" + MODEL]["avg"] = 999999
@@ -411,8 +365,8 @@ class RemainingUsageTests(unittest.TestCase):
         self.assertEqual(kept["days"]["2026-10-14"]["budgets"]
                          ["intl\x1f" + MODEL]["avg"], 999999)
 
-        # 重启（state["day"] 为空）会让第一次构建再试归档昨天一次：重算出的
-        # 4000 不得盖掉文件里已持久化的值（该天已在文件里就不覆盖）。
+        # 重启后 state["day"] 为空，第一次构建会再试归档昨天一次：重算出的
+        # 4000 不得盖掉文件里已持久化的值，该天已在文件里就不覆盖。
         restart_fold()
         reload_checkpoint_cache()
         after_restart = payload(accounts, now=now)
@@ -449,11 +403,11 @@ class RemainingUsageTests(unittest.TestCase):
     def test_remaining_counts_from_the_reset(self):
         reset, detail = reset_epoch("2026-10-10 08:00:00")
         write_log([
-            # the spent window that produced the cap: 5000 tokens total
+            # 产生撞线的已花窗口：合计 5000 token
             usage_row(reset - 20 * HOUR, "acct-A", 2000),
             usage_row(reset - 2 * HOUR, "acct-A", 3000),
             cap_row(reset - HOUR, "acct-A", detail),
-            # the new window, after the reset: 1200 burned so far
+            # 重置后的新窗口：已用 1200
             usage_row(reset + 30 * 60, "acct-A", 700),
             usage_row(reset + 45 * 60, "acct-A", 500),
         ])
@@ -474,7 +428,7 @@ class RemainingUsageTests(unittest.TestCase):
             usage_row(reset - HOUR, "acct-A", 1000),
             cap_row(reset - 30 * 60, "acct-A", detail),
         ])
-        # now is inside the spent window: the reset clock is still ahead
+        # now 在已花窗口内，恢复时刻还没到
         now = reset - 10 * 60
         data = payload([account("acct-A")], now=now)
         row = find_row(data, "acct-A")
@@ -485,15 +439,14 @@ class RemainingUsageTests(unittest.TestCase):
         self.assertEqual(row["used"], 5000)
 
     def test_unknown_window_uses_trailing_24h(self):
-        # acct-A provides the budget for the model (5000) through a cap event
-        # on the *previous day* — it gets archived into estimate-daily.json at
-        # this build and stays in the 3-day estimate; acct-B never capped.
-        reset = local_epoch(2026, 10, 10, 8, 0, 0)       # 昨天 08:00（本地）
+        # acct-A 通过昨天的撞线事件为这个模型提供预算 5000，本次构建时归档进
+        # estimate-daily.json 并留在 3 天估算里；acct-B 从未撞线。
+        reset = local_epoch(2026, 10, 10, 8, 0, 0)       # 昨天 08:00 本地
         now = local_epoch(2026, 10, 11, 14, 0, 0)        # 今天 14:00
         write_log([
             usage_row(reset - 2 * HOUR, "acct-A", 5000),
             cap_row(reset - HOUR, "acct-A", cap_detail(reset)),
-            # acct-B: 900 inside the trailing 24h, 400 outside it
+            # acct-B：尾随 24h 内 900，窗口外 400
             usage_row(now - 30 * HOUR, "acct-B", 400),
             usage_row(now - 20 * HOUR, "acct-B", 900),
         ])
@@ -505,9 +458,8 @@ class RemainingUsageTests(unittest.TestCase):
         self.assertEqual(row["used"], 900)
         self.assertEqual(row["budget"], 5000)
         self.assertEqual(row["remaining"], 4100)
-        # acct-A's reset is 30h old: that window expired long ago and the
-        # current one cannot be anchored either, so it is estimated too - the
-        # trailing 24h is a lower bound, never a claim to know the window.
+        # acct-A 的恢复时刻在 30h 前，那个窗口早已过期，当前窗口也无法锚定，
+        # 所以同样标为估算：尾随 24h 只是下界，并不声称知道窗口。
         stale = find_row(data, "acct-A")
         self.assertTrue(stale["estimated"])
         self.assertEqual(stale["window_start"], now - P.LIMIT_WINDOW_SECONDS)
@@ -568,7 +520,7 @@ class RemainingUsageTests(unittest.TestCase):
         data = payload([account("acct-A")], now=now)
         self.assertEqual(find_row(data, "acct-A")["used"], 0)
 
-        # A row appended after the first pass is folded in without a rescan.
+        # 第一遍之后追加的行无需重扫即可折入。
         with io.open(P.USAGE_LOG, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(usage_row(now - HOUR, "acct-A", 123),
                                 ensure_ascii=False) + "\n")
@@ -576,9 +528,9 @@ class RemainingUsageTests(unittest.TestCase):
         self.assertEqual(find_row(data, "acct-A")["used"], 123)
 
     def test_shrunk_log_starts_over(self):
-        # 撞线那天（昨天）的口径在第一次构建时已归档进 estimate-daily.json：
-        # 日志被换掉后重折的只是用量行，预算从归档里继续读（新口径）。
-        reset = local_epoch(2026, 10, 9, 8, 0, 0)        # 昨天 08:00（本地）
+        # 撞线那天是昨天，其口径在第一次构建时已归档进 estimate-daily.json；
+        # 日志被换掉后重折的只是用量行，预算从归档里继续读。
+        reset = local_epoch(2026, 10, 9, 8, 0, 0)        # 昨天 08:00 本地
         now = local_epoch(2026, 10, 10, 4, 0, 0)         # 今天 04:00
         write_log([
             usage_row(reset - 2 * HOUR, "acct-A", 600),
@@ -586,9 +538,8 @@ class RemainingUsageTests(unittest.TestCase):
         ])
         self.assertEqual(payload([account("acct-A")], now=now)["budgets"][0]["avg"], 600)
 
-        # The log was replaced by a shorter one (rotation / a copy in place):
-        # the cached offset points past its end, so the fold starts over
-        # instead of resuming into unrelated bytes.
+        # 日志被更短的一份替换，轮转或原地复制都会这样：缓存的偏移越过文件
+        # 末尾，折叠从头开始，而不是从无关的字节处续读。
         write_log([usage_row(reset - 2 * HOUR, "acct-A", 800)])
         data = payload([account("acct-A")], now=now)
         row = find_row(data, "acct-A")

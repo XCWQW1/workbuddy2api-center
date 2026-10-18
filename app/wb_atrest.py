@@ -1,41 +1,5 @@
 # -*- coding: utf-8 -*-
-"""桌面端 at-rest 加密凭据的解密与静态密钥回收。
 
-背景：桌面客户端自 2026-09-24 起把 `accessToken` / `refreshToken`（以及国内版
-的 `nickname` / `phoneNumber`）从明文改成 `{"$wbEncrypted": suite, "envelope":
-base64(...)}` 加密信封。看板照旧能读到 `.info` 文件，但拿出来的是信封文本，
-导入账号池之后每个请求都 401——这就是「扫描桌面客户端账号」入口被隐藏的原因。
-本模块把解密链路补回来，入口可以重新开放。
-
-方案与客户端 `packages/at-rest-crypto` 一致：
-
-    key       = sha256(atRestSecretKey_b64_string)      # 由客户端构建载荷派生
-    keyId     = sha256(key).hex[0:16]
-    AAD       = "WB-AAD\\0" | 0x01 | LP(framingMagic) | LP("sym-v1") | u32(suite)
-                | LP(keyId) | framingCode | 0x00 | 0x00        (LP = u32be 长度 + utf8)
-    envelope  = base64(JSON{suite,keyId,nonce,authTag,ciphertext})   AES-256-GCM
-    framing   : 文件 -> WBEF1/1（keyblob），字段 -> WBEV1/2（.info 里的字段）
-
-静态密钥编译在桌面客户端（WorkBuddy.exe / WorkBuddyAI.exe，见
-`DESKTOP_EXE_CANDIDATES`）的原生模块里，磁盘上拿不到明文，所以只能从**正在
-运行的**主进程内存里找回来（见 `recover_key`）：判据是 sha256(窗口)[:8] 等于
-keyblob 里 static-v1 槽的 protectorKeyId，因此客户端升级后依然可用。
-
-四处刻意的取舍：
-
-* 纯 Python 实现 AES-256-GCM，不引入第三方依赖——本项目与绿色包都不带 node，
-  也不装 pip 包，而这条链路只在导入账号时跑几次；
-* 密钥只放在**进程内存**里（`_KEY_CACHE`），不落盘、不进日志：找回一次即可
-  反复使用，网关重启后重新找回；keyblob 每次使用前都校验，客户端换钥后内存
-  里的旧钥自动作废。回收只有 Windows 这条路（`hunt_key`），其他平台走
-  `adopt_key`——用户在面板里手工粘贴一次，同样只留在内存里；
-* 内存扫描分三档、命中即止（见 `hunt_key`），不再对每个字节偏移做一次哈希：
-  客户端侧 `atRestSecretKey` 是 44 字符规范 base64，在内存里就是一段孤立的
-  base64 token，正则直接把它捞出来再验一遍即可；只有捞不到时才退回逐窗口
-  哈希，最后才逐字节兜底；
-* 本模块只读，唯一的文件读取是客户端配置目录下的 keyblob，文件名写死，且
-  `keyblob_path()` 会把结果钉回配置目录内。
-"""
 import base64
 import hashlib
 import hmac
@@ -46,7 +10,7 @@ import sys
 import threading
 import time
 
-#: 信封字段名（`{"$wbEncrypted": 1, "envelope": "..."}`）
+#: 信封字段名，取值形如 `{"$wbEncrypted": 1, "envelope": "⋯⋯"}`。
 ENVELOPE_KEY = "$wbEncrypted"
 
 FRAMING_MAGIC = {"file": "WBEF1", "field": "WBEV1", "record": "WBER1", "stream": "WBES1"}
@@ -54,20 +18,20 @@ FRAMING_CODE = {"file": 1, "field": 2, "record": 3, "stream": 4}
 SCHEME = "sym-v1"
 SUITE = 1
 
-#: keyblob 文件名（客户端配置目录下，写死，不接收调用方给的路径）
+#: keyblob 文件名，固定在客户端配置目录下，不接收调用方给的路径。
 KEYBLOB_NAME = "keyblob"
 
 
 class AtRestError(RuntimeError):
-    """解密链路的可预期失败（缺文件、密钥不对、进程内存找不到密钥…）。"""
+    """解密链路的可预期失败：缺文件、密钥不对、进程内存找不到密钥等。"""
 
 
 # --------------------------------------------------------------- 受限路径
 def _safe_path(base, name):
     """把 `name` 限制在 `base` 目录内，返回规范化后的绝对路径。
 
-    三道闸：逐段拒绝 `..`、只取文件名（丢掉任何目录成分）、规范化后要求父目录
-    正好等于 base。因此调用方给什么都出不了这个目录。
+    三段校验：拒绝 `..` 段，只取文件名并丢掉目录成分，规范化后要求父目录
+    正好等于 base。调用方给任何名字都无法离开这个目录。
     """
     raw = str(name).replace("\\", "/")
     if ".." in [seg for seg in raw.split("/") if seg]:
@@ -93,7 +57,7 @@ def _u32(value):
 
 
 def aad(key_id, suite, framing):
-    """AAD 必须逐字节对齐客户端，否则 GCM 校验必然失败。"""
+    """AAD 必须与客户端逐字节一致，否则 GCM 校验必然失败。"""
     if framing not in FRAMING_MAGIC:
         raise AtRestError("unknown framing %r" % (framing,))
     return b"".join((
@@ -104,23 +68,23 @@ def aad(key_id, suite, framing):
 
 
 def derive_key_id(key):
-    """protectorKeyId / envelope.keyId 的算法：sha256(key) 的前 16 个 hex。"""
+    """protectorKeyId 与 envelope.keyId 的算法：取 sha256 密钥的前 16 个 hex 字符。"""
     return hashlib.sha256(key).hexdigest()[:16]
 
 
 def is_envelope(value):
-    """是不是一个 `$wbEncrypted` 信封（而不是明文 token）。"""
+    """判断值是否为 `$wbEncrypted` 信封；明文 token 返回 False。"""
     if isinstance(value, dict):
         return isinstance(value.get("envelope"), str) and ENVELOPE_KEY in value
     if isinstance(value, str):
-        # 老版本曾把整个信封 JSON 序列化成字符串塞进字段里
+        # 整段信封 JSON 也可能被序列化成字符串写进字段。
         stripped = value.lstrip()
         return stripped.startswith("{") and ENVELOPE_KEY in stripped[:64]
     return False
 
 
 def parse_envelope(value):
-    """把 envelope（base64 字符串或 `$wbEncrypted` 字典）拆成 GCM 三段。"""
+    """把 base64 字符串或 `$wbEncrypted` 字典形式的 envelope 拆成 GCM 三段。"""
     if isinstance(value, dict):
         value = value.get("envelope") or ""
     try:
@@ -152,8 +116,8 @@ def open_envelope(key, value, framing):
 def decrypt_field(key, value):
     """解密一个可能加密、也可能本来就是明文的字段。
 
-    返回明文 `str`；空值返回 ""；非字符串且非信封的值返回 None，交给调用方决定
-    怎么回退（例如国内版昵称可以退回 UID 前缀）。
+    返回明文 `str`；空值返回 ""；非字符串且非信封的值返回 None，由调用方
+    决定回退方式，例如国内版昵称可以退回 UID 前缀。
     """
     if value is None or value == "":
         return ""
@@ -198,7 +162,7 @@ def _mix_columns(s):
 
 
 class _AES256(object):
-    """AES-256 分组加密（GCM 只需要正向加密）。状态按列主序排成 16 字节。"""
+    """AES-256 分组加密，GCM 只需要正向加密。状态按列主序排成 16 字节。"""
 
     __slots__ = ("_w",)
 
@@ -238,7 +202,7 @@ _REDUCTION = 0xE1000000000000000000000000000000
 
 
 def _gf_mul(x, y):
-    """GF(2^128) 乘法（GCM 的块哈希），约简多项式 x^128+x^7+x^2+x+1。"""
+    """GF(2^128) 乘法，用于 GCM 的块哈希。约简多项式为 x^128+x^7+x^2+x+1。"""
     z = 0
     v = y
     for i in range(128):
@@ -295,7 +259,7 @@ def _gcm_open(key, nonce, aad_bytes, ciphertext, tag):
 def seal(key, plaintext, framing, key_id=None, nonce=None):
     """把明文封成 `$wbEncrypted` 信封。
 
-    生产链路只需要解密，这个函数是给它做自检与单测用的（也顺带把格式写清楚）。
+    生产链路只需要解密。这个函数用于自检与单测，同时也把信封格式写清楚。
     """
     if isinstance(plaintext, str):
         plaintext = plaintext.encode("utf-8")
@@ -318,18 +282,18 @@ def seal(key, plaintext, framing, key_id=None, nonce=None):
 
 
 # ------------------------------------------------------------------ keyblob
-#: 桌面客户端的配置目录候选（keyblob 所在）。与 wb_proxy.read_product_config_models
-#: 的口径一致：国际版装在 ~/.workbuddy-ai，国内版装在 ~/.workbuddy；不同版本
-#: 的安装器两者都可能写，所以按存在性探测而不是写死一个。
+#: 桌面客户端的配置目录候选，keyblob 位于其中。与 wb_proxy.read_product_config_models
+#: 的判定一致：国际版装在 ~/.workbuddy-ai，国内版装在 ~/.workbuddy。不同版本的
+#: 安装器两者都可能写入，因此按存在性探测，不固定为一个目录。
 CONFIG_DIR_CANDIDATES = (".workbuddy-ai", ".workbuddy")
 
 
 def config_dir():
-    """客户端配置目录（keyblob 所在）。可用环境变量指向便携版的位置。
+    """客户端配置目录，即 keyblob 所在目录。可用环境变量指向便携版位置。
 
-    未设环境变量时按 CONFIG_DIR_CANDIDATES 顺序取第一个存在 keyblob 的目录
-    （兼容 `~/.workbuddy-ai` 的新版安装布局）；都不存在时回落到第一个候选，
-    让 load_keyblob() 报出常规的「keyblob 不存在」而不是这里的探测细节。
+    未设环境变量时，按 CONFIG_DIR_CANDIDATES 顺序取第一个存在 keyblob 的目录，
+    兼容 `~/.workbuddy-ai` 与 `~/.workbuddy` 两种安装布局；都不存在时返回第一个
+    候选，让 load_keyblob() 报出「keyblob 不存在」，不在这里暴露探测细节。
     """
     env = (os.environ.get("WORKBUDDY_CONFIG_DIR")
            or os.environ.get("CODEBUDDY_CONFIG_DIR"))
@@ -344,17 +308,17 @@ def config_dir():
 
 
 def keyblob_path():
-    """固定为 <配置目录>/keyblob —— 文件名写死，调用方无法指向别处。"""
+    """固定为 <配置目录>/keyblob，文件名固定，调用方无法指向别处。"""
     return _safe_path(config_dir(), KEYBLOB_NAME)
 
 
 def load_keyblob():
-    """读取客户端的 keyblob（固定路径，见 keyblob_path）。"""
+    """读取客户端的 keyblob，路径固定，见 keyblob_path。"""
     path = keyblob_path()
     if not os.path.isfile(path):
         raise AtRestError("keyblob 不存在：%s（桌面客户端没装或没登录过？）" % path)
     try:
-        with open(path, encoding="utf-8") as fh:      # 路径已由 keyblob_path 钉在配置目录内
+        with open(path, encoding="utf-8") as fh:      # 路径已由 keyblob_path 限制在配置目录内
             return json.load(fh)
     except AtRestError:
         raise
@@ -389,16 +353,16 @@ def unwrap_keyblob(key):
 #
 # 三档扫描，命中即止，内存段按字节数均分给多个进程并行扫：
 #
-#   1) 密钥载荷：客户端把 atRestSecretKey 当成 44 字符的规范 base64 传递
-#      （`isCanonical32ByteBase64`），JSON.parse 之后它在内存里就是一段孤立的
-#      base64 token。正则匹配走 C 层（约 200 MB/s/进程），每个候选只做两次
-#      sha256，比逐窗口哈希快两个数量级；
-#   2) stride=8 逐窗口哈希：原生 Buffer 至少 16 字节对齐，先按 8 字节栅格找，
-#      命中率极高又快 8 倍；
-#   3) stride=1 逐窗口哈希：兜底，保证不漏。
+#   1) 密钥载荷：客户端把 atRestSecretKey 当成 44 字符的规范 base64 传递，
+#      `isCanonical32ByteBase64` 是其判据。JSON.parse 之后它在内存里是一段
+#      孤立的 base64 token。正则匹配走 C 层，约 200 MB/s/进程，每个候选只做
+#      两次 sha256，比逐窗口哈希快两个数量级；
+#   2) stride=8 逐窗口哈希：原生 Buffer 按至少 16 字节边界分配，先按 8 字节
+#      栅格找，命中率很高，速度也快 8 倍；
+#   3) stride=1 逐窗口哈希：最后手段，保证不漏。
 #
-# 第 1 档的候选同样要过 keyblob 的 GCM 解封校验（unwrap_keyblob）才采信，
-# 校验不过就当没找到、继续往后扫，所以快档不会引入误判。
+# 第 1 档的候选同样要过 keyblob 的 GCM 解封校验 `unwrap_keyblob` 才采信；
+# 校验不过就当没找到，继续往后扫，因此快档不会引入误判。
 CHUNK = 4 << 20
 OVERLAP = 31
 #: 分片粒度：把大段切开再分给各进程，否则一个 V8 大堆会把负载全压在单个进程上
@@ -406,17 +370,17 @@ SLICE = 64 << 20
 MODE_LITERAL = "literal"
 MODE_SECRET = "secret"
 MODE_WINDOW = "window"
-#: 扫描子进程的入口参数（见 _worker_cli）
+#: 扫描子进程的入口参数，见 _worker_cli。
 WORKER_FLAG = "--scan-worker"
 
-#: 密钥载荷的字段名（客户端 `parseKeyPayload` 认的那个键），直接按字面量找
+#: 密钥载荷的字段名，客户端 `parseKeyPayload` 认这个键，直接按字面量查找。
 _LITERAL_PLAIN = b"atRestSecretKey"
 _LITERAL_UTF16 = b"a\x00t\x00R\x00e\x00s\x00t\x00S\x00e\x00c\x00r\x00e\x00t\x00K\x00e\x00y\x00"
-#: 44 字符规范 base64（32 字节 + 一个 '='）
+#: 44 字符规范 base64：32 字节加一个 '='。
 _B64_44 = re.compile(rb"[A-Za-z0-9+/]{43}=")
 
-#: 44 字符规范 base64，且前后不能再接 base64 字符——否则一张 data-url 图片里
-#: 就能切出上百万个候选。JS 字符串是 UTF-16，所以两种排布都找。
+#: 44 字符规范 base64，且前后不能再接 base64 字符；否则一张 data-url 图片里
+#: 就能切出上百万个候选。JS 字符串是 UTF-16，因此两种排布都找。
 _SECRET_PATTERNS = (
     (re.compile(rb"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{43}=(?![A-Za-z0-9+/=])"), False),
     (re.compile(rb"(?<![A-Za-z0-9+/]\x00)(?:[A-Za-z0-9+/]\x00){43}=\x00(?![A-Za-z0-9+/=]\x00)"), True),
@@ -487,12 +451,12 @@ def _list_procs():
 
 
 #: 桌面客户端主进程的候选 exe 名。不同版本的安装器叫法不同：有 WorkBuddy.exe，
-#: 也有 WorkBuddyAI.exe（如 F:\workBuddy\WorkBuddyAI\ 这类默认布局）。
+#: 也有 WorkBuddyAI.exe，例如 F:\workBuddy\WorkBuddyAI\ 这类默认布局。
 DESKTOP_EXE_CANDIDATES = ("workbuddy.exe", "workbuddyai.exe")
 
 
 def _main_pids(exe_names=DESKTOP_EXE_CANDIDATES):
-    """Electron 主进程 = 父进程不是同一个 exe 的那个（其余是渲染进程）。"""
+    """Electron 主进程是父进程不属于候选 exe 集合的那个进程，其余为渲染进程。"""
     if isinstance(exe_names, str):
         exe_names = (exe_names,)
     wanted = {name.lower() for name in exe_names}
@@ -524,9 +488,9 @@ def _private_regions(handle):
 
 
 def _scan_regions(job):
-    """在若干内存段里找密钥。job = (pid, regions, key_id, mode, stride)。
+    """在若干内存段里找密钥。job 为 pid、regions、key_id、mode、stride 五元组。
 
-    job 也来自扫描子进程（JSON，所以 regions 是 list），两种形状都能吃。
+    job 也可能来自扫描子进程，JSON 里的 regions 是 list，两种形状都支持。
     """
     pid, regions, key_id, mode, stride = job
     win = _win32()
@@ -575,7 +539,7 @@ def _scan_regions(job):
                                 hits.append((start + match.start(), key.hex()))
                                 return hits
                 else:
-                    # 对齐栅格按绝对地址算，跨 chunk 也不会错位
+                    # 栅格起点按绝对地址计算，跨 chunk 也不会错位。
                     first = (-start) % stride
                     view = memoryview(data)
                     for i in range(first, len(data) - 31, stride):

@@ -425,29 +425,51 @@ class PanelModelListTests(unittest.TestCase):
                 return item
         self.fail("%s not in the panel list" % mid)
 
-    def test_excluded_models_are_listed_without_being_disabled(self):
+    def test_excluded_models_start_switched_off(self):
         payload = self.view(realm="intl")
         self.assertEqual(payload["source"], "server")
         for mid in self.EXCLUDED:
             item = self.row(payload, mid)
             self.assertTrue(item["excluded"], mid)
-            self.assertTrue(item["enabled"], mid)
+            self.assertFalse(item["enabled"], mid)
+            self.assertFalse(wb_settings.model_served(P.ACCOUNTS_DIR, mid), mid)
         served = self.row(payload, "grok-4.7")
         self.assertTrue(served["enabled"])
         self.assertFalse(served["excluded"])
-        # Reading the panel must not change which models receive traffic.
-        self.assertEqual(wb_settings.disabled_models(P.ACCOUNTS_DIR), [])
+        self.assertEqual(
+            sorted(m.lower() for m in wb_settings.disabled_models(P.ACCOUNTS_DIR)),
+            sorted(m.lower() for m in self.EXCLUDED))
 
-    def test_an_excluded_model_can_be_switched_off(self):
+    def test_a_checked_excluded_model_stays_checked(self):
+        """操作者重新勾选后，下一次加载不会又被默认排除关掉。"""
         self.view(realm="intl")
-        wb_settings.set_disabled_models(P.ACCOUNTS_DIR, ["deepseek-v4.1-flash-sg"])
+        keep = [m for m in wb_settings.disabled_models(P.ACCOUNTS_DIR)
+                if m != "deepseek-v4.1-flash-sg"]
+        wb_settings.set_disabled_models(P.ACCOUNTS_DIR, keep)
         payload = self.view(realm="intl")
         item = self.row(payload, "deepseek-v4.1-flash-sg")
         self.assertTrue(item["excluded"])
-        self.assertFalse(item["enabled"])
-        wb_settings.set_disabled_models(P.ACCOUNTS_DIR, [])
+        self.assertTrue(item["enabled"])
+        self.assertTrue(wb_settings.model_served(P.ACCOUNTS_DIR,
+                                                 "deepseek-v4.1-flash-sg"))
+        self.assertNotIn("deepseek-v4.1-flash-sg",
+                         wb_settings.disabled_models(P.ACCOUNTS_DIR))
+
+    def test_virtual_aliases_are_default_denied_and_can_be_enabled(self):
         payload = self.view(realm="intl")
-        self.assertTrue(self.row(payload, "deepseek-v4.1-flash-sg")["enabled"])
+        aliases = ("default-model", "fast-model", "balanced-model",
+                   "primary-model", "deep-model")
+        for mid in aliases:
+            item = self.row(payload, mid)
+            self.assertTrue(item["excluded"], mid)
+            self.assertFalse(item["enabled"], mid)
+        keep = [m for m in wb_settings.disabled_models(P.ACCOUNTS_DIR)
+                if m != "fast-model"]
+        wb_settings.set_disabled_models(P.ACCOUNTS_DIR, keep)
+        payload = self.view(realm="intl")
+        self.assertTrue(self.row(payload, "fast-model")["enabled"])
+        self.assertTrue(wb_settings.model_served(P.ACCOUNTS_DIR, "fast-model"))
+        self.assertFalse(self.row(payload, "balanced-model")["enabled"])
 
     def test_refresh_reports_whether_the_server_answered(self):
         payload = self.view(realm="intl", refresh="1")

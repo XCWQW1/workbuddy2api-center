@@ -1,16 +1,9 @@
-"""wb_tasks.py —— 国内版成长任务与日常福利全自动完成引擎
-
-包含功能：
-1. 成长任务查询、批量接取 (accept)、构造事件上报点亮 (report)、领奖入账 (claim)。
-2. 连续打卡 (streak) 与能量 (energy) 余额查询。
-3. 猫猫旅行 (buddy travel) 状态查询、自动派出与自动领奖。
-4. 严格遵守 >= 1.0s 防风控间隔，并使用 wb_fingerprint 的稳定设备指纹。
-"""
 import json
 import re
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 import wb_accounts as _accounts
 import wb_identity
@@ -18,8 +11,7 @@ import wb_identity
 CHAT_BASE = "https://copilot.tencent.com"
 BILL_BASE = "https://www.codebuddy.cn"
 WEB_BASE = "https://www.workbuddy.cn"
-#: 本模块只跑国内版，桌面端 UA 与 wb_identity 同一来源，避免两处各写一份
-#: 版本号（国际版 5.8.4 时就漏改过一份）。
+#: 本模块只跑国内版，桌面端 UA 与 wb_identity 共用同一来源，避免两处版本号不一致。
 DESKTOP_UA = wb_identity.DESKTOP_UA_CN
 WEB_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 
@@ -28,11 +20,10 @@ _log = lambda msg: None
 
 
 def set_logger(fn):
-    """Route task diagnostics to the caller's logger.
+    """把任务诊断输出接到调用方提供的日志函数。
 
-    The growth endpoints swallow their errors so one dead endpoint cannot
-    abort a whole cycle. Without a logger those failures are invisible, and an
-    upstream change looks identical to "no tasks today".
+    成长接口会吞掉自己的失败，避免单个端点挂掉中断整轮；没有日志时这些失败
+    完全不可见，上游改版与「今天没有任务」看起来一模一样。
     """
     global _log
     _log = fn or (lambda msg: None)
@@ -54,8 +45,9 @@ TASK_SPECS = {
     "black_cat": {"kind": "cat", "target": 3, "reward": 100, "name": "夜猫子任务 (23:00-08:00)"},
     "RichMeow_Chat": {"kind": "richmeow", "target": 1, "reward": 100, "name": "桌面对话事件链"},
     "Library_read": {"kind": "library", "target": 1, "reward": 100, "name": "浏览资料库"},
-    # first_buddy 是 auto 类（上游不接受接取），完成后领奖才发放 Buddy 实例；
-    # 它是所有 single 任务与猫猫旅行的前置（"prerequisite not met: first_buddy"）。
+    # first_buddy 是 auto 类任务，上游不接受接取；完成并领奖后才发放 Buddy
+    # 实例，它是所有 single 任务与猫猫旅行的前置，缺它时上游回
+    # "prerequisite not met: first_buddy"。
     "first_buddy": {"kind": "chat", "target": 1, "reward": 300, "name": "领取一只 Buddy"},
     "wb_wechat_oa_subscribe_task": {"unforgeable": True, "reward": 100,
                                     "reason": "需在微信关注「腾讯 WorkBuddy」公众号满 24 小时",
@@ -64,11 +56,11 @@ TASK_SPECS = {
 }
 
 # ---------------------------------------------------------------------------
-# 逆向修复常量 (2026-09 实测校准)
+# 桌面端行为常量，2026-09 实测校准
 # ---------------------------------------------------------------------------
-# 这些任务上游只认桌面客户端的真实行为信号 (jump_url 均为 workbuddy:// 深链,
-# 需要真实点击进入对应页面)。伪造 /v2/report 事件会被忽略或落到 heartbeat,
-# 进度永远是 0/1, claim 必然返回 400 "task not completed"。诚实地跳过并给出深链。
+# 这些任务上游只认桌面客户端的真实行为信号，jump_url 均为 workbuddy:// 深链，
+# 需要真实点击进入对应页面。伪造 /v2/report 事件会被忽略或落到 heartbeat，
+# 进度停在 0/1，claim 返回 400 "task not completed"，因此跳过并给出深链。
 DESKTOP_ONLY_TASKS = {
     "RichMeow_Chat": "在桌面端发起 1 次对话",
     "Library_read": "在桌面端打开「资料库」并读完介绍文档",
@@ -76,7 +68,7 @@ DESKTOP_ONLY_TASKS = {
     "Buddy_App_QQ": "在桌面端「发现应用」进入「企鹅教师助手」",
 }
 
-# 夜猫子任务只在 23:00-08:00 上报才计数, 且每天 1 次、累计 3 天。
+# 夜猫子任务只在 23:00-08:00 上报才计数，且每天 1 次、累计 3 天。
 NIGHT_TASK_CODES = {"black_cat"}
 
 def cst_now():
@@ -88,9 +80,9 @@ def in_night_window():
     h = cst_now().tm_hour
     return h >= 23 or h < 8
 
-# 专家/团队事件必须彼此不同: 桌面端 appendGrowthEvent 按 (eventCode, id) 去重,
-# 上游同样只按不同 id 累加进度 —— 重复发同一个 id 进度永远不动。
-# 下列 id 已在 2026-09 实测中验证可推进任务进度。
+# 专家/团队事件必须彼此不同：桌面端 appendGrowthEvent 按 eventCode 与 id 去重，
+# 上游同样只按不同 id 累加进度，重复发同一个 id 进度不变。
+# 以下 id 已在 2026-09 实测中验证可推进任务进度。
 EXPERT_ID_POOL = [
     ("ex_PZw8Gu81HfN4", "运维工程师"), ("ex_ROsDtJbzADFV", "产品经理"),
     ("ex_SMUnl0nJbPix", "UI设计师"), ("ex_ZTR062oVBOCW", "数据分析师"),
@@ -102,7 +94,7 @@ EXPERT_ID_POOL = [
     ("ex_NX5C8GBciVed", "测试架构师"), ("ex_DdCsaoq4AtcO", "云端运维专家"),
     ("ex_KzqKQguubrNQ", "内容创作专家"), ("ex_2cvvUZQhDyeJ", "腾讯轻量云专家"),
 ]
-# 团队 id 来自官方专家清单 expert_center.json (expertType=team, 共 53 个),
+# 团队 id 来自官方专家清单 expert_center.json，expertType=team，共 53 个；
 # 前 3 个已在 2026-09 实测验证可推进 Expert_team_use_3。
 TEAM_ID_POOL = [
     ("CloudOpsTeam", "运维专家团队"), ("CloudContentTeam", "内容专家团队"),
@@ -196,7 +188,7 @@ def fetch_growth_summary(account):
 
 
 def fetch_streak_days(account):
-    """只读查询账号当前连续打卡天数（GET /activity/growth/streak）。
+    """只读查询账号当前连续打卡天数，接口为 GET /activity/growth/streak。
 
     失败返回 None，不发写请求。供对话活跃上报后回显连登天数使用。
     """
@@ -214,11 +206,10 @@ def fetch_streak_days(account):
 def accept_tasks(account, codes, chunk=20):
     """批量接取任务。
 
-    上游按批返回 results, 单个任务可能 status=accepted / already_accepted /
-    其它失败原因。过去这里只返回 bool 且吞掉异常, 接取失败时上层完全看不见,
-    于是后续上报的事件全部作用在未接取的任务上 —— 进度永远 0, 领奖必然
-    "task not completed", 表现就是"接取了一堆但一个都没点亮"。
-    现在返回 {"ok": bool, "accepted": [...], "failed": [...], "msg": str}。
+    上游按批返回 results，单个任务可能 status=accepted / already_accepted /
+    其它失败原因。返回 {"ok": bool, "accepted": [...], "failed": [...],
+    "msg": str}，上层据此判断是否值得继续上报事件：未接取任务上的上报不会
+    计入进度，领奖时上游回 "task not completed"。
     """
     out = {"ok": True, "accepted": [], "failed": [], "msg": "", "reasons": []}
     if not codes:
@@ -285,7 +276,8 @@ def claim_task(account, code):
             if d.get("code") == 0:
                 data = d.get("data") or {}
                 return {"ok": True, "credit": data.get("credit", 0), "energy": data.get("energy", 0)}
-            # 200 + 非0码 (典型: 400 task not completed —— 进度还没落账就来领奖)
+            # 200 响应但 code 非 0，典型是进度还没落账就来领奖，
+            # 上游回 task not completed。
             _log(f"task {code} claim rejected: {d.get('msg')}")
             return {"ok": False, "credit": 0, "energy": 0, "msg": d.get("msg") or f"code={d.get('code')}"}
     except urllib.error.HTTPError as exc:
@@ -330,8 +322,8 @@ def claim_task(account, code):
 def build_event(account, kind, idx=0, expert=None):
     """构造指定类型的真实规范事件数据。
 
-    expert: (expert_id, expert_name) —— 专家/团队类事件必须每次使用不同的 id,
-    上游按 (eventCode, id) 去重, 重复 id 不会推进任务进度。
+    expert 是 expert_id 与 expert_name 组成的元组。专家/团队类事件必须每次
+    使用不同的 id，上游按 eventCode 与 id 去重，重复 id 不会推进任务进度。
     """
     now = int(time.time() * 1000)
     cid = f"wb-task-{now}-{idx}"
@@ -399,9 +391,9 @@ def build_event(account, kind, idx=0, expert=None):
 def report_events(account, events, base=None):
     """向上游上报事件数组。
 
-    默认发 copilot.tencent.com (chat 侧) —— 与桌面客户端真实上报地址一致
-    (桌面 NetLog: POST https://copilot.tencent.com/v2/report), 2026-09 实测
-    该侧事件会实时推进成长任务进度。
+    默认发往 copilot.tencent.com 的 chat 侧，与桌面客户端的真实上报地址
+    一致，即 POST https://copilot.tencent.com/v2/report；2026-09 实测该侧
+    事件会实时推进成长任务进度。
     """
     if base is None:
         base = CHAT_BASE
@@ -428,7 +420,7 @@ def _travel_status(account):
 def ensure_buddy(account, gap=1.0):
     """确保账号已领到 Buddy 实例：没有则完成并领取 first_buddy。
 
-    first_buddy 是 auto 类任务，其奖励（reward_buddy）就是 Buddy 实例；
+    first_buddy 是 auto 类任务，其奖励字段 reward_buddy 就是 Buddy 实例；
     single 任务与猫猫旅行都以它为前提。返回是否已就绪。
     """
     tasks = fetch_growth_tasks(account)
@@ -444,7 +436,7 @@ def ensure_buddy(account, gap=1.0):
 
 
 def _travel_depart(account, lid):
-    """派出旅行；返回 (data, err)。成功 data 为响应 data，失败 err 为上游 msg。"""
+    """派出旅行；返回 data 与 err 两个值。成功时 data 为响应 data，失败时 err 为上游 msg。"""
     body = json.dumps({"location_id": lid}).encode("utf-8")
     req = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/depart",
                                  data=body, method="POST", headers=account.headers("chat"))
@@ -470,7 +462,7 @@ def _travel_depart(account, lid):
 
 
 def do_cat_travel(account):
-    """检查并执行猫猫旅行 (领奖 / 派出)。"""
+    """检查并执行猫猫旅行，含领奖与派出。"""
     if getattr(account, "is_enterprise", lambda: False)():
         return {"ok": True, "action": "skip", "msg": "企业版账号无成长体系，跳过"}
     headers = account.headers("chat")
@@ -482,7 +474,7 @@ def do_cat_travel(account):
 
     state = st.get("state")
     if state == "arrived":
-        # 领奖 (官方前端: POST travel/claim body {})
+        # 领奖，官方前端为 POST travel/claim，body 是 {}。
         req_cl = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/claim", data=b"{}", method="POST", headers=headers)
         try:
             with _accounts.urlopen(req_cl, timeout=10, proxy=account.proxy) as resp:
@@ -496,8 +488,8 @@ def do_cat_travel(account):
     if state == "idle":
         if st.get("daily_limit_reached"):
             return {"ok": True, "action": "idle", "msg": "猫猫今日已完成旅行，明日 00:00 刷新"}
-        # 派出旅行: 官方前端要求 body 携带 {location_id} (目的地清单在
-        # travel/config) —— 空 body 会被拒 400 "invalid request"。
+        # 派出旅行：官方前端要求 body 携带 location_id，目的地清单在
+        # travel/config；空 body 会被拒 400 "invalid request"。
         lid = None
         try:
             req_cfg = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/config", headers=headers)
@@ -510,9 +502,9 @@ def do_cat_travel(account):
             _log(f"buddy/travel/config query failed: {exc}")
         if lid is None:
             lid = 1
-        # 状态里的 buddy_id 是"当前旅行实例"的 id，猫在家 (idle) 时恒为 0，
+        # 状态里的 buddy_id 是当前旅行实例的 id，猫在家即 idle 时恒为 0，
         # 不能拿它判断有没有 Buddy。以 depart 的 "no active buddy" 为准：
-        # 先直接派，失败再补齐 first_buddy（其奖励即 Buddy 实例）重试一次。
+        # 先直接派，失败再补齐 first_buddy 并重试一次，其奖励即 Buddy 实例。
         data, err = _travel_depart(account, lid)
         if data is None and "no active buddy" in (err or "").lower():
             if ensure_buddy(account):
@@ -534,7 +526,7 @@ def do_cat_travel(account):
 def _progress_one(account, t, logs, gap):
     """推进单个任务并返回本次到账积分。
 
-    auto 类任务不需要接取（上游 "task does not require acceptance"），事件可
+    auto 类任务不需要接取，上游回 "task does not require acceptance"，事件可
     直接点亮；single 类未接取时上报不计进度，跳过等接取成功。
     """
     code = t["task_code"]
@@ -551,9 +543,9 @@ def _progress_one(account, t, logs, gap):
     if status == "claimed":
         return 0
 
-    # 已完成的任务先领奖 —— 桌面端/夜间任务也可能被真实操作完成
-    # (例如用户自己在桌面端用了一次, 或夜里调度器点亮了), 这类任务必须
-    # 先结算, 不能因为"只能靠真实操作"就直接跳过丢掉奖励。
+    # 已完成的任务先领奖：桌面端/夜间任务也可能被真实操作完成，例如用户
+    # 自己在桌面端用了一次，或夜里调度器点亮了。这类任务必须先结算，
+    # 不能因为只能靠真实操作就直接跳过丢掉奖励。
     if status == "completed" or cur >= tgt:
         res = claim_task(account, code)
         if res.get("ok"):
@@ -565,26 +557,26 @@ def _progress_one(account, t, logs, gap):
         time.sleep(gap)
         return 0
 
-    # 只认桌面端真实行为的任务: 伪造事件不会推进进度, 诚实跳过并给出深链。
+    # 只认桌面端真实行为的任务：伪造事件不会推进进度，跳过并给出深链。
     if code in DESKTOP_ONLY_TASKS:
         jump = t.get("jump_url") or "workbuddy://chat"
         logs.append(f"⏭ 任务 [{spec['name']}] 需真实操作完成: {DESKTOP_ONLY_TASKS[code]}"
                     f" (深链 {jump}), 跳过事件伪造")
         return 0
 
-    # 夜猫子任务只在 23:00-08:00 计数 (每日 01:00 调度器也会自动执行)
+    # 夜猫子任务只在 23:00-08:00 计数，每日 01:00 调度器也会自动执行。
     if code in NIGHT_TASK_CODES and not in_night_window():
         logs.append(f"🌙 任务 [{spec['name']}] 仅 23:00-08:00 上报计数, 当前不在窗口, 跳过"
                     f" (每日 01:00 调度器自动执行, 累计 3 天)")
         return 0
 
     if status == "not_accepted" and t.get("task_type") != "auto":
-        # 接取没成功就上报是白费功夫: 上游只对已接取的任务累计进度。
+        # 接取没成功就上报没有效果，上游只对已接取的任务累计进度。
         logs.append(f"⏭ 任务 [{spec['name']}] 仍未接取, 跳过 (先解决接取失败)")
         return 0
 
-    # 需点亮上报 —— 专家/团队事件必须使用互不相同的 id, 否则上游按
-    # (eventCode, id) 去重, 进度永远不动。
+    # 需要点亮上报：专家/团队事件必须使用互不相同的 id，否则上游按
+    # eventCode 与 id 去重，进度不会变化。
     need = max(1, tgt - cur)
     kind = spec.get("kind")
     logs.append(f"正在点亮任务 [{spec['name']}] (需上报 {need} 次)...")
@@ -606,8 +598,8 @@ def _progress_one(account, t, logs, gap):
         logs.append(f"! 任务 [{spec['name']}] 部分事件上报失败 (上游拒绝), 继续尝试领奖")
     time.sleep(1.5)
 
-    # 等上游把进度落账再领奖。进度通常 1-3 秒就可见, 因此先快查几次;
-    # 只有确实在动才继续等, 免得每个卡住的任务都空等 20 秒 (整轮要几分钟)。
+    # 等上游把进度落账再领奖。进度通常 1-3 秒就可见，因此先快查几次；
+    # 只有确实在动才继续等，免得每个卡住的任务都空等 20 秒，整轮要几分钟。
     prog = cur
     for attempt in range(6):
         fresh = next((x for x in fetch_growth_tasks(account) if x["task_code"] == code), None)
@@ -616,7 +608,7 @@ def _progress_one(account, t, logs, gap):
             if prog >= tgt or fresh.get("status") in ("completed", "claimed"):
                 break
             if prog > cur:
-                # 已经在涨了, 值得多等一会儿
+                # 进度已经在涨，值得多等一会儿。
                 time.sleep(2.5)
                 continue
         if attempt < 2:
@@ -628,7 +620,6 @@ def _progress_one(account, t, logs, gap):
         time.sleep(gap)
         return 0
 
-    # 领奖
     res = claim_task(account, code)
     if res.get("ok"):
         cr = res.get("credit", 0)
@@ -648,7 +639,7 @@ def run_growth_tasks(account, gap=1.0):
         return {"ok": True, "msg": "企业版账号无成长体系，跳过", "logs": []}
 
     logs = []
-    logs.append(f"开始为账号 {account.nickname or account.uid[:8]} 运行成长任务自动化...")
+    logs.append(f"开始为账号 {account.nickname or account.uid[:8]} 运行成长任务自动化")
     tasks = fetch_growth_tasks(account)
     if not tasks:
         logs.append("未能获取到任务清单，请检查网络或账号状态")
@@ -656,21 +647,21 @@ def run_growth_tasks(account, gap=1.0):
 
     total_earned = 0
 
-    # 0. auto 类任务（如 first_buddy）不需要接取，且可能是其他任务与猫猫旅行
-    #    的前置：必须先把它们点亮并领奖（first_buddy 的奖励就是 Buddy 实例），
+    # 0. auto 类任务如 first_buddy 不需要接取，且可能是其他任务与猫猫旅行的
+    #    前置：必须先把它们点亮并领奖，first_buddy 的奖励就是 Buddy 实例，
     #    否则 single 任务接取会报 "prerequisite not met: first_buddy"。
     for t in tasks:
         if t.get("task_type") == "auto":
             total_earned += _progress_one(account, t, logs, gap)
 
-    # 1. 批量接取未接任务（auto 类不接受接取，unforgeable 无法自动化）
+    # 1. 批量接取未接任务：auto 类不接受接取，unforgeable 无法自动化。
     def _needs_accept(x):
         return (x["status"] == "not_accepted" and not x.get("unforgeable")
                 and x.get("task_type") != "auto")
 
     unaccepted = [t["task_code"] for t in tasks if _needs_accept(t)]
     if unaccepted:
-        logs.append(f"发现 {len(unaccepted)} 个待接取任务，正在批量接取...")
+        logs.append(f"发现 {len(unaccepted)} 个待接取任务，正在批量接取")
         acc = accept_tasks(account, unaccepted)
         if acc.get("failed"):
             why = acc.get("msg") or ("; ".join(acc.get("reasons") or [])[:160])
@@ -681,11 +672,11 @@ def run_growth_tasks(account, gap=1.0):
             logs.append(f"✓ 已接取 {len(acc['accepted'])} 个任务")
         time.sleep(gap)
         tasks = fetch_growth_tasks(account)
-        # 复核一次: 上游偶尔会瞬时拒绝整个批次, 复查后仍处于未接取的再补一次,
-        # 否则后面所有上报都作用在未接取的任务上 —— 进度全是 0。
+        # 复核一次：上游偶尔会瞬时拒绝整个批次，复查后仍处于未接取的再补一次，
+        # 否则后面所有上报都作用在未接取的任务上，进度全是 0。
         still = [t["task_code"] for t in tasks if _needs_accept(t)]
         if still:
-            logs.append(f"仍有 {len(still)} 个未接取，重试接取一次...")
+            logs.append(f"仍有 {len(still)} 个未接取，重试接取一次")
             retry = accept_tasks(account, still)
             if retry.get("accepted"):
                 logs.append(f"✓ 重试接取成功 {len(retry['accepted'])} 个")
@@ -699,13 +690,13 @@ def run_growth_tasks(account, gap=1.0):
             logs.append(f"! 仍有 {len(still_pending)} 个任务处于未接取状态，"
                         f"对未接取任务上报事件不会计入进度，本轮跳过这些任务")
 
-    # 2. 处理每个任务（auto 已在第 0 步处理过）
+    # 2. 处理每个任务，auto 已在第 0 步处理过。
     for t in tasks:
         if t.get("task_type") == "auto":
             continue
         total_earned += _progress_one(account, t, logs, gap)
 
-    # 3. 顺手检查猫猫旅行
+    # 3. 检查猫猫旅行。
     tr_res = do_cat_travel(account)
     if tr_res.get("msg"):
         logs.append(f"猫猫日常: {tr_res.get('msg')}")
@@ -720,8 +711,8 @@ def run_growth_tasks(account, gap=1.0):
 
 
 def run_night_growth(account):
-    """夜猫子任务 (black_cat): 每日 23:00-08:00 上报 1 次 GLM-5.2 夜间对话事件,
-    每天计 1 次、累计 3 天后可领奖。白天调用会诚实跳过。"""
+    """夜猫子任务 black_cat：每日 23:00-08:00 上报 1 次 GLM-5.2 夜间对话事件，
+    每天计 1 次、累计 3 天后可领奖。白天调用会跳过。"""
     if account.realm != "cn":
         return {"ok": False, "msg": "国际版不适用国内成长任务中心", "logs": [], "earned_credit": 0}
     if getattr(account, "is_enterprise", lambda: False)():
@@ -779,9 +770,9 @@ def run_night_growth(account):
     return {"ok": True, "earned_credit": earned, "logs": logs}
 
 def run_streak_bonus(account):
-    """连登管家：补签保连登 -> 礼包/补偿 -> 连登档位兑换 (7d/14d/28d) -> 自动抽奖闭环。
+    """连登管家：补签保连登、礼包与补偿、连登档位兑换 7d/14d/28d、自动抽奖闭环。
 
-    幂等设计：未解锁/已领/无次数/企业版均安全静默跳过。
+    幂等设计：未解锁、已领、无次数、企业版均安全静默跳过。
     """
     if account.realm != "cn":
         return {"ok": False, "msg": "连登管家仅限国内版账号"}
@@ -800,7 +791,6 @@ def run_streak_bonus(account):
             yesterday_str = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
             y_cell = next((c for c in cells if c.get("date") == yesterday_str), None)
             if y_cell and y_cell.get("score", 0) == 0:
-                # 查是否有补签卡
                 req_st = urllib.request.Request(CHAT_BASE + "/activity/growth/streak", headers=headers)
                 with _accounts.urlopen(req_st, timeout=10, proxy=account.proxy) as st_resp:
                     st_data = json.loads(st_resp.read().decode("utf-8"))
@@ -814,7 +804,7 @@ def run_streak_bonus(account):
     except Exception as exc:
         _log(f"makeup yesterday failed: {exc}")
 
-    # 1. 尝试领新手礼包与补偿 (每号一次，无则业务错误静默)
+    # 1. 尝试领新手礼包与补偿，每号一次，无则业务错误静默。
     b_hdrs = account.headers("billing")
     for path, name in [("/billing/meter/claim-gift", "新手礼包"),
                        ("/billing/meter/claim-compensation", "活动补偿")]:
@@ -840,7 +830,6 @@ def run_streak_bonus(account):
                 "14d": redemp.get("tier_14d_status"),
                 "28d": redemp.get("tier_28d_status"),
             }
-            import uuid
             for t in tiers:
                 tier_name = t.get("tier")
                 status = statuses.get(tier_name)
@@ -859,14 +848,13 @@ def run_streak_bonus(account):
     except Exception as exc:
         _log(f"streak redeem check failed: {exc}")
 
-    # 3. 自动抽奖闭环 (有 chances 则全抽完)
+    # 3. 自动抽奖闭环，有 chances 则全部抽完。
     drawn_count = 0
     try:
         req_lot = urllib.request.Request(CHAT_BASE + "/activity/growth/lottery/summary", headers=headers)
         with _accounts.urlopen(req_lot, timeout=10, proxy=account.proxy) as resp:
             lot_data = json.loads(resp.read().decode("utf-8"))
             chances = (lot_data.get("data") or {}).get("chances", 0)
-            import uuid
             for _ in range(chances):
                 body = json.dumps({"client_token": str(uuid.uuid4())}).encode("utf-8")
                 req_draw = urllib.request.Request(CHAT_BASE + "/activity/growth/lottery/draw",

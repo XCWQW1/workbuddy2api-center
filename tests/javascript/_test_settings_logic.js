@@ -184,4 +184,12 @@ assert.equal(new Set(authTexts).size, 3,
   '有生效密钥 / 没有生效密钥 / 接口不校验，三种状态要给出三种说明: ' + JSON.stringify(authTexts));
 assert.ok(authTexts.every((text) => text && text.trim() !== ''), '认证状态不能空着');
 
+const hours = logic.parseHours('21, 9 21; 05');
+assert.deepEqual(hours, { ok: true, value: [5, 9, 21] }, '去重、排序，逗号/空格/分号都接受');
+assert.equal(logic.hoursText(hours.value), '5, 9, 21');
+assert.deepEqual(logic.parseHours(''), { ok: true, value: [] }, '留空表示这组不跑');
+assert.equal(logic.parseHours('24').ok, false);
+assert.equal(logic.parseHours('abc').ok, false);
+assert.equal(logic.parseHours('-1').ok, false);
+
 console.log('settings logic assertions passed');

@@ -21,7 +21,7 @@
 wb-proxy/
 ├── wb_agents.py               # 核心模块：文本编辑器、注册表、备份还原、公共 API、CLI 入口
 ├── wb_proxy.py                # 路由层：/agents, /agents/cli, /agents/apply, /agents/restore
-├── dashboard.html             # 交互层：智能体配置看板、状态渲染与异步请求
+├── web/                       # 交互层：智能体配置看板、状态渲染与异步请求
 └── accounts/                  # 数据持久化目录（由网关管理）
     ├── integration-state.json # 智能体集成状态账本
     └── agent-backups/         # 备份根目录

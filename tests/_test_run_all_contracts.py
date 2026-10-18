@@ -1,33 +1,3 @@
-"""Contract tests for tests/run_all.py - the runner's reliability promises.
-
-run_all.py owns behavior no single suite can check for itself: a per-suite wall
-clock, tree cleanup when that clock runs out, a failure line that names the real
-error instead of a bare "Node.js v20.20.2", log retention, argument validation,
-and "a pattern that matches nothing is not a pass". Today only the console
-encoding failure mode has dedicated coverage (_test_run_all_encoding.py), so
-every other promise rests on the full CI matrix noticing indirectly.
-
-These tests drive the real runner as a subprocess against throwaway probe
-suites, so each contract is exercised end to end. Nothing is mocked: the failing
-probe really exits non-zero, and the hanging probe really has to be killed.
-
-Isolation: the runner discovers suites next to itself (os.listdir(HERE)), so a
-byte-identical copy of run_all.py is placed in a temporary directory with the
-probe suites beside it. Nothing is ever written into the repository's tests/
-directory, and the copy is compared against the real file first, so these tests
-cannot silently drift away from the code they cover.
-
-Cleanup never asks the code under test for help. The thing under test is exactly
-what may be broken, so the harness starts every sandbox runner in a group it
-owns, keeps the pids it may have to kill outside the disposable scenario
-directory, and terminates the whole tree through the OS (TerminateProcess /
-SIGKILL) rather than through taskkill - a locked-down host refuses that just as
-readily as it refuses the runner's own call.
-
-Run with: python tests/_test_run_all_contracts.py
-No network, no credentials. Every probe file, process and log directory this
-suite creates is removed in a finally block.
-"""
 import ctypes
 import json
 import os
@@ -44,28 +14,25 @@ from ctypes import wintypes
 HERE = os.path.dirname(os.path.abspath(__file__))
 REAL_RUNNER = os.path.join(HERE, "run_all.py")
 
-#: A passing probe writes more lines than the runner keeps in its tail, so the
-#: --logs assertion can tell "the full output" apart from "the last 25 lines".
+#: 通过的探针写出的行数多于 runner 在尾部保留的行数，--logs 断言因此能区分
+#: 完整输出与最后 25 行。
 FILLER_LINES = 40
 
-#: Bounds are deliberately loose: they only have to separate "bounded by
-#: --timeout" from "waited for the probe", which sleeps for ten minutes.
+#: 边界刻意放宽：只需区分被 --timeout 截断与等到探针结束，后者要睡十分钟。
 HANG_TIMEOUT = 5
 HANG_SECONDS = 600
 HANG_BUDGET = 60
 
-#: The bound the harness itself puts on a sandbox runner, far below
-#: HANG_SECONDS on purpose: the harness must never wait for a runner that has
-#: stopped honouring its own wall clock.
+#: 测试框架自身对沙箱 runner 设的上界，刻意远低于 HANG_SECONDS：runner 一旦
+#: 不再遵守自己的挂钟，测试框架绝不能继续等下去。
 SANDBOX_BUDGET = 15
 
-#: The grandchild outlives the check but not the test session, so a host that
-#: refuses the tree kill cannot leave a ten-minute orphan behind.
+#: 孙进程活过本轮检查但活不过整个测试会话，宿主拒绝树杀时也不会留下十分钟
+#: 的孤儿进程。
 ORPHAN_SECONDS = 120
 
-#: The line in run_all.py that applies the per-suite wall clock. The negative
-#: harness check removes it from its own copy, so the runner under test stops
-#: honouring --timeout and only the harness's own bound can end the run.
+#: run_all.py 中施加单套件挂钟的那一行。负向用例把它从自己的副本里删掉，
+#: 被测 runner 于是不再遵守 --timeout，只能由测试框架自身的上界结束运行。
 TIMEOUT_ANCHOR = "code = proc.wait(timeout=timeout)"
 
 _WINDOWS = os.name == "nt"
@@ -90,7 +57,7 @@ if _WINDOWS:
                     ("szExeFile", ctypes.c_char * 260)]
 
     def _process_tree():
-        """{pid: parent pid} straight from the OS - no tasklist, no taskkill."""
+        """{pid: parent pid} 直接取自系统，不调用 tasklist 或 taskkill。"""
         snapshot = _KERNEL32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
         table = {}
         entry = _PROCESSENTRY32()
@@ -103,11 +70,11 @@ if _WINDOWS:
         return table
 
     def alive(pid):
-        """Liveness through the OS, not tasklist.
+        """用系统接口判断存活，不调用 tasklist。
 
-        A locked-down host answers "Access denied" to tasklist and prints
-        nothing, and a helper that greps that output then calls every pid dead.
-        OpenProcess/GetExitCodeProcess answers about the process itself.
+        受限宿主对 tasklist 只回 Access denied 且不打印任何内容，靠解析该
+        输出的辅助函数会把所有 pid 都当成已退出；OpenProcess 与
+        GetExitCodeProcess 直接询问进程本身。
         """
         handle = _KERNEL32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION,
                                        False, pid)
@@ -122,10 +89,10 @@ if _WINDOWS:
             _KERNEL32.CloseHandle(handle)
 
     def terminate_pid(pid):
-        """Kill one pid through the OS, with no shell-out to taskkill.
+        """通过系统接口杀掉单个 pid，不调用 taskkill。
 
-        taskkill is what the runner uses, and the host that refuses it refuses
-        the harness too; the last line of defence cannot be the same call.
+        runner 用的就是 taskkill，拒绝它的宿主同样拒绝测试框架；最后一道
+        防线不能依赖同一个调用。
         """
         handle = _KERNEL32.OpenProcess(_PROCESS_TERMINATE, False, pid)
         if not handle:
@@ -136,7 +103,7 @@ if _WINDOWS:
             _KERNEL32.CloseHandle(handle)
 else:
     def _process_tree():
-        """{pid: parent pid} from /proc, which is where Linux CI lives."""
+        """{pid: parent pid} 取自 /proc，Linux CI 走这条分支。"""
         return _proc_process_tree()
 
     def alive(pid):
@@ -155,23 +122,21 @@ else:
 
 
 def _parse_proc_stat(data):
-    """The parent pid out of one /proc/<pid>/stat line.
+    """从一行 /proc/<pid>/stat 里取出父进程 pid。
 
-    Split on the *last* ')' rather than on whitespace: the command name sits in
-    parentheses and may itself contain spaces and parentheses, and everything
-    after it is fixed-position (state, then ppid).
+    按最后一个 ')' 切分而非按空白切分：命令名位于成对括号中，自身可能含
+    空格和括号，其后字段位置固定，先是 state，再是 ppid。
     """
     rest = data.rsplit(b")", 1)[1].split()
     return int(rest[1])
 
 
 def _proc_process_tree(proc_root="/proc"):
-    """{pid: parent pid} from a /proc-shaped tree.
+    """从 /proc 形状的树里读出 {pid: parent pid}。
 
-    Parameterised on the root so the Linux branch can be exercised from any
-    platform against a synthetic tree, instead of only ever failing on CI. The
-    shape has to match the Windows branch: _descendants() reads one mapping and
-    must not have to know which platform filled it in.
+    根目录作为参数，Linux 分支因此能在任意平台上用合成树验证，而不是只在
+    CI 上失败。返回形状必须与 Windows 分支一致：_descendants 只读一份映射，
+    不应关心它由哪个平台填充。
     """
     try:
         names = [n for n in os.listdir(proc_root) if n.isdigit()]
@@ -188,15 +153,13 @@ def _proc_process_tree(proc_root="/proc"):
 
 
 def _descendants(root, table=None):
-    """Every pid below root, deepest first, with root itself last.
+    """返回 root 之下的全部 pid，先深后浅，root 自身在最后。
 
-    Windows keeps the creator's pid in a child's parent field even after that
-    parent exits, so the walk still finds an orphan whose parent is already
-    gone. On POSIX this needs /proc; without it the caller's group kill is the
-    only tree mechanism, which is why probes register their own pids as well.
+    Windows 在父进程退出后仍保留子进程父字段里的创建者 pid，遍历因此仍能
+    找到父进程已消失的孤儿。POSIX 上这依赖 /proc；没有 /proc 时只有调用方
+    的进程组杀可用，探针因此同时登记自己的 pid。
 
-    `table` is a {pid: parent pid} mapping and exists so the traversal can be
-    tested without the platform it happens to be running on.
+    `table` 是 {pid: parent pid} 映射，让遍历可以脱离当前平台测试。
     """
     if table is None:
         table = _process_tree()
@@ -222,11 +185,10 @@ def _descendants(root, table=None):
 
 
 def new_group_kwargs():
-    """Start a child in its own group/session.
+    """让子进程处于自己的进程组或会话。
 
-    Used twice for the same reason: the harness owns the sandbox runner so it
-    can take that runner's tree back, and run_all.py gives every suite its own
-    group for exactly the same purpose.
+    两处用法目的一致：测试框架把沙箱 runner 收进自己的组，以便收回整棵
+    进程树；run_all.py 给每个套件独立分组也是同一原因。
     """
     if _WINDOWS:
         return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
@@ -234,22 +196,19 @@ def new_group_kwargs():
 
 
 def kill_owned_tree(proc):
-    """Terminate a harness-owned runner and everything under it, then reap.
+    """终止测试框架持有的 runner 及其整棵进程树，然后回收。
 
-    Deliberately independent of the code under test and of taskkill: this is
-    the path that has to work when the runner has stopped honouring its own
-    timeout, and when the host refuses the runner's own tree kill.
+    刻意不依赖被测代码和 taskkill：runner 不再遵守自身超时、宿主拒绝其树杀
+    时，走的正是这条路径。
 
-    It also never raises. It runs on the path where the run has already failed,
-    and an exception here would skip the rest of the cleanup and leave exactly
-    the orphans this function exists to remove.
+    本函数从不抛出异常。它运行在已经失败的路径上，此处抛异常会跳过后续清理，
+    恰好留下本函数要消除的孤儿进程。
     """
     if proc.poll() is not None:
         return
     try:
         if not _WINDOWS:
-            # The runner leads its own session, so its group catches anything
-            # that did not detach into a group of its own.
+            # runner 自领会话，它的进程组能覆盖未另行分离的进程。
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except OSError:
@@ -266,7 +225,7 @@ def kill_owned_tree(proc):
 
 
 def wait_gone(pid, seconds=10.0):
-    """True once the pid is gone; a killed process is not gone instantly."""
+    """pid 消失后返回 True；进程被杀后不会立刻消失。"""
     deadline = time.time() + seconds
     while time.time() < deadline:
         if not alive(pid):
@@ -276,7 +235,7 @@ def wait_gone(pid, seconds=10.0):
 
 
 def read_pids(path, seconds=15.0):
-    """Read a probe's registered pids, waiting for the file to appear."""
+    """读取探针登记的 pid，必要时等待文件出现。"""
     deadline = time.time() + seconds
     while time.time() < deadline:
         try:
@@ -287,10 +246,9 @@ def read_pids(path, seconds=15.0):
     raise AssertionError("the probe never registered its pids in %s" % path)
 
 
-#: A parent that starts a grandchild, registers both pids and then waits. Used
-#: both as the hanging probe and, unmodified, to ask the host what it permits.
-#: The grandchild is given a working directory outside the scenario tree, so a
-#: host that cannot kill it still leaves the scenario directory removable.
+#: 一个父进程：启动孙进程、登记两个 pid，然后等待。它既用作挂起探针，也
+#: 原样用来询问宿主允许什么。孙进程的工作目录设在场景树之外，宿主杀不掉它
+#: 时场景目录仍可删除。
 TREE_PROBE = (
     "import json, os, subprocess, sys, tempfile, time\n"
     "child = subprocess.Popen([sys.executable, '-c',\n"
@@ -303,17 +261,15 @@ TREE_PROBE = (
 
 
 def host_can_kill_trees():
-    """Ask this host whether the runner's tree kill actually works on it.
+    """询问当前宿主 runner 的树杀是否真的有效。
 
-    Returns (can, reason). The probe repeats exactly what run_all.kill_tree()
-    does - taskkill /F /T on Windows, killpg elsewhere - against a throwaway
-    parent/grandchild pair. A locked-down host refuses it (taskkill answers
-    "Access denied"), and the runner then falls back to killing only the direct
-    child; the caller has to know which of the two it is looking at, otherwise a
-    refused kill reads as a passing cleanup.
+    返回 can 与 reason 两个值。探针对一对临时的父进程和孙进程重放
+    run_all.kill_tree 的行为：Windows 上用 taskkill /F /T，其余平台用
+    killpg。受限宿主会拒绝，taskkill 只回 Access denied，runner 于是退回只
+    杀直接子进程；调用方必须知道自己面对的是哪种情况，否则被拒绝的杀进程
+    会被当成清理成功。
 
-    The probe's own cleanup does not use taskkill: that is the call being
-    measured, and it is the call that may be refused.
+    探针自身的清理不使用 taskkill：那正是被测量的调用，也可能被拒绝。
     """
     env = dict(os.environ)
     handle, pid_file = tempfile.mkstemp(prefix="runall-tree-", suffix=".json")
@@ -362,11 +318,11 @@ def host_can_kill_trees():
 
 
 class SandboxTimeout(Exception):
-    """The sandbox runner outlived the harness's own bound."""
+    """沙箱 runner 超过了测试框架自身的上界。"""
 
 
 class Scenario(object):
-    """A throwaway tests/ directory: a copy of the runner plus probe suites."""
+    """一次性 tests/ 目录：runner 副本外加若干探针套件。"""
 
     def __init__(self, label, pids_root):
         self.uid = "%s-%s" % (label, uuid.uuid4().hex[:8])
@@ -376,9 +332,8 @@ class Scenario(object):
         self.runner = os.path.join(self.tests, "run_all.py")
         shutil.copyfile(REAL_RUNNER, self.runner)
         self.logs_dir = os.path.join(self.dir, "kept-logs")
-        #: Registered probe pids live beside the scenario directory, never
-        #: inside it: tearDown has to read them after the run and before the
-        #: files go away, and a probe can outlive the run.
+        #: 探针登记的 pid 放在场景目录旁边而非其中：tearDown 要在运行结束后、
+        #: 文件删除前读取它们，而探针可能比本次运行活得更久。
         self.pids_dir = os.path.join(pids_root, self.uid)
         os.makedirs(self.pids_dir)
         self.owned = []
@@ -386,7 +341,7 @@ class Scenario(object):
         self._runs = 0
 
     def add(self, label, body):
-        """Write a probe suite and return its file name."""
+        """写入一个探针套件并返回文件名。"""
         name = "_test_%s_%s.py" % (self.uid, label)
         with open(os.path.join(self.tests, name), "w", encoding="utf-8") as fh:
             fh.write(body)
@@ -394,15 +349,14 @@ class Scenario(object):
         return name
 
     def pid_file(self, label="probe"):
-        """Where a probe registers the pids the harness may have to kill."""
+        """探针登记 pid 的位置，测试框架可能要杀掉这些进程。"""
         return os.path.join(self.pids_dir, label + ".json")
 
     def break_timeout(self):
-        """Regress the copied runner so its own --timeout never fires.
+        """破坏 runner 副本，让它的 --timeout 永不触发。
 
-        Anchored on the exact line and loud when the anchor is gone: a negative
-        check that quietly stopped breaking anything would be worse than no
-        check at all.
+        锚定精确行，锚点消失时立即报错：负向用例若悄悄失效，比没有该用例
+        更糟。
         """
         with open(self.runner, encoding="utf-8") as fh:
             text = fh.read()
@@ -416,16 +370,15 @@ class Scenario(object):
             fh.write(broken)
 
     def run(self, *extra, **kwargs):
-        """Run the sandboxed runner; return (returncode, output, seconds).
+        """运行沙箱 runner，返回 returncode、output 与耗时秒数。
 
-        The runner is started in a group the harness owns and managed with
-        Popen, not subprocess.run(timeout=...): that helper's timeout owns only
-        the direct process, so a runner that stopped honouring --timeout would
-        leave its probe tree behind. Here the outer bound takes the whole tree
-        and reaps it before raising.
+        runner 由测试框架在自有进程组中以 Popen 启动，而不用
+        subprocess.run 的 timeout 参数：后者只约束直接子进程，runner 一旦
+        不再遵守 --timeout，探针树就会被留下。这里的外层上界会拿下整棵树并
+        在抛出前完成回收。
 
-        The output goes to a file, never a pipe: a probe that survives the run
-        would otherwise hold the pipe open and stall the reader.
+        输出写入文件而非管道：否则活过本次运行的探针会一直持有管道，让读取
+        方挂起。
         """
         timeout = kwargs.pop("timeout", 180)
         env = dict(os.environ)
@@ -443,8 +396,8 @@ class Scenario(object):
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 kill_owned_tree(proc)
-                # run_all.py gives every suite its own group, so a probe is not
-                # in the runner's group; the pid it registered is reachable.
+                # run_all.py 给每个套件独立分组，探针不在 runner 的组里；
+                # 只能通过它登记的 pid 找到它。
                 self.kill_registered()
                 raise SandboxTimeout(
                     "the sandbox runner did not return within %ds: %s"

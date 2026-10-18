@@ -1,4 +1,3 @@
-"""Tests for gateway_hint 413 and GPT max_tokens clamping."""
 import unittest
 import sys
 import os

@@ -106,7 +106,7 @@ export function creditEventRows(events) {
 /** 积分变动记录为空时的说明，写清什么时候才会有记录。 */
 export function creditEventsEmptyText(realm) {
   return '还没有读到' + realmLabel(realm) + '的积分变动记录。每次读取余额成功且余额比上一次增加时才会记一条，第一次读取只建立基线；'
-    + '签到、每日活跃打卡与猫猫旅行的奖励到账之后就会出现在这里。';
+    + 'Buddy 加油站、每日活跃打卡与猫猫旅行的奖励到账之后就会出现在这里。';
 }
 
 export function growthEmptyText(realm) {

@@ -34,7 +34,6 @@ from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
 
 _TMP_ENV = isolated_data_dirs("wb-agents-cli-")
 
-import wb_agents  # noqa: E402
 import wb_proxy  # noqa: E402
 
 PASS = FAIL = 0

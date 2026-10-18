@@ -1,11 +1,13 @@
-// 设置 → 网关行为：保留积分、每日限额、自动切换、打卡通道、本地网络工具、Messages 翻译路径与测试使用的模型；控件先改本地草稿，由卡片上的「保存」统一提交。
+// 设置 → 网关行为：保留积分、每日限额、自动切换、打卡通道、本地网络工具、Messages 翻译路径与接口测试模型；控件先改本地草稿，由卡片上的「保存」统一提交。
 import { html, live, nothing, repeat } from '../../core/dom.js';
 import { icon } from '../../core/icons.js';
 import { getJSON } from '../../core/api.js';
 import { toast, toastError } from '../../ui/toast.js';
 import {
+  hoursText,
   messagesFormatOptions,
   messagesFormatValue,
+  parseHours,
   parseNonNegativeInteger,
   testModelOptions,
   testModelSelected,
@@ -13,10 +15,20 @@ import {
   validateTestModel,
 } from './logic.js';
 
+const SCHEDULE_FIELDS = ('checkin travel keepalive cat').split(' ');
+const SCHEDULE_LABELS = {
+  checkin: '签到时段',
+  travel: '猫猫旅行时段',
+  keepalive: '保活时段',
+  cat: '夜猫任务时段',
+};
+
 export function createGatewayTab(page) {
   const form = {
     reserve: '0',
     dailyLimit: '0',
+    taskJitter: '5',
+    schedule: { checkin: '9, 21', travel: '9, 21', keepalive: '22', cat: '1' },
     smartRouting: true,
     sessionAffinity: true,
     autoSwitch: false,
@@ -25,7 +37,9 @@ export function createGatewayTab(page) {
     messagesFormat: 'openai-completions',
     testModel: { intl: '', cn: '' },
   };
-  const errors = { reserve: '', dailyLimit: '', testModel: { intl: '', cn: '' } };
+  const errors = { reserve: '', dailyLimit: '', taskJitter: '',
+                   schedule: { checkin: '', travel: '', keepalive: '', cat: '' },
+                   testModel: { intl: '', cn: '' } };
   // 服务端最后一次给出的设置：撤销回到这里，也是「有未保存的改动」的对照。
   let baseline = null;
   // 表头的未保存标记只在翻转时重绘，输入过程中不打断光标位置。
@@ -38,6 +52,10 @@ export function createGatewayTab(page) {
     return {
       reserve: String(Number(view.reserve_credits) || 0),
       dailyLimit: String(Number(view.daily_token_limit) || 0),
+      taskJitter: String(Number(view.task_jitter_max) || 5),
+      schedule: Object.fromEntries(SCHEDULE_FIELDS.map((field) => [
+        field, hoursText((view.scheduler_hours || {})[field]),
+      ])),
       smartRouting: view.smart_routing !== false,
       sessionAffinity: view.session_affinity !== false,
       autoSwitch: view.auto_switch_product === true,
@@ -54,6 +72,8 @@ export function createGatewayTab(page) {
   function applyState(state) {
     form.reserve = state.reserve;
     form.dailyLimit = state.dailyLimit;
+    form.taskJitter = state.taskJitter;
+    for (const field of SCHEDULE_FIELDS) form.schedule[field] = state.schedule[field];
     form.smartRouting = state.smartRouting;
     form.sessionAffinity = state.sessionAffinity;
     form.autoSwitch = state.autoSwitch;
@@ -64,6 +84,8 @@ export function createGatewayTab(page) {
     form.testModel.cn = state.testModel.cn;
     errors.reserve = '';
     errors.dailyLimit = '';
+    errors.taskJitter = '';
+    for (const field of SCHEDULE_FIELDS) errors.schedule[field] = '';
     errors.testModel.intl = '';
     errors.testModel.cn = '';
     dirtyShown = false;
@@ -79,6 +101,9 @@ export function createGatewayTab(page) {
     if (!baseline) return false;
     return String(form.reserve).trim() !== baseline.reserve
       || String(form.dailyLimit).trim() !== baseline.dailyLimit
+      || String(form.taskJitter).trim() !== baseline.taskJitter
+      || SCHEDULE_FIELDS.some((field) =>
+        String(form.schedule[field]).trim() !== baseline.schedule[field])
       || form.smartRouting !== baseline.smartRouting
       || form.sessionAffinity !== baseline.sessionAffinity
       || form.autoSwitch !== baseline.autoSwitch
@@ -122,13 +147,24 @@ export function createGatewayTab(page) {
   async function saveAll() {
     const reserve = parseNonNegativeInteger(form.reserve, { label: '保留积分' });
     const dailyLimit = parseNonNegativeInteger(form.dailyLimit, { label: '每日 Token 限额' });
+    const jitter = parseNonNegativeInteger(form.taskJitter, { label: '任务随机间隔', max: 600 });
     errors.reserve = reserve.ok ? '' : reserve.error;
     errors.dailyLimit = dailyLimit.ok ? '' : dailyLimit.error;
+    errors.taskJitter = !jitter.ok ? jitter.error
+      : (jitter.value < 2 ? '任务随机间隔不能小于 2 秒' : '');
+    const schedule = {};
+    for (const field of SCHEDULE_FIELDS) {
+      const parsed = parseHours(form.schedule[field], { label: SCHEDULE_LABELS[field] });
+      errors.schedule[field] = parsed.ok ? '' : parsed.error;
+      if (parsed.ok) schedule[field] = parsed.value;
+    }
     for (const realm of ['intl', 'cn']) {
       form.testModel[realm] = String(form.testModel[realm] || '').trim();
       errors.testModel[realm] = validateTestModel(form.testModel[realm]);
     }
-    if (errors.reserve || errors.dailyLimit || errors.testModel.intl || errors.testModel.cn) {
+    if (errors.reserve || errors.dailyLimit || errors.taskJitter
+        || SCHEDULE_FIELDS.some((field) => errors.schedule[field])
+        || errors.testModel.intl || errors.testModel.cn) {
       page.draw();
       return false;
     }
@@ -138,6 +174,8 @@ export function createGatewayTab(page) {
       const view = await page.save({
         reserve_credits: reserve.value,
         daily_token_limit: dailyLimit.value,
+        task_jitter_max: jitter.value,
+        scheduler_hours: schedule,
         smart_routing: form.smartRouting,
         session_affinity: form.sessionAffinity,
         auto_switch_product: form.autoSwitch,
@@ -177,7 +215,7 @@ export function createGatewayTab(page) {
       </div>`;
   }
 
-  function numberRow({ name, desc, field, suffix, step = '1' }) {
+  function numberRow({ name, desc, field, suffix, step = '1', min = '0' }) {
     return html`
       <div class="setting">
         <div class="setting-main">
@@ -186,10 +224,27 @@ export function createGatewayTab(page) {
           ${errors[field] ? html`<div class="field-error">${errors[field]}</div>` : nothing}
         </div>
         <div class="setting-control">
-          <input class="input input-num" type="number" min="0" step=${step} .value=${live(form[field])}
+          <input class="input input-num" type="number" min=${min} step=${step} .value=${live(form[field])}
                  ?disabled=${saving}
                  @input=${(e) => { form[field] = e.target.value; errors[field] = ''; structChanged(); }}>
           <span class="setting-unit">${suffix}</span>
+        </div>
+      </div>`;
+  }
+
+  function hoursRow({ name, desc, field }) {
+    return html`
+      <div class="setting">
+        <div class="setting-main">
+          <div class="setting-name">${name}</div>
+          <div class="setting-desc">${desc}</div>
+          ${errors.schedule[field] ? html`<div class="field-error">${errors.schedule[field]}</div>` : nothing}
+        </div>
+        <div class="setting-control">
+          <input class="input input-hours" type="text" inputmode="numeric" placeholder="例如 9, 21"
+                 .value=${live(form.schedule[field])} ?disabled=${saving}
+                 @input=${(e) => { form.schedule[field] = e.target.value; errors.schedule[field] = ''; structChanged(); }}>
+          <span class="setting-unit">整点</span>
         </div>
       </div>`;
   }
@@ -215,11 +270,11 @@ export function createGatewayTab(page) {
         </div>`;
     };
     return html`
-      <div class="setting span-2">
+      <div class="setting">
         <div class="setting-main">
-          <div class="setting-name">测试使用的模型</div>
+          <div class="setting-name">接口测试模型</div>
           <div class="setting-desc">
-            账号行的「测试」按钮会发送一条内容为 hi 的真实对话，这里分别选择两个出口使用哪个模型；「默认」表示不指定，由网关按该出口的默认模型请求。
+            账号行的「测试」按钮发送一条 hi 对话时使用哪个模型；「默认」表示由网关按该出口的默认模型请求。
           </div>
         </div>
         <div class="setting-control test-model-row">
@@ -262,6 +317,33 @@ export function createGatewayTab(page) {
             ${numberRow({
               name: '每日 Token 限额', field: 'dailyLimit', suffix: 'token', step: '1000',
               desc: '账号当日消耗的 token 达到该值后暂停接单，请求自动切到其他账号，本地时间 0 点后恢复。填写 0 表示不限额。',
+            })}
+            ${numberRow({
+              name: '任务随机间隔',
+              field: 'taskJitter',
+              suffix: '秒',
+              min: 2,
+              desc: '定时巡检在处理每个账号前随机等待 2 秒到这个值之间的时间，避免同一批请求同时发出。默认 5 秒，最大 600 秒。',
+            })}
+            ${hoursRow({
+              name: '签到与活跃上报时段',
+              field: 'checkin',
+              desc: '国内版签到与对话活跃上报的整点，默认 9, 21。填 0 到 23，用逗号分隔；留空表示这组不跑。',
+            })}
+            ${hoursRow({
+              name: '猫猫旅行时段',
+              field: 'travel',
+              desc: '猫猫旅行派出与领取的整点，默认 9, 21。',
+            })}
+            ${hoursRow({
+              name: 'Token 保活时段',
+              field: 'keepalive',
+              desc: '检查并刷新即将过期令牌的整点，默认 22。',
+            })}
+            ${hoursRow({
+              name: '夜猫任务时段',
+              field: 'cat',
+              desc: '夜猫子专属任务的上报整点，默认 1。',
             })}
             ${switchRow({
               name: '会话粘性',
@@ -323,7 +405,7 @@ export function createGatewayTab(page) {
       return choice !== 'cancel';
     },
     onMount() {
-      // 首次进入就要填满测试模型下拉：目录来自 /v1/models，读取失败只影响这一项。
+      // 首次进入就要填满接口测试模型下拉：目录来自 /v1/models，读取失败只影响这一项。
       loadCatalogs().then(() => page.draw());
     },
   };

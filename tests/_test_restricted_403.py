@@ -1,28 +1,27 @@
-"""上游风控限制 403（code 11140）必须换号，而不是透传给客户端。
+"""上游风控限制 403（code 11140）必须停掉整个网关，而不是换号。
 
 实测正文：{"code":11140,"msg":"request illegal",...,"displayMsg":{"en":"Your
 account has been restricted due to unusual activity","zh":"账号存在异常行为，
-已被限制使用"}}。这在重试循环里原本落进内容审核分支：降级提示词重试一次，
-然后 break——被限制的账号既不冷却、也继续被选用，客户端一次次拿到 403，
-对话就这样被打死（2026-10-11 生产实测）。
+已被限制使用"}}。限制发生后继续轮询下一个账号，正是把整个账号池关联起来的原因。
 
 要钉住的行为：
 
-  1. 风控 403 与内容审核 403 分流：前者冷却账号 2 小时并轮到下一个账号；
-  2. 内容审核 403 的原路径不变（降级重试、透传，不给账号上长冷却）；
-  3. 一切 >=500 的未知状态码（实测 550）也按瞬时故障轮转；
-  4. 池里只有这一个账号时，仍把限制原因交给客户端（没有别的可试）。
+  1. 风控 403 停用全部账号，并向调用方抛 GatewayStandDown（映射为 503）；
+  2. 停止期间新请求在入口被拒绝，不发往上游；
+  3. 内容审核 403 的原路径不变（降级重试、透传，不给账号上长冷却）；
+  4. 一切 >=500 的未知状态码（实测 550）按瞬时故障轮转。
 
 Run with the current interpreter (python tests/run_all.py restricted).
 """
+import email
 import io
 import json
 import os
 import sys
 import tempfile
-import time
 import unittest
 import urllib.error
+from unittest import mock
 
 _TMP = tempfile.mkdtemp(prefix="wb-restrict403-")
 os.environ["ACCOUNTS_DIR"] = os.path.join(_TMP, "accounts")
@@ -96,6 +95,12 @@ class StubPool(object):
     def apply_model_daily_token_limit(self, value=None, per_model=None):
         return value or 0
 
+    def set_all_enabled(self, enabled, realm=None):
+        for account in self.accounts:
+            if realm and account.realm != realm:
+                continue
+            account.enabled = bool(enabled)
+
 
 class ScriptedUpstream(object):
     """按尝试顺序吐预设结果：异常抛出、FakeResp 返回。"""
@@ -137,9 +142,11 @@ class Restricted403DetectionTests(unittest.TestCase):
 class Restricted403DispatchTests(unittest.TestCase):
     def setUp(self):
         self.old_pool = P.POOL
+        P.clear_stand_down()
 
     def tearDown(self):
         P.POOL = self.old_pool
+        P.clear_stand_down()
 
     def _run(self, accounts, script):
         P.POOL = StubPool(accounts)
@@ -156,30 +163,35 @@ class Restricted403DispatchTests(unittest.TestCase):
             wb_accounts.urlopen = real_urlopen
         return result, raised
 
-    def test_restricted_account_is_cooled_and_next_account_serves(self):
+    def test_restricted_account_stops_every_account(self):
         restricted = make_account("r1")
         healthy = make_account("h1")
         resp, raised = self._run(
             [restricted, healthy],
-            [http_error(403, RESTRICT_BODY), FakeResp()])
-        self.assertIsNone(raised)
-        self.assertEqual(resp[1].uid, "h1")
-        # 被限制的账号进 2 小时冷却，不再被选用。
-        self.assertGreaterEqual(restricted.cooldown_until - time.time(), 7000)
-        self.assertEqual(restricted.last_error, "HTTP 403 (account restricted)")
-        self.assertIn("11140", restricted.last_error_detail)
-        # 健康账号没有被牵连。
-        self.assertEqual(healthy.cooldown_until, 0.0)
-
-    def test_lone_restricted_account_still_reports_the_reason(self):
-        restricted = make_account("r-only")
-        resp, raised = self._run(
-            [restricted],
-            [http_error(403, RESTRICT_BODY), http_error(403, RESTRICT_BODY)])
+            [http_error(403, RESTRICT_BODY)])
+        # 脚本只给了一次应答：若还去轮询下一个账号，会因脚本耗尽而报别的错。
         self.assertIsNone(resp)
-        self.assertIsInstance(raised, P.ContentRejected)
+        self.assertIsInstance(raised, P.GatewayStandDown)
+        self.assertEqual(getattr(raised, "account_uid", None), "r1")
+        self.assertIn("11140", raised.detail)
+        # 所有账号一起停用：下一个账号不会再被选中。
+        self.assertFalse(restricted.enabled)
+        self.assertFalse(healthy.enabled)
+        state = P.stand_down_state()
+        self.assertTrue(state["active"])
+        self.assertEqual(state["uid"], "r1")
+        # 入口也挡住：停止期间不再向上游发请求。
+        with self.assertRaises(P.GatewayStandDown):
+            P.open_upstream(dict(PAYLOAD), target_realm="intl")
+
+    def test_lone_restricted_account_stops_the_gateway(self):
+        restricted = make_account("r-only")
+        resp, raised = self._run([restricted], [http_error(403, RESTRICT_BODY)])
+        self.assertIsNone(resp)
+        self.assertIsInstance(raised, P.GatewayStandDown)
         self.assertEqual(getattr(raised, "account_uid", None), "r-only")
         self.assertIn("11140", raised.detail)
+        self.assertFalse(restricted.enabled)
 
     def test_content_403_keeps_its_old_path(self):
         a = make_account("c1")
@@ -203,6 +215,67 @@ class Restricted403DispatchTests(unittest.TestCase):
         self.assertIsNone(raised)
         self.assertEqual(resp[1].uid, "f2")
         self.assertEqual(flaky.fails, 1)
+
+
+class DispatchRequest(P.Handler):
+    """把真实 Handler 放在内存 socket 上跑：停止期间必须是 503。"""
+
+    def __init__(self, path, command="POST", body=b""):
+        self.path = path
+        self.command = command
+        self.request_version = "HTTP/1.1"
+        self.close_connection = True
+        self.headers = email.message_from_string("Content-Type: application/json\r\n")
+        self.rfile = io.BytesIO(body)
+        self.wfile = io.BytesIO()
+        self.status = None
+        self.client_address = ("127.0.0.1", 0)
+
+    def send_response(self, code, message=None):
+        self.status = code
+
+    def send_header(self, key, value):
+        pass
+
+    def end_headers(self):
+        pass
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def dispatch(self):
+        getattr(self, "do_" + self.command)()
+        raw = self.wfile.getvalue().decode("utf-8")
+        return self.status, json.loads(raw) if raw else None
+
+
+class StandDownDispatchTests(unittest.TestCase):
+    def setUp(self):
+        self.old_pool = P.POOL
+        P.clear_stand_down()
+        self._tmp = tempfile.TemporaryDirectory(prefix="wb-standdown-")
+        self.addCleanup(self._tmp.cleanup)
+
+    def tearDown(self):
+        P.POOL = self.old_pool
+        P.clear_stand_down()
+
+    def test_chat_requests_answer_503_while_stopped(self):
+        P.POOL = StubPool([make_account("r1")])
+        P.stand_down_accounts("r1", '"code":11140')
+        body = json.dumps(PAYLOAD).encode("utf-8")
+        with mock.patch.multiple(P, ACCOUNTS_DIR=self._tmp.name, API_KEY=None):
+            status, payload = DispatchRequest("/v1/chat/completions", body=body).dispatch()
+        self.assertEqual(status, 503)
+        message = payload["error"]["message"]
+        self.assertIn("全部账号已停用", message)
+        self.assertIn("全部启用", message)
+
+    def test_re_enabling_clears_the_stop(self):
+        P.stand_down_accounts("r1", "")
+        self.assertTrue(P.stand_down_state()["active"])
+        P.clear_stand_down()
+        self.assertFalse(P.stand_down_state()["active"])
 
 
 if __name__ == "__main__":

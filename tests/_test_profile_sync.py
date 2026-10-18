@@ -1,8 +1,3 @@
-"""Web-console nickname sync (B6).
-
-Run with: python _test_profile_sync.py
-No upstream credentials or outbound network are used.
-"""
 import json
 import os
 import sys

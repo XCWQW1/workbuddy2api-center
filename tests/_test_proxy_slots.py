@@ -1,7 +1,6 @@
 """Deterministic tests for proxy-slot definitions (no network)."""
 
 import atexit
-import json
 import os
 import sys
 import tempfile

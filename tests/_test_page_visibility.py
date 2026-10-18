@@ -9,7 +9,7 @@ and the UI needs no second persistence subsystem.
 
 The normalisation carries most of these cases. The panel only ever sends a list
 of well-formed keys, but the file is hand-editable and this module deliberately
-does not know which pages exist - the pages live in dashboard.html - so the safe
+does not know which pages exist - the pages live in app/web - so the safe
 reading of anything malformed is "nothing hidden". `settings` is the one key
 dropped on the way in: it is where the switch itself lives, and a stored file
 that hides it would leave the panel with no way back.

@@ -1,11 +1,3 @@
-"""The OpenRouter price-estimation master switch.
-
-On by default: an install whose settings.json predates the key behaves exactly
-as it always did. Off disables the feature end to end - no fetch, no policy
-minted on demand, no per-row cost, and a row the switch left unpriced is not
-reported as "missing a price" in the aggregates. These tests pin the default,
-the round trip, the cached read behind the request path, and every gate.
-"""
 import json
 import os
 import sys
@@ -31,7 +23,7 @@ def _read_settings(path):
 
 
 class PricingEnabledSettingTests(unittest.TestCase):
-    """The stored switch: on unless explicitly turned off."""
+    """存储的开关默认开启，只有显式关闭才生效。"""
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="wb-pricing-switch-")
@@ -42,8 +34,7 @@ class PricingEnabledSettingTests(unittest.TestCase):
         wb_pricing.set_settings_dir(self._previous)
 
     def test_a_settings_file_without_the_key_reads_as_on(self):
-        # An install upgraded from a build that never wrote the key keeps the
-        # behaviour it shipped with, which is what the release notes say.
+        # 从未写入该键的旧版本升级后仍保持原有行为，与发布说明一致。
         self.assertIs(wb_settings.pricing_enabled(self.dir), True)
 
     def test_the_setting_defaults_to_on_and_is_persisted(self):
@@ -56,9 +47,8 @@ class PricingEnabledSettingTests(unittest.TestCase):
         self.assertIs(wb_pricing.pricing_enabled(), True)
 
     def test_the_switch_read_is_cached_but_never_goes_stale(self):
-        # cost_for_row reads this on every row of a usage page, so the read is
-        # cached by (path, mtime, size) - the panel saving settings.json must
-        # still be picked up on the spot.
+        # cost_for_row 会为用量页的每一行读取该开关，因此按路径、mtime 和大小缓存；
+        # 面板保存 settings.json 后必须立即生效。
         self.assertIs(wb_pricing.pricing_enabled(), True)
         time.sleep(0.02)
         _write_settings(self.dir, {"pricing_enabled": False})
@@ -66,7 +56,7 @@ class PricingEnabledSettingTests(unittest.TestCase):
 
 
 class PricingGateTests(unittest.TestCase):
-    """With the switch off, nothing is priced and nothing is minted."""
+    """开关关闭时不计价，也不生成策略。"""
 
     def setUp(self):
         self.accounts = tempfile.mkdtemp(prefix="wb-pricing-switch-acct-")
@@ -91,7 +81,7 @@ class PricingGateTests(unittest.TestCase):
         self.assertFalse(off["known"])
         self.assertTrue(off.get("disabled"))
         self.assertEqual(off["cny"], 0.0)
-        # The hover details stay empty rather than explaining a made-up price.
+        # 悬停明细保持为空，不解释虚构的价格。
         self.assertIsNone(off["rates"])
 
     def test_current_policy_id_and_ensure_policy_mint_nothing_when_off(self):
@@ -105,7 +95,7 @@ class PricingGateTests(unittest.TestCase):
         wb_proxy._fold_cost(bucket, wb_pricing.cost_for_row(dict(self.row)),
                             self.model)
         self.assertEqual(bucket.get("cost_missing"), None)
-        # An unpriced row under a live switch is still reported, as before.
+        # 开关开启时，未定价的行仍会被报告。
         wb_settings.set_pricing_enabled(self.accounts, True)
         bucket = {}
         wb_proxy._fold_cost(bucket, wb_pricing.cost_for_row(
@@ -125,16 +115,14 @@ class PricingGateTests(unittest.TestCase):
 
 
 class PricingBackfillTests(unittest.TestCase):
-    """Requests made while the switch was off are priced once it comes back on.
+    """开关关闭期间的请求在重新开启后计价。
 
-    Nothing is written back into usage.jsonl - costing is read-time, so a row
-    with no policy reference is priced the moment the switch (and the price
-    table) allows it again. What has to be pinned is that turning the switch
-    back on really does re-fetch, because a model first called during the off
-    period only has a price if a fetch registers it.
+    计价发生在读取时，不会回写 usage.jsonl；没有策略引用的行在开关和价格表
+    允许时立即计价。重新开启必须真正触发抓取，关闭期间首次调用的模型只有
+    经过抓取注册后才有价格。
     """
 
-    # One entry the bundled snapshot has never heard of, plus a couple it knows.
+    # 两个内置快照未收录的条目，另加若干已知模型。
     OR = {
         "deepseek/deepseek-r1-0528": {"prompt": "0.0000005",
                                       "completion": "0.00000215",
@@ -184,9 +172,8 @@ class PricingBackfillTests(unittest.TestCase):
         wb_settings.set_pricing_enabled(self.accounts, False)
         self.assertFalse(wb_pricing.cost_for_row(dict(row))["known"])
 
-        # Coming back on triggers a fetch; the fetch is what registers the
-        # live-only name in the policy table. Until then the row has no price
-        # from any source - the snapshot does not know the name either.
+        # 重新开启会触发抓取，只有抓取才会把仅在线存在的名称注册进策略表；
+        # 在此之前该行没有任何价格来源，内置快照也不认识这个名称。
         wb_settings.set_pricing_enabled(self.accounts, True)
         doc, _unpriced, _ov = wb_pricing.build_snapshot(dict(self.OR), None,
                                                        [model])
@@ -199,7 +186,7 @@ class PricingBackfillTests(unittest.TestCase):
 
 
 class PricingRefresherSwitchTests(unittest.TestCase):
-    """The refresh loop parks while the switch is off and resumes after."""
+    """刷新循环在开关关闭时挂起，重新开启后恢复。"""
 
     def setUp(self):
         self.accounts = tempfile.mkdtemp(prefix="wb-pricing-switch-loop-acct-")
@@ -218,8 +205,7 @@ class PricingRefresherSwitchTests(unittest.TestCase):
         wb_pricing.set_data_dir(self._prev_data)
 
     def _seed_timeline(self):
-        """A non-empty timeline: the case where a normal restart would not
-        re-fetch, so only the switch coming back on can explain a fetch."""
+        """非空时间线：正常重启不会重新抓取，只有开关重新开启才能解释抓取。"""
         with open(os.path.join(self.data, "pricing-timeline.jsonl"), "w",
                   encoding="utf-8") as fh:
             fh.write(json.dumps({"at": time.time(),
@@ -255,8 +241,7 @@ class PricingRefresherSwitchTests(unittest.TestCase):
     def test_the_loop_does_not_fetch_while_off_and_resumes_when_on(self):
         calls = []
         wb_settings.set_pricing_enabled(self.accounts, False)
-        # 0.02 minutes = 1.2 s: a loop that ignored the switch would call well
-        # before the deadline below.
+        # 0.02 分钟等于 1.2 秒；忽略开关的循环会在下方等待结束前发起调用。
         refresher = self._refresher(0.02, calls)
         refresher.start()
         time.sleep(1.8)
@@ -268,8 +253,7 @@ class PricingRefresherSwitchTests(unittest.TestCase):
         self.assertGreaterEqual(self._wait_for_calls(calls, 1, 5), 1)
 
     def test_coming_back_on_fetches_at_once_even_with_a_timeline(self):
-        # The interval is 30 minutes, so a fetch inside the deadline can only
-        # be the catch-up that makes the off-period rows priceable.
+        # 间隔为 30 分钟，因此等待期内发生抓取只能是在补抓，使关闭期间的行可以计价。
         self._seed_timeline()
         calls = []
         wb_settings.set_pricing_enabled(self.accounts, False)
@@ -283,8 +267,7 @@ class PricingRefresherSwitchTests(unittest.TestCase):
         self.assertGreaterEqual(self._wait_for_calls(calls, 1, 5), 1)
 
     def test_a_normal_restart_with_a_timeline_does_not_refetch(self):
-        # The pre-existing behaviour the catch-up must not disturb: a restart
-        # that already has prices waits out the interval instead of fetching.
+        # 补抓不能破坏原有行为：已有价格的实例重启后应等待间隔结束，不发起抓取。
         self._seed_timeline()
         calls = []
         wb_settings.set_pricing_enabled(self.accounts, True)

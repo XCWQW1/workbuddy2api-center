@@ -1,4 +1,3 @@
-"""The low-credit guard parks an account before its balance reaches zero."""
 import os
 import sys
 import tempfile
@@ -25,7 +24,7 @@ class ReserveCreditsTests(unittest.TestCase):
             self.assertEqual(wb_settings.reserve_credits(directory), 0)
             self.assertEqual(wb_settings.set_reserve_credits(directory, 10), 10)
             self.assertEqual(wb_settings.reserve_credits(directory), 10)
-            # 垃圾值与负数都收成 0,不报错
+            # 垃圾值与负数都收成 0，不报错
             self.assertEqual(wb_settings.set_reserve_credits(directory, -5), 0)
             self.assertEqual(wb_settings.set_reserve_credits(directory, "abc"), 0)
 

@@ -1,16 +1,3 @@
-"""账号备注：面板标记「批量」/「自用」，随凭证档持久化。
-
-备注是纯展示字段：不参与任何调度判断，落盘、导出/导入照常携带，看板在账号
-行内显示并可直接编辑（有备注的账号在表格里置顶——那是前端排序，由
-tests/_test_account_weight.js 钉住）。这里钉住字段本身：
-
-  1. 默认空、坏数据回落空串、超长截断；
-  2. 随凭证档与公共视图走（to_dict / public / 导入导出）；
-  3. set_note 落盘、空串清除、未知 uid 返回 None；
-  4. 看板接线存在（accountRow 渲染备注行 + editAccountNote 走 /accounts/set）。
-
-Run with the current interpreter (python tests/run_all.py note).
-"""
 import os
 import sys
 import tempfile
@@ -80,25 +67,9 @@ class SetNoteTests(unittest.TestCase):
 
     def test_note_change_reaches_the_disk(self):
         self.pool.set_note("s-b", "批量02")
-        # 重新从原目录读，确认落盘
+        # 重新读取原目录，确认数据已写入磁盘
         pool2 = wb_accounts.AccountPool(self.directory, log=lambda _m: None)
         self.assertEqual({a.uid: a for a in pool2.load()}["s-b"].note, "批量02")
-
-
-class DashboardWiringTests(unittest.TestCase):
-    """看板接线的结构断言（渲染细节由 JS 套件钉）。"""
-
-    def test_dashboard_has_note_editing(self):
-        with open(os.path.join(ROOT, "dashboard.html"), encoding="utf-8") as fh:
-            html = fh.read()
-        self.assertIn("editAccountNote", html)
-        self.assertIn("{uid: uid, note: next}", html)
-        self.assertIn("+ 备注", html)
-
-    def test_dashboard_sorts_note_accounts_first(self):
-        with open(os.path.join(ROOT, "dashboard.html"), encoding="utf-8") as fh:
-            html = fh.read()
-        self.assertIn("const nx = x[0].note ? 0 : 1, ny = y[0].note ? 0 : 1;", html)
 
 
 if __name__ == "__main__":

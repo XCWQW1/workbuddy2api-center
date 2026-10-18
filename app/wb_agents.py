@@ -634,7 +634,7 @@ def dsh_reasoning_levels(raw):
     DSH 的模型条目用 `reasoningEfforts` 声明可选思考档位（键=选择器里的档位，
     值=请求里实际发的拼写）。本路由不在它的内置目录里，所以不声明就没有选择
     器——`/v1/models` 里的 `reasoning_efforts` 它不读，它只读 id / name /
-    contextWindow / maxTokens。网关宣告的档位名就是上游认的拼写，一一照抄即可；
+    contextWindow / maxTokens。网关声明的档位名就是上游认的拼写，一一照抄即可；
     固定档位的模型（网关只给 reasoning_fixed_effort）没有列表，就不声明：给了
     选择器也不会改变上游实际跑的档位。
     """
@@ -1092,12 +1092,7 @@ def integrate(accounts_dir, client_id, base_url, api_key, model=None,
         for w_path, w_existed, w_backup in written:
             try:
                 if w_existed and w_backup:
-                    # w_backup 是 _backup_file() 记下的**完整备份路径**（state
-                    # 与 restore() 都按整条路径用它），直接读回即可。这里曾经
-                    # 先拼了一次 backup_dir(...)，而那个名字全模块都不存在：
-                    # NameError 被下面的 except 吞掉，于是多文件客户端写一半
-                    # 失败时既不回滚也不写 state——面板显示「未配置」，而
-                    # restore() 又因为查不到记录而拒绝执行。
+                    # w_backup 是 _backup_file() 记下的完整备份路径，直接读回即可。
                     _atomic_write_bytes(w_path, _read_bytes(w_backup))
                 elif not w_existed and os.path.exists(w_path):
                     os.unlink(w_path)

@@ -1,48 +1,22 @@
-"""Optional SQLite persistence for the gateway's runtime log ring.
-
-Off by default. With the switch off the gateway behaves exactly like upstream:
-the log lives only in the in-memory ring in wb_proxy, nothing is written to
-disk and no database file is created. Switched on, every entry the ring keeps
-is also appended to `usage/logs.sqlite3`, so a restart, a crash or a
-slow-moving incident can still be read back afterwards.
-
-Three independent retention caps keep the file from growing without bound. Each
-one is optional, and "blank" means "no limit on this axis":
-
-  * rows  - keep only the newest N entries
-  * days  - drop entries older than N days (the panel defaults this to 7)
-  * bytes - shrink the database file back under N bytes
-
-Only the Python standard library is required. All database work happens on one
-background thread over a single connection, so a slow query can never stall a
-request and two writers can never race: `append` is a queue put, and the few
-read paths (the panel's log view) submit a job and wait for its result.
-"""
-
+# 网关日志环的可选 SQLite 持久化。开关默认关闭；开启后每条日志同时写入
+# usage/logs.sqlite3，并受行数、天数与字节数三重上限约束。
 import os
 import queue
 import sqlite3
 import threading
 import time
 
-# Entries are batched per transaction; a burst of request logs costs one fsync
-# instead of one per line. The drain loop also picks up whatever else is
-# already queued (reads and clears included), so a pending query is never
-# starved behind a busy writer.
+# 每条事务批量提交，突发请求日志只付一次 fsync。排空循环也处理已排队的读与
+# 清理，查询不会被写入饿死。
 _BATCH_MAX = 256
-# How often the cheap caps (rows, days) are re-checked, in seconds. Trimming is
-# a couple of DELETEs, so this is about not running them on every batch.
+# 行数与天数上限的检查间隔，单位秒。裁剪只有几条 DELETE，不必每批都跑。
 _TRIM_INTERVAL = 5.0
-# The worker also wakes on this clock when nothing is being logged, so an idle
-# gateway still expires old rows instead of leaving an over-cap database until
-# the next line happens to arrive.
+# 空闲时也按此周期唤醒，让没有新日志的网关仍会清理过期行。
 _IDLE_TICK = 5.0
-# The size cap is the expensive one: it may delete in batches and VACUUM, so it
-# gets its own, much slower clock.
+# 大小上限最贵，可能分批删除并执行 VACUUM，因此使用更慢的周期。
 _TRIM_BYTES_INTERVAL = 30.0
-# A single entry's message is stored as-is; this is only a guard against a
-# pathological payload (a whole response body logged by mistake) taking the
-# file to its cap in one line. 64 KiB of text is far past any real log line.
+# 单条消息原样存储；该上限防止异常载荷把文件一次撑到上限。64 KiB 已远超真实
+# 日志行。
 _MSG_MAX = 64 * 1024
 
 _SCHEMA = """
@@ -62,12 +36,10 @@ _COLUMNS = ("id", "ts", "time", "level", "tag", "msg")
 
 
 class LogStore:
-    """Durable backing store for the gateway log ring.
+    """网关日志环的持久化后端。
 
-    Lifecycle: construct with the database path, then `configure()` with the
-    panel settings. `configure` starts or stops the worker as the switch flips;
-    flipping it off leaves the file and its rows alone, so turning it back on
-    resumes where it left off.
+    生命周期：用数据库路径构造，再以面板设置调用 configure。开关切换时启动
+    或停止工作线程；关闭时保留文件与行，重新打开后接着写。
     """
 
     def __init__(self, path):
@@ -86,9 +58,9 @@ class LogStore:
         return self._enabled
 
     def configure(self, enabled, max_rows=None, max_days=None, max_bytes=None):
-        """Apply the panel's settings; start or stop the worker to match.
+        """应用面板设置，并按开关启动或停止工作线程。
 
-        Idempotent and cheap: called on startup and on every settings save.
+        启动时与每次保存设置都会调用，要求幂等且廉价。
         """
         with self._lock:
             self._caps = {
@@ -110,7 +82,7 @@ class LogStore:
         return self._enabled
 
     def close(self):
-        """Stop the worker and flush. Safe to call more than once."""
+        """停止工作线程并冲刷；可重复调用。"""
         with self._lock:
             if not self._enabled and self._thread is None:
                 return
@@ -122,7 +94,7 @@ class LogStore:
 
     # -- writes ------------------------------------------------------------
     def append(self, entry):
-        """Queue one entry. Never blocks the request path."""
+        """排队一条记录，不阻塞请求路径。"""
         if not self._enabled:
             return
         try:

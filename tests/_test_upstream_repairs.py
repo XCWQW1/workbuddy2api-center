@@ -1,18 +1,11 @@
-"""上游请求的三处修补：prompt_cache_key 注入、deepseek thinking + effort 补全、工具调用配对修复。
-
-不联网、不需要上游账号：被测函数是纯体重写，用例喂合成请求体并断言出站形状。
-"""
 import copy
 import json
 import os
 import sys
-import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
-# Its own directories, removed when this process exits. The suite used to point
-# both at tests/_acc and tests/_use, which it shared with
-# _test_namespace_tools.py, and every run left those directories in the checkout.
+# 独立目录，进程退出时删除，不与其他套件共用 tests/_acc 与 tests/_use。
 _TMP = isolated_data_dirs("wb-upstream-repairs-")
 
 import wb_proxy as P

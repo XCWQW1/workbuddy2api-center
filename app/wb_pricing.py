@@ -1024,7 +1024,7 @@ OVERRIDES = {
 #   -lkeap       渠道后缀：实测 deepseek-r1-0528-lkeap / deepseek-v3-1-lkeap /
 #                deepseek-v3-0324-lkeap 都能落到同名基准（后两个经 OVERRIDES）
 #   -taiji       发行后缀：kimi-k2-instruct-taiji 剥掉后 OR 仍无同名基准，
-#                因此照样未定价——把「命不中就不定价」这条规则也钉住
+#                因此照样未定价，「匹配不到就不定价」这条规则由它覆盖
 #   -volc        渠道后缀（火山）：deepseek-v3-*-volc 在 OVERRIDES 里已有更
 #                精确的写法，这里兜底未来新增的 -volc 变体
 #   -sg          节点后缀（新加坡）：同上，剥掉后仍要求唯一命中
@@ -1311,7 +1311,7 @@ def resolve(hub_id, or_models, by_norm, variants=None):
     """(OpenRouter id, 是否来自人工覆盖)；匹配不到返回 (None, False)。
 
     variants 为 None 时读设置开关（默认开）。剥后缀继承来的命中一律记作
-    人工覆盖，因为那不是名字碰巧相同，而是一次有据可查的判定。
+    人工覆盖，因为它是一次有据可查的判定。
     """
     if variants is None:
         variants = variant_inherit_enabled()

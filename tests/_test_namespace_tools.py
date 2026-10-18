@@ -1,16 +1,9 @@
-"""Deterministic tests for Codex App namespace tool support.
-
-No network: expansion, name resolution and outbound stamping are pure transformations, so cases assert both the upstream and the client shapes.
-"""
 import os
 import sys
-import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
-# Its own directories, removed when this process exits. The suite used to point
-# both at tests/_acc and tests/_use, so two runs of it shared one directory and
-# every run left those directories behind in the checkout.
+from _isolated_dirs import isolated_data_dirs  # noqa: E402
+# 自带数据根目录，进程退出时删除，避免多次运行共用同一目录。
 _TMP = isolated_data_dirs("wb-namespace-tools-")
 
 import wb_proxy as P
@@ -103,7 +96,7 @@ check("namespaced tool reaches the chat body",
       "js" in by_name and by_name["js"]["type"] == "function")
 check("namespace map rides along for the return trip",
       chat.get("_namespace_map", {}).get("js") == "node_repl", chat.get("_namespace_map"))
-# The upstream has no server-side search tool, so standing in for web_search is opt-in through wb_settings.local_web_tools; this case follows it.
+# 上游没有服务端搜索工具，web_search 的本地实现由 wb_settings.local_web_tools 开关控制，下面的用例跟随该开关。
 _orig_local_web = P.wb_settings.local_web_tools
 P.wb_settings.local_web_tools = lambda accounts_dir: False
 try:

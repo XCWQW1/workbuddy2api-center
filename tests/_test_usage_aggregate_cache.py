@@ -1,38 +1,3 @@
-"""聚合状态落盘：往返、降级与节流。
-
-PR #189 把面板的 all-time 聚合改成按字节偏移增量折叠，但状态只在进程内存
-里：服务一重启，第一次刷新仍是全量扫描，而日志每天涨一万多行，冷扫描成本
-跟着线性上升。这一套把几份状态（snapshot / by_account / analytics 的
-all-time 折叠）连同位置信息落盘到数据目录，重启后第一次刷新只读新增字节。
-
-v4 起一类状态一份文件（usage-aggregate-cache-<kind>.json）：这一套按新的
-文件布局读写；升级前单文件（v3）的只读兼容由 _test_usage_cache_kinds.py
-钉住。
-
-这个套件钉住的是「checkpoint 只是加速」这条底线：
-
-  * 往返：折叠 → 写盘 → 模拟重启加载 → 聚合结果与不落盘时逐字节一致
-    （**包括 JSON 键顺序**：响应字节里键序是可见的，比较一律用不排序的
-    文本，并单独断言键序树一致——v1 用 sort_keys 写盘让加载后变成字母序，
-    正是这一类断言漏掉之后才暴露的问题）；
-  * 真·新进程：子进程加载 checkpoint，结果一致且确实走了加载路径；
-  * 续扫：checkpoint 之后日志增长，新进程只折增量，结果与全量一致；
-  * 降级：损坏 JSON / 截断 / schema 不符 / 日志被替换、截断或同尺寸重写 /
-    tail 签名不符 / 位置或类型不合法 / 目录不可写，一律当作没有缓存、走
-    全量，结果正确且不抛错；
-  * 采纳：剪枝线摘掉旧天的小时表（小时层比日桶短命）不算损坏，analytics
-    状态照常采用——误拒就会天天全量重折（#26）；
-  * 指纹：价格表或 realm 归属一变，checkpoint 必须作废；
-  * 节流：默认阈值下连续刷新不写文件，推进到阈值才写；
-  * 开关：WB_USAGE_CACHE=0 时行为与 #189 原状一致（不读也不写）。
-
-降级用例的写法：先给「应当被拒绝」的那份状态加一个一眼可见的载荷标记
-（poison），再做变异。标记没被采用就说明校验拦住了它；一旦被错误采用，结果
-里就会多出那个标记，用例当场失败——比只看「有没有加载」更直接。
-
-No network: the usage log, the pricing snapshot and the settings file are
-synthesised in a temp directory.
-"""
 import io
 import json
 import os
@@ -46,8 +11,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
-# 与 my_dump.py 同一把冻结时钟：聚合结果里有 time.time() 派生的字段，不冻结
-# 的话「父进程算的」和「子进程算的」必然不同——那是墙钟差异，不是行为差异。
+# 与 my_dump.py 共用一把冻结时钟：聚合结果含 time.time 派生的字段，不冻结
+# 时父进程与子进程的结果必然不同，那属于墙钟差异，与行为无关。
 FROZEN = 1791445200.0
 
 _TMP = tempfile.mkdtemp(prefix="wb-aggcache-")
@@ -62,19 +27,19 @@ import wb_proxy as P
 import wb_accounts
 import wb_pricing
 
-# 这个套件不碰真 accounts/ 目录：ACCOUNTS_DIR 是脚本旁边的硬编码路径，只能
-# 在导入后重绑（_test_analytics_by_key.py 里记过同样的坑）。
+# 这个套件不碰真实 accounts/ 目录：ACCOUNTS_DIR 是脚本旁的硬编码路径，只能在
+# 导入后重新绑定。
 P.ACCOUNTS_DIR = ACCOUNTS_DIR
 wb_pricing.set_data_dir(USAGE_DIR)
 wb_pricing.set_settings_dir(ACCOUNTS_DIR)
 
 USAGE_LOG = P.USAGE_LOG
-# v4 布局：一类状态一份文件。套件按 kind 读写这些文件，个别用例还会直接
-# 改坏某一类的文件来验证「一类坏不影响其余类」。
+# 一类状态一份文件。套件按 kind 读写这些文件，个别用例会直接改坏某一类文件，
+# 验证一类损坏不影响其余类。
 KIND_FILES = {kind: P._usage_cache_kind_path(kind)
               for kind in P._USAGE_CACHE_KINDS}
-# 写盘计数：文件 mtime 在粗粒度文件系统上只到秒，同一秒内的两次写无法区
-# 分，所以「有没有重写」直接数写入调用。
+# 写盘计数：粗粒度文件系统上的 mtime 只到秒，同一秒内的两次写无法区分，所以
+# 直接统计写入调用。
 _WRITES = []
 _real_write_kind = P._usage_cache_write_kind
 
@@ -86,8 +51,8 @@ def _counting_write_kind(kind, entries):
 
 
 P._usage_cache_write_kind = _counting_write_kind
-# snapshot 的结果里带着进程自己的 _usage["started"]，冻结它让父进程与子进程
-# 的输出可比。
+# snapshot 的结果带有进程自己的 _usage["started"]，冻结它让父进程与子进程的
+# 输出可比。
 P._usage["started"] = FROZEN
 
 PASS = FAIL = 0
@@ -104,11 +69,9 @@ def check(label, cond, extra=""):
 
 
 def canon(obj):
-    """两份结果的可比形态：同一份 JSON 文本。
+    """把结果转成可比较的 JSON 文本。
 
-    不排序键：响应的 JSON 字节里键序是可见的，checkpoint 加载回来的状态必须
-    连键顺序都和冷折叠一致（v1 的 sort_keys 写盘让加载后变成字母序，正是这个
-    函数当初用 sort_keys 比较时漏掉的那一类差异）。比较一律用不排序的文本。
+    不排序键：响应字节里键序可见，加载后的状态必须连键顺序都与冷折叠一致。
     """
     return json.dumps(obj, ensure_ascii=False)
 
@@ -124,11 +87,10 @@ def first_diff(a, b, span=70):
 
 
 def key_order(obj):
-    """一份 JSON 结构里的键顺序（值只留形状）。
+    """提取 JSON 结构里的键顺序，值只保留形状。
 
-    用 list 承载 dict 的键序，这样 == 比较本身就对顺序敏感。tuple 和 list 在
-    JSON 里都是数组（父进程的结果里有 tuple，子进程的是 list），按序列同等
-    对待，键序比较才不会把「经过一次 JSON 往返」误判成差异。
+    用 list 承载 dict 的键序，== 比较即对顺序敏感。tuple 与 list 在 JSON 里
+    都是数组，按序列同等对待，一次 JSON 往返不会被误判成差异。
     """
     if isinstance(obj, dict):
         return [(k, key_order(v)) for k, v in obj.items()]
@@ -157,13 +119,13 @@ def first_order_path(a, b, path=""):
 
 
 def adopted_all(state):
-    """三份状态是否都被采用（by_account 没有指纹，它单独为真说明不了问题）。"""
+    """三份状态是否都被采用。by_account 没有指纹，单独为真说明不了问题。"""
     return (state.get("snapshot", 0) > 0 and state.get("analytics", 0) > 0
             and state.get("by_account", 0) > 0)
 
 
 def check_same_shape(label, cold, loaded):
-    """值 + 键序都要一致（冷折叠结果 vs 加载 checkpoint 后的结果）。"""
+    """值与键序都要一致：冷折叠结果对比加载 checkpoint 后的结果。"""
     check(label + "：值一致", canon(cold) == canon(loaded),
           first_diff(canon(cold), canon(loaded)))
     check(label + "：键顺序一致", key_order(cold) == key_order(loaded),
@@ -193,7 +155,7 @@ ROWS = [
     row(FROZEN - 5000, "m-a", "u1", 100, 50),
     row(FROZEN - 4900, "m-b", "u2", 200, 20, realm="cn"),
     row(FROZEN - 4800, "m-a", "u1", 300, 30, key="k2"),
-    # 没有 realm 字段、模型只认前缀（gpt-）的行：归属与 CURRENT_REALM 无关
+    # 没有 realm 字段、模型只认 gpt- 前缀的行：归属与 CURRENT_REALM 无关
     row(FROZEN - 4700, "gpt-5.6-luna", "u3", 400, 40, realm=None),
     row(FROZEN - 4600, "m-b", "u2", 500, 50, realm="cn", outcome="failed"),
     row(FROZEN - 4500, "m-a", "u2", 600, 60, key=""),
@@ -205,13 +167,13 @@ ROWS = [
     row(FROZEN - 3900, "m-a", "u2", 330, 33, key="k2"),
     row(FROZEN - 3800, "m-b", "u2", 440, 44, realm="cn"),
     row(FROZEN - 3700, "m-a", "u1", 550, 55, outcome="client_aborted"),
-    # 没有 realm 字段、模型也不认前缀（m-c）：归属跟着 CURRENT_REALM 走
+    # 没有 realm 字段、模型也不认前缀 m-c 的行：归属跟着 CURRENT_REALM 走
     row(FROZEN - 3600, "m-c", "u3", 660, 66, realm=None),
     row(FROZEN - 3500, "m-a", "u1", 770, 77),
     row(FROZEN - 3400, "m-b", "u2", 880, 88, realm="cn"),
     row(FROZEN - 3300, "m-a", "u1", 990, 99, key="k2"),
 ]
-# 一条没有 `key` 字段的行（keys 功能之前写下的行）→ __before_keys__ 桶。
+# 一条没有 `key` 字段的行，折进 __before_keys__ 桶。
 _pre_key = row(FROZEN - 3200, "m-c", "u1", 111, 11)
 del _pre_key["key"]
 ROWS.append(_pre_key)
@@ -238,9 +200,9 @@ _MTIME = [FROZEN - 1000000.0]
 def write_pricing(doc):
     io.open(PRICING_FILE, "w", encoding="utf-8").write(
         json.dumps(doc, ensure_ascii=False))
-    # load_pricing() 按 (path, mtime) 缓存：两次写入落在同一个 mtime 刻度上
-    # 会拿不到新内容（Windows 上 time.time() 只有 ~15ms 精度），把 mtime 拨
-    # 到一把确定会前进的整数秒上。
+    # load_pricing 按 path 与 mtime 缓存：两次写入落在同一个 mtime 刻度上会
+    # 读不到新内容。Windows 上 time.time 只有约 15ms 精度，因此把 mtime 拨到
+    # 确定前进的整数秒。
     _MTIME[0] += 3600.0
     os.utime(PRICING_FILE, (_MTIME[0], _MTIME[0]))
 
@@ -258,7 +220,7 @@ def append_log(rows):
 
 
 def cache_env(enabled=None, min_bytes=None, min_seconds=None):
-    """把三个开关写进环境（None = 删除该变量，用默认值）。"""
+    """把三个开关写进环境。None 表示删除该变量并使用默认值。"""
     for name, value in (("WB_USAGE_CACHE", enabled),
                         ("WB_USAGE_CACHE_MIN_BYTES", min_bytes),
                         ("WB_USAGE_CACHE_MIN_SECONDS", min_seconds)):
@@ -284,7 +246,7 @@ def cache_env_off():
 # 结果与「模拟重启」
 # --------------------------------------------------------------------------
 def live():
-    """五个入口的原始结果（三份状态、三个 realm 视图都覆盖）。"""
+    """五个入口的原始结果，覆盖三份状态与三个 realm 视图。"""
     return {
         "snap": P._usage_snapshot_uncached(),
         "snap_intl": P._usage_snapshot_uncached(realm="intl"),
@@ -297,7 +259,7 @@ def live():
 
 
 def live_raw():
-    """(原始结果, 异常描述)。异常本身就是「校验没拦住」的一种表现。"""
+    """返回原始结果与异常描述。异常本身就是校验没拦住的一种表现。"""
     try:
         return live(), ""
     except Exception as exc:
@@ -305,7 +267,7 @@ def live_raw():
 
 
 def live_canon():
-    """(canon(结果), 异常描述)。"""
+    """返回 canon 后的结果与异常描述。"""
     obj, err = live_raw()
     return (canon(obj) if obj is not None else None), err
 
@@ -357,7 +319,7 @@ io.open(CHILD_SCRIPT, "w", encoding="utf-8", newline="\n").write(
 
 
 def run_child(extra_env=None):
-    """真·新进程：跑同一组入口，返回 (原始结果, checkpointed)。"""
+    """起一个真正的新进程跑同一组入口，返回原始结果与 checkpointed。"""
     dest = os.path.join(_TMP, "child_out.json")
     if os.path.exists(dest):
         os.unlink(dest)
@@ -382,7 +344,7 @@ def cache_files():
 
 
 def no_cache_files():
-    """一个 kind 文件都没有（等价于「没有 checkpoint」）。"""
+    """一个 kind 文件都没有，等价于没有 checkpoint。"""
     return not cache_files()
 
 
@@ -395,9 +357,9 @@ def make_checkpoint():
 
 
 def cache_data():
-    """五个 kind 文件的合并视图：{kind: entries}（缺失/读不出的当空表）。
+    """返回五个 kind 文件的合并视图，缺失或读不出的类别当空表。
 
-    与 v3 的单文件视图同形，用例里 _entry(data, kind, realm) 的写法不用改。
+    与单文件视图同形，用例里 _entry 的调用写法保持不变。
     """
     merged = {}
     for kind in P._USAGE_CACHE_KINDS:
@@ -413,9 +375,9 @@ def cache_data():
 
 
 def save_cache(data):
-    """把合并视图写回 kind 文件（保持 v4 的包装形状）。
+    """把合并视图写回 kind 文件，保持包装形状。
 
-    空表不写文件——与生产侧的写盘一致（没内容的类不落盘）。
+    空表不写文件，与生产侧一致，没内容的类别不落盘。
     """
     for kind in P._USAGE_CACHE_KINDS:
         entries = data.get(kind) or []
@@ -428,7 +390,7 @@ def save_cache(data):
 
 
 def kind_file_data(kind):
-    """某个 kind 文件的原始 JSON（顶层形状校验用）。"""
+    """返回某个 kind 文件的原始 JSON，用于顶层形状校验。"""
     with io.open(KIND_FILES[kind], encoding="utf-8") as fh:
         return json.load(fh)
 
@@ -444,7 +406,7 @@ def clear_cache_files():
 
 
 def _entry(data, kind, realm=None):
-    """checkpoint 里某一份状态（by_account 只有一份；其余按 realm 匹配）。"""
+    """取出 checkpoint 里某一份状态。by_account 只有一份，其余按 realm 匹配。"""
     for entry in data[kind]:
         if kind == "by_account" or entry.get("realm") == realm:
             return entry
@@ -503,8 +465,8 @@ check("by_account 那份不带 realm 轴", "realm" not in stored["by_account"][0
 check("写盘是原子替换：没有留下临时文件",
       not [n for n in os.listdir(USAGE_DIR) if n.endswith(".tmp")],
       os.listdir(USAGE_DIR))
-# 落盘时不能排序：文件里的键序必须是折叠的插入顺序。排序（v1 的 sort_keys）
-# 会让加载回来的一切变成字母序，响应字节随之与冷启动不同。
+# 落盘时不能排序：文件里的键序必须是折叠的插入顺序。排序会让加载回来的键
+# 变成字母序，响应字节随之与冷启动不同。
 stored_keys = list(_entry(stored, "snapshot", None)["snap"].keys())
 fold_keys = list(P._usage_snap_state[None]["snap"].keys())
 check("落盘的键顺序就是折叠的插入顺序（不是字母序）",
@@ -518,7 +480,7 @@ ADOPTED = dict(P._usage_cache_checkpointed)
 check("模拟重启后加载到了 checkpoint（三份都被采用）", adopted_all(ADOPTED), ADOPTED)
 check("加载后结果与不落盘逐字节一致", canon(LOADED_RAW or {}) == GOLDEN,
       err or first_diff(GOLDEN, canon(LOADED_RAW or {})))
-# 这是 v1 漏掉的那一类断言：值相等还不够，响应的 JSON 字节里键序是可见的。
+# 值相等还不够，响应 JSON 字节里的键序同样可见。
 check_same_shape("加载后 vs 冷折叠（模拟重启）", GOLDEN_RAW, LOADED_RAW)
 check("键序自检：冷折叠的顶层 summary 不是字母序（否则这条断言测不出东西）",
       list(GOLDEN_RAW["analytics"]["summary"]["all_time"].keys())[0] != "cached_tokens",
@@ -578,10 +540,10 @@ print("[4] 降级：坏 checkpoint 一律当作没有缓存")
 
 
 def poison(data, kind, realm=None):
-    """给一份状态加一个一眼可见的载荷标记。
+    """给一份状态加一个显眼的载荷标记。
 
-    校验放行它 → 结果里就会多出这个标记 → 用例当场失败；校验拦住了它 →
-    结果与真值逐字节一致。比只看「加载了没有」更直接。
+    校验放行时结果会多出这个标记，用例当场失败；校验拦住时结果与真值逐字节
+    一致。
     """
     entry = _entry(data, kind, realm)
     if kind == "snapshot":
@@ -595,8 +557,8 @@ def poison(data, kind, realm=None):
         entry["maps"]["summary"]["requests"] += 1000
 
 
-# 先证明标记本身是可见的：三份都带上标记、都照常被采用时，结果必须明显
-# 不同——否则下面的降级用例可能什么都没测到。
+# 先证明标记可见：三份都带标记且都被采用时，结果必须明显不同，否则下面的
+# 降级用例可能什么都没测到。
 make_checkpoint()
 data = cache_data()
 poison(data, "snapshot", None)
@@ -611,7 +573,7 @@ check("标记机制自检：三份状态都被采用时标记会出现在结果�
 
 
 def mutate_cache(mutate, label, kind="snapshot", realm=None):
-    """先给要变异的那份状态加标记，再变异，然后从它加载——结果必须回到真值。"""
+    """先给要变异的状态加标记再变异，然后从它加载，结果必须回到真值。"""
     make_checkpoint()
     data = cache_data()
     poison(data, kind, realm)
@@ -626,8 +588,8 @@ def mutate_cache(mutate, label, kind="snapshot", realm=None):
 def mutate_kind_file(kind, mutate, label, others=("analytics", "by_account")):
     """改坏某个 kind 文件的顶层形状，再从它加载。
 
-    该类的状态必须被拒、结果回到真值，而其余类照常被采用——一类文件坏了不
-    拖累其余类，这是 v4 拆文件的直接承诺。
+    该类的状态必须被拒绝、结果回到真值，其余类照常被采用：一类文件损坏不
+    拖累其余类。
     """
     make_checkpoint()
     data = kind_file_data(kind)
@@ -643,7 +605,7 @@ def mutate_kind_file(kind, mutate, label, others=("analytics", "by_account")):
               P._usage_cache_checkpointed)
 
 
-# 4.1 文件本身读不出来（五个 kind 文件一起改坏：等于「没有任何 checkpoint」）
+# 4.1 文件本身读不出来：五个 kind 文件一起改坏，等于没有任何 checkpoint
 make_checkpoint()
 for path in cache_files():
     io.open(path, "wb").write(b"{this is not json")
@@ -676,7 +638,7 @@ clear_cache_files()
 restart()
 check("文件不存在：结果回到真值", canon(live()) == GOLDEN)
 
-# 4.2 schema 与顶层形状（按类分别校验：坏一份只作废一份）
+# 4.2 schema 与顶层形状：按类分别校验，坏一份只作废一份
 mutate_kind_file("snapshot", lambda d: d.update({"schema": 6}),
                  "schema 版本不符（比当前新）")
 mutate_kind_file("snapshot", lambda d: d.update({"schema": 4}),
@@ -725,7 +687,7 @@ mutate_cache(lambda d: _entry(d, "by_account").update({"offset": 10 ** 9}),
 mutate_cache(lambda d: _entry(d, "analytics").update({"offset": 10 ** 9}),
              "analytics 的 offset 超出文件长度", kind="analytics")
 
-# 4.4 载荷形状（手工改坏字段类型）
+# 4.4 载荷形状：手工改坏字段类型
 mutate_cache(lambda d: _entry(d, "snapshot")["snap"].update({"requests": "很多"}),
              "snapshot 的数字字段被写成字符串")
 mutate_cache(lambda d: _entry(d, "snapshot")["snap"].pop("by_model"),
@@ -754,20 +716,19 @@ mutate_cache(lambda d: _entry(d, "analytics")["maps"]["keys"]["__before_keys__"]
 mutate_cache(lambda d: _entry(d, "analytics")["maps"]["models"].update({"m-a": 5}),
              "analytics 的模型条目不是对象", kind="analytics")
 
-# 4.5 realm 字段缺失/写错（缺失的条目绝不能被 realm=None 匹配走）
+# 4.5 realm 字段缺失或写错：缺失的条目不能被 realm=None 匹配走
 mutate_cache(lambda d: _entry(d, "snapshot", None).pop("realm"),
              "条目没有 realm 字段")
 mutate_cache(lambda d: _entry(d, "snapshot", None).update({"realm": 5}),
              "realm 字段类型不对")
 
-# 4.6 采纳：剪枝线摘掉旧天的小时表不算损坏（#26）
+# 4.6 采纳：剪枝线摘掉旧天的小时表不算损坏 #26
 #
-# _prune_day_buckets 的 hours_keep 一段会把保留窗口之外的旧天的小时表摘掉
-# （pop 掉键；午夜兜底那天则置 None）。摘掉之后这份状态仍然可用：按日对齐的
-# 窗口照旧由日桶自身的 maps 回答，整点窗口本来就按 hours is None 退回整段
-# 扫描。曾经 analytics 的日桶判据要求 hours 必须是 dict，于是「只要还在折新行，
-# 剪枝线天天摘、整份状态天天被判废」，每次进程启动都要付一次全量重折（44MB
-# 副本上实测 ~3s）。下面反过来钉：这样的状态**必须被采纳**。
+# _prune_day_buckets 的 hours_keep 一段会把保留窗口之外的旧天的小时表摘掉，
+# pop 掉键，午夜边界那天则置 None。摘掉之后这份状态仍然可用：按日窗口由日桶
+# 自身的 maps 回答，整点窗口按 hours is None 退回整段扫描。analytics 的日桶
+# 判据若要求 hours 必须是 dict，整份状态就会被判废，每次进程启动都要付一次
+# 全量重折；44MB 副本上实测约 3s。这里反过来确认：这样的状态必须被采纳。
 
 
 def strip_day_hours(entry, mode="pop"):
@@ -786,13 +747,13 @@ def strip_day_hours(entry, mode="pop"):
 
 
 def accept_cache(mutate, label, kind="analytics", realm=None):
-    """加标记 + 变异后加载——标记必须仍出现在结果里（= 状态被采纳）。
+    """加标记并变异后加载，标记必须仍出现在结果里，说明状态被采纳。
 
-    与 mutate_cache 相反：那边钉「坏状态必须被拒」，这边钉「合法状态不许被
-    误拒」。被误拒时走全量重折，标记消失、结果等于真值，用例当场失败。
+    与 mutate_cache 相反：那边验证坏状态必须被拒，这里验证合法状态不许被
+    误拒。被误拒时会走全量重折，标记消失、结果等于真值，用例当场失败。
 
-    每轮先清掉盘上的 checkpoint 从干净的一份重来：与降级用例不同，这里标记
-    会被真的采用，采用后的状态可能落回盘上，不清就会把 +1000 带进后面的用例。
+    每轮先清掉盘上的 checkpoint 后重来：这里标记会被真正采用，采用后的状态
+    可能写回盘上，不清就会把 +1000 带进后面的用例。
     """
     clear_cache_files()
     make_checkpoint()
@@ -821,8 +782,8 @@ accept_cache(lambda d: _state.update(
 check("用例有实义：确实把至少一个日桶的 hours 置成了 null",
       _state.get("n", 0) > 0, "夹具里没有带 hours 的日桶")
 
-# 收尾：把带标记的状态从盘上清掉、重建一份干净的 checkpoint，免得 +1000
-# 顺着盘上的文件漏进后面的指纹用例。
+# 收尾：把带标记的状态从盘上清掉并重建一份干净的 checkpoint，免得 +1000 顺着
+# 盘上的文件漏进后面的指纹用例。
 clear_cache_files()
 make_checkpoint()
 
@@ -925,7 +886,7 @@ check("同尺寸重写：确实没有被采用", not P._usage_cache_checkpointed
 
 write_log(ROWS)
 make_checkpoint()
-# 整个文件被换掉（新文件对象）：dev/ino 变了，或内容一致——接受或拒绝都
+# 整个文件被换掉，生成了新文件对象：dev/ino 变了，或内容一致。接受或拒绝都
 # 允许，结果必须永远正确。
 os.unlink(USAGE_LOG)
 write_log(ROWS)
@@ -973,7 +934,7 @@ try:
 finally:
     P._usage_cache_kind_path = real_kind_path
     P._usage_cache_path = real_path
-# 读路径被目录占位（open 会抛 OSError，必须被吞掉）
+# 读路径被目录占位：open 会抛 OSError，必须被吞掉
 make_checkpoint()
 clear_cache_files()
 os.makedirs(KIND_FILES["snapshot"])
@@ -1038,22 +999,22 @@ check("写出来的还是完整的 checkpoint（每份自带 schema 与 kind 标
           and kind_file_data(k)["kind"] == k
           for k in P._USAGE_CACHE_KINDS if os.path.exists(KIND_FILES[k])))
 
-# 空闲不重写（本节的靶子）：进度已对齐到 checkpoint，等满一个时间窗口后再
-# 刷新，日志没有新字节 → 不许再写。旧行为：计时器到点就无条件写一份逐字节
-# 相同的 checkpoint，面板开着等于每 900s 白写一份 120KB（纯写放大）。
+# 空闲不重写：进度已与 checkpoint 同步，等满一个时间窗口后再刷新，日志没有
+# 新字节时不许再写。计时器到点就无条件写会让面板开着时每 900s 白写一份逐字节
+# 相同的 120KB checkpoint，纯属写放大。
 cache_env(enabled=1, min_bytes=10 ** 9, min_seconds=900)
 writes_before = _WRITES.count("snapshot")
 P._usage_cache_last_attempt -= 901
 live()
 check("计时器到点 + 无推进：不写（空闲不重写）",
       _WRITES.count("snapshot") == writes_before)
-# 同一件事从真实调用路径再走一遍：无新字节的 usage_snapshot(range="today")
-# 是面板轮询每几秒就碰一次的路径（日桶半 → _usage_cache_maybe_save）。
+# 从真实调用路径再走一遍：带 range=today 的 usage_snapshot 是面板轮询每几秒
+# 就碰一次的路径，经由日桶分支进入 _usage_cache_maybe_save。
 P._usage_cache_last_attempt -= 901
 P.usage_snapshot(range="today", ttl=0)
 check("无新字节的 usage_snapshot(range=today) 不重写 checkpoint",
       _WRITES.count("snapshot") == writes_before)
-# 有推进（不足字节阈值）：计时器分支照常写——修的是空闲重写，不是计时器
+# 有推进但不足字节阈值：计时器分支照常写，只有空闲重写被跳过。
 append_log([row(FROZEN - 100, "m-a", "u1", 500, 50)])
 P._usage_cache_last_attempt -= 901
 live()
@@ -1061,7 +1022,7 @@ check("计时器到点 + 有新字节（不足字节阈值）：写一次",
       _WRITES.count("snapshot") == writes_before + 1)
 write_log(ROWS)                          # 恢复基线日志，后续用例共用它
 
-# 加载之后不产生「白写」：采用 checkpoint 会把节流基线对齐到加载的 offset
+# 加载之后不产生白写：采用 checkpoint 会把节流基线设到加载的 offset
 cache_env(enabled=1)                     # 默认阈值
 writes_before = _WRITES.count("snapshot")
 restart()
@@ -1088,10 +1049,10 @@ check("再模拟一次重启结果仍不变", third == GOLDEN, first_diff(GOLDEN
 
 print()
 print("[9] 指纹必须与「账号池加载到哪一步」无关（重启后第一刻就要命中）")
-# 这一节用一份自己的账号目录与日志：
-#   * 账号文件放在磁盘上（指纹的来源）；
-#   * 日志每行都带 realm 字段，归属完全由字段决定——这样「池在不在」不影响
-#     任何数字，断言「命中」时不必纠缠归属口径。
+# 这一节使用独立的账号目录与日志：
+#   * 账号文件放在磁盘上，作为指纹来源；
+#   * 日志每行都带 realm 字段，归属完全由字段决定。这样账号池在不在都不影响
+#     任何数字，断言命中时不必纠缠归属口径。
 REAL_ACCOUNTS = os.path.join(_TMP, "accounts-real")
 os.makedirs(REAL_ACCOUNTS, exist_ok=True)
 _ACCT_MTIME = [FROZEN - 2000000.0]
@@ -1101,9 +1062,9 @@ def write_account(uid, realm):
     path = os.path.join(REAL_ACCOUNTS, uid + ".json")
     io.open(path, "w", encoding="utf-8").write(json.dumps(
         {"uid": uid, "realm": realm, "accessToken": "", "nickname": uid}))
-    # 指纹的磁盘缓存键含 (size, mtime)：两次写入落在同一个 mtime 刻度上会
-    # 读不到新内容（Windows 的 time.time() 只有 ~15ms 精度），拨到确定前进
-    # 的整数秒上。
+    # 指纹的磁盘缓存键含 size 与 mtime：两次写入落在同一个 mtime 刻度上会
+    # 读不到新内容。Windows 的 time.time 只有约 15ms 精度，因此拨到确定前进
+    # 的整数秒。
     _ACCT_MTIME[0] += 3600.0
     os.utime(path, (_ACCT_MTIME[0], _ACCT_MTIME[0]))
 
@@ -1128,14 +1089,14 @@ try:
     fp_none = P._realm_inputs()
     P.POOL = wb_accounts.AccountPool(REAL_ACCOUNTS)      # 建好了，还没 load()
     fp_unloaded = P._realm_inputs()
-    P.POOL.load()                                        # 加载完成
+    P.POOL.load()
     fp_loaded = P._realm_inputs()
     check("指纹与池的加载状态无关（未建/未加载/已加载都相同）",
           fp_none == fp_unloaded == fp_loaded, (fp_none, fp_unloaded, fp_loaded))
     check("指纹就是磁盘上的 uid→realm",
           fp_loaded == (P.CURRENT_REALM, (("u-1", "intl"), ("u-2", "cn"))), fp_loaded)
 
-    # 先写一份 checkpoint（池就绪），再用「池未就绪」的状态加载：必须命中。
+    # 先写一份 checkpoint，此时池已就绪，再用池未就绪的状态加载：必须命中。
     check("池就绪时写盘成功", make_checkpoint())
     stored = cache_data()
     check("落盘的 realm 指纹就是磁盘那份",
@@ -1149,8 +1110,8 @@ try:
     check("池未就绪的进程仍然命中 checkpoint（含带 realm 指纹的两份）",
           adopted_all(P._usage_cache_checkpointed), P._usage_cache_checkpointed)
     check("池未就绪时的结果与冷折叠一致", got == NINE, err or first_diff(NINE, got or ""))
-    # 池加载完之后：载荷里的 accounts_map/account 由活池派生，数字部分必须仍
-    # 然与全量折叠一致（这一段就是「运行 10 分钟后」的那一态）。
+    # 池加载完之后：载荷里的 accounts_map 与 account 由活池派生，数字部分必须
+    # 仍与全量折叠一致，对应运行 10 分钟后的状态。
     P.POOL.load()
     cache_env_off()
     restart()
@@ -1161,7 +1122,7 @@ try:
     check("池加载完之后同样命中且一致", got == NINE_LOADED,
           err or first_diff(NINE_LOADED, got or ""))
 
-    # 磁盘变了（realm 改了）：指纹必须跟着变，且池没跟上时不许写盘。
+    # 磁盘变了，realm 已改：指纹必须跟着变，池没跟上时不许写盘。
     write_account("u-2", "intl")
     check("账号文件改了，指纹跟着变",
           P._realm_inputs() != fp_loaded, P._realm_inputs())
@@ -1180,8 +1141,8 @@ try:
     restart()
     check("改回来之后指纹回到原值", P._realm_inputs() == fp_loaded, P._realm_inputs())
 
-    # 池整个不存在而磁盘上有账号：折叠根本不查账号映射，这种折叠冷进程复现
-    # 不了 —— 宁可不信任、不写，等池就绪后再用。
+    # 池整个不存在而磁盘上有账号：折叠根本不查账号映射，冷进程无法复现这种
+    # 折叠。此时不信任也不写，等池就绪后再用。
     P.POOL = None
     clear_cache_files()
     cache_env_force()

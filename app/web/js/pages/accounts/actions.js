@@ -21,6 +21,20 @@ export function loadProxySlots() {
   return getJSON('/proxy/slots');
 }
 
+/** 某个版本的可用模型，账号的排除名单从这里选。 */
+export function loadRealmModels(realm) {
+  return getJSON('/v1/models?realm=' + encodeURIComponent(realm));
+}
+
+export function setDisabledModels(uid, models) {
+  return postJSON('/accounts/set', { uid, disabledModels: models });
+}
+
+/** 今天的活动流水：Buddy 加油站与每日活跃的完成情况都按它判定。 */
+export function loadActivityToday() {
+  return getJSON('/activity/history?range=today&limit=200');
+}
+
 export function refreshCredits(realm) {
   return postJSON('/accounts/credits', realm ? { realm } : {});
 }
@@ -35,6 +49,11 @@ export function checkin(uid) {
 
 export function dailyChat(uid) {
   return postJSON('/accounts/daily-chat', uid ? { uid } : {});
+}
+
+/** 只给名单里的账号打卡：今天已经打过的不再打第二遍。 */
+export function dailyChatPending(uids) {
+  return postJSON('/accounts/daily-chat', { uids });
 }
 
 export function dailyChatWeb(uid) {
@@ -99,8 +118,8 @@ export function importDesktopCredential(path, realm) {
   return postJSON('/accounts/import/desktop', { path, realm });
 }
 
-export function startLogin(realm) {
-  return postJSON('/accounts/login/start', { platform: 'CLI', realm });
+export function startLogin(realm, product) {
+  return postJSON('/accounts/login/start', { product, realm });
 }
 
 export function pollLogin(state) {

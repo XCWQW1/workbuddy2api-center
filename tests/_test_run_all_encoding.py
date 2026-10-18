@@ -1,15 +1,3 @@
-"""run_all.py must survive a non-UTF-8 console when a suite prints Chinese.
-
-The Windows CI runner's stdout is cp1252. Suites are executed with
-PYTHONIOENCODING=utf-8 and their output is read back from a utf-8 log, but
-run_all.py then re-prints the summary line itself - and that print used the
-console encoding. The first Chinese summary aborted the whole run with
-UnicodeEncodeError *after* every suite had already passed, which is why the
-Windows job failed on main for a string of releases.
-
-Run with: python _test_run_all_encoding.py
-Runs one narrow suite as a subprocess; no network, no credentials.
-"""
 import os
 import subprocess
 import sys
@@ -19,9 +7,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 RUN_ALL = os.path.join(HERE, "run_all.py")
 
-# A suite that prints a Chinese summary, so the parent's own print() is the
-# thing under test. Kept narrow so this stays a subprocess, not a full run.
-NON_ASCII_SUITE = "settings_load"
+# 该套件会打印中文摘要，被测的就是父进程自己的 print。只跑一个套件，
+# 保持子进程粒度，不跑整轮。
+NON_ASCII_SUITE = "accounts_logic"
 
 
 class RunAllEncodingTests(unittest.TestCase):
@@ -33,7 +21,7 @@ class RunAllEncodingTests(unittest.TestCase):
                               stderr=subprocess.STDOUT, timeout=300)
 
     def test_survives_a_cp1252_console(self):
-        """The regression: this used to exit non-zero with UnicodeEncodeError."""
+        """cp1252 下退出码必须为 0，输出也不含 UnicodeEncodeError。"""
         result = self._run("cp1252")
         output = result.stdout.decode("utf-8", "replace")
         self.assertEqual(result.returncode, 0,
@@ -46,7 +34,7 @@ class RunAllEncodingTests(unittest.TestCase):
                          result.stdout.decode("utf-8", "replace"))
 
     def test_reports_the_selected_suite(self):
-        """Guard against the fix silently short-circuiting the run."""
+        """防止运行被静默短路。"""
         result = self._run("cp1252")
         output = result.stdout.decode("utf-8", "replace")
         self.assertIn(NON_ASCII_SUITE, output)

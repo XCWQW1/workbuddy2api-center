@@ -37,10 +37,9 @@ MANIFEST_NAME = "release-manifest.json"
 MARKER = "<!-- release-download-block -->"
 SCHEMA = 1
 
-# The folder every packaged file lives under. It matches the green package
-# (tools/_build_green_package.py), so extracting gives one folder instead of a
-# loose pile, and the updater planned in #29 has a single prefix to strip
-# (declared in the manifest).
+# The folder every packaged file lives under. It matches the launcher layout,
+# so extracting gives one folder instead of a loose pile, and the updater
+# planned in #29 has a single prefix to strip (declared in the manifest).
 PACKAGE_ROOT = "wb-proxy-center"
 
 # Paths the updater must never touch. They travel with the archive's manifest
@@ -80,6 +79,17 @@ def _zip_date(epoch):
     return (t.tm_year, t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec)
 
 
+def is_dot_path(name):
+    """True when any path component starts with a dot.
+
+    The release ZIP carries product files only; tool config (``.github``,
+    ``.gitignore`` and the like) must never leak in, whether it comes from the
+    manifest or from the runtime tree.
+    """
+    return any(part.startswith(".") for part in
+               str(name or "").replace("\\", "/").split("/") if part)
+
+
 def build_portable(version, tag, out_path, source=ROOT, runtime_dir=None,
                    root=PACKAGE_ROOT, epoch=DEFAULT_EPOCH):
     """Write the portable ZIP and return (path, [managed files]).
@@ -97,6 +107,9 @@ def build_portable(version, tag, out_path, source=ROOT, runtime_dir=None,
     portable_runtime.verify(runtime_dir)
 
     files = read_manifest()
+    hidden = [p for p in files if is_dot_path(p)]
+    if hidden:
+        raise SystemExit("清单里不能有以点开头的路径：%s" % ", ".join(hidden))
     missing = [p for p in files if not os.path.isfile(os.path.join(source, p))]
     if missing:
         raise SystemExit("清单里的文件不存在：%s" % ", ".join(missing))
@@ -127,6 +140,8 @@ def build_portable(version, tag, out_path, source=ROOT, runtime_dir=None,
         for fn in filenames:
             full = os.path.join(dirpath, fn)
             rel = os.path.relpath(full, runtime_dir).replace(os.sep, "/")
+            if is_dot_path(rel):
+                continue
             with open(full, "rb") as fh:
                 entries.append(("%s/python/%s" % (root, rel), fh.read(), 0o755))
             runtime_files += 1

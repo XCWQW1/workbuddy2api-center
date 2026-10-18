@@ -25,17 +25,13 @@
 
 LICENSE
 README.md
-dashboard.html
 
 start-wb-proxy.bat
 start-wb-proxy.command
 start-wb-proxy.sh
-restart-wb-proxy.bat
 start-wb-proxy-lan.bat
 start-wb-proxy-lan.command
-restart-wb-proxy.command
 start-wb-proxy-lan.sh
-restart-wb-proxy.sh
 allow-firewall.bat
 allow-firewall.command
 
@@ -98,6 +94,7 @@ app/web/js/core/theme.js
 app/web/js/main.js
 app/web/js/pages/accounts.js
 app/web/js/pages/accounts/actions.js
+app/web/js/pages/accounts/activity.js
 app/web/js/pages/accounts/dialogs.js
 app/web/js/pages/accounts/logic.js
 app/web/js/pages/credits.js

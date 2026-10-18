@@ -1,5 +1,5 @@
 """Tests for fingerprint sanitization, including PR #62 OmO Sisyphus-Junior fix."""
-import json, os, sys, tempfile, unittest
+import json, os, sys, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)

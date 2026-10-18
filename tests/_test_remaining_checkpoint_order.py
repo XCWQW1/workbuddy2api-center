@@ -1,33 +1,3 @@
-"""Remaining-usage checkpoint ordering: an out-of-order log still adopts.
-
-`at` is the request *completion* clock and the fold appends rows in log order,
-so two request threads finishing milliseconds apart leave a pair whose `at`
-regresses a little (the real local log has such a pair 4.96ms apart at lines
-18338/18339; the router's own 674KB checkpoint has one 0.47ms apart). The
-loading side used to demand a monotonically ordered list, so that single
-inversion rejected the whole remaining entry and every restart paid the cold
-scan again (3.05s on the router, 4.5s measured later) even though the file
-had just been written.
-
-Pinned here:
-
-  - the fold keeps every pair sorted by `at`, so a window sum equals the sum
-    recomputed on the sorted sequence; on an unsorted buffer `_range_sum`'s
-    bisection skipped whole stretches (the same rows could sum to 0);
-  - a checkpoint written from an out-of-order log adopts after a restart with
-    zero rows re-folded and a payload byte-identical to the cold fold's;
-  - a *legacy* checkpoint (buffers in log order, the shape every pre-fix
-    writer wrote - including the router's real file) is stable-sorted and
-    repaired at adopt with the same byte-identical payload;
-  - repair-unable data (a negative amount) is still rejected as a whole;
-  - truncation and same-size rewrites still invalidate the checkpoint;
-  - two independent processes - cold fold vs adopt from checkpoint, both
-    through the public `remaining_usage()` - produce identical payload bytes.
-
-The fixture shapes come from the real files: the 1100-row pair stands for the
-router checkpoint's base>0/head=0 pair, the 560-row one for its head=178/176
-pair, and the two regression constants are the real deltas.
-"""
 import io
 import json
 import os
@@ -50,15 +20,15 @@ import wb_proxy as P
 MODEL = "deepseek-v4.1-flash"
 MODEL_B = "hy4"
 HOUR = 3600
-# 真实回退量：本机日志 L18338/18339 的相邻两行，与路由器 checkpoint 里
-# 3a92cd99-.../deepseek-v4.1-flash 那条（head=178 的长尾，回退在最后一格）。
+# 真实回退量：本机日志 L18338/18339 的相邻两行，以及路由器 checkpoint 里
+# 3a92cd99-.../deepseek-v4.1-flash 那条 head=178 的长尾，回退在最后一格。
 REAL_REGRESSION = 0.00496
 ROUTER_REGRESSION = 0.0004658699035644531
 RESET_STAMP = "2026-10-09 08:00:00"
 
 
 def reset_epoch(stamp):
-    """6004 文本里那个 UTC+8 墙钟解出来的 epoch（与主机时区无关）。"""
+    """把 6004 文本里的 UTC+8 墙钟解析成 epoch，与主机时区无关。"""
     detail = ('{"code":6004,"msg":"usage exceeds frequency limit, but don\'t '
               'worry, your usage will reset at %s UTC+8, alternatively, you can '
               'switch to the other models to continue using it.","requestId":"x"}'

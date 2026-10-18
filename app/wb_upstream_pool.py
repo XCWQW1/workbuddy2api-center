@@ -8,7 +8,7 @@ urllib 这条路上连接**不可能**复用——每个出站请求都要重新
 （4 次取最小），是请求路径上最大的一笔开销，比全部本地 CPU 项之和还大；多轮对话
 每轮都要付一遍。这里绕开 do_open，直接拿 http.client 的连接来复用，其余语义
 （代理 CONNECT、Proxy-Authorization、Host / Content-Length / Accept-Encoding 头、
-HTTPError / URLError 的映射、重定向跟随）逐条与 urllib 对齐，差别只有
+HTTPError / URLError 的映射、重定向跟随）逐条与 urllib 一致，差别只有
 Connection: keep-alive 这一处，见下面各函数的注释。
 
 什么时候**不**走池（抛 PoolBypass，由 wb_accounts.urlopen 回退到 urllib 原路径，
@@ -286,7 +286,7 @@ class _PooledHTTPSConnection(http.client.HTTPSConnection):
 
 
 class _KeepAlivePool(object):
-    """按键存放空闲连接。锁只保护 _idle 字典；一条连接同一时刻只属于一个使用者。"""
+    """按键存放空闲连接。锁只保护 _idle 字典；一条连接同一时刻只属于一个调用方。"""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -323,7 +323,7 @@ class _KeepAlivePool(object):
                 self._close(conn)
                 conn = None
             else:
-                # 复用前把读超时重设回本次请求的超时：上一位使用者可能是流式请求，
+                # 复用前把读超时重设回本次请求的超时：上一个调用方可能是流式请求，
                 # _apply_stream_idle_timeout 把 socket 超时改成了 idle 值（默认
                 # 300s）；不重置的话这次请求连响应头也会按 300s 等，线程被拖住。
                 try:
@@ -443,7 +443,7 @@ def _target_parts(url):
 def _split_proxy(proxy):
     """拆分代理串 -> dict(scheme, user, password, host, port)，非 HTTP 代理返回 None。
 
-    语义与 urllib.request._parse_proxy 对齐（支持 http://user:pass@host:port 与
+    语义与 urllib.request._parse_proxy 一致（支持 http://user:pass@host:port 与
     authority 形式 host:port），但只认 http 代理：socks5:// 之类的串返回 None，
     调用方回退到 urllib 原路径（那条路本来也不支持它们），不在这里发明新行为。
     """
@@ -654,7 +654,7 @@ def egress_key(url, proxy=""):
 def urlopen(req, timeout=30, proxy=""):
     """连接池版 urlopen。签名与 wb_accounts.urlopen 一致。
 
-    失败语义与 urllib 对齐：HTTP >= 400 抛 HTTPError（body 已读好，挂在 BytesIO
+    失败语义与 urllib 一致：HTTP >= 400 抛 HTTPError（body 已读好，挂在 BytesIO
     上，exc.read()/read(n)/fp 的行为不变）；发送阶段的 OSError 抛 URLError；
     其余 http.client 异常原样上抛。
 

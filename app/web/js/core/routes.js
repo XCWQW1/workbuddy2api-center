@@ -4,9 +4,9 @@ export const ROUTES = [
   { path: 'dashboard', title: '仪表盘', icon: 'BarChart3', dock: true, group: 'overview', groupLabel: '总览',
     keywords: '首页 总览 概况', load: () => import('../pages/dashboard.js') },
   { path: 'accounts', title: '账号', icon: 'Users', dock: true, group: 'ops', groupLabel: '运营', section: 'accounts',
-    keywords: '账号池 积分 签到 登录 导入 导出', load: () => import('../pages/accounts.js') },
+    keywords: '账号池 积分 签到 加油站 今日活跃 登录 导入 导出', load: () => import('../pages/accounts.js') },
   { path: 'tasks', title: '任务', icon: 'ClipboardList', section: 'accounts',
-    keywords: '成长任务 猫猫旅行 调度器 巡检 签到 打卡 积分变动', load: () => import('../pages/tasks.js') },
+    keywords: '成长任务 猫猫旅行 调度器 巡检 签到 加油站 打卡 今日活跃 积分变动', load: () => import('../pages/tasks.js') },
   { path: 'credits', title: '积分', icon: 'Coins', dock: true, group: 'ops', section: 'accounts',
     keywords: '积分 余额 套餐 到期 来源', load: () => import('../pages/credits.js') },
   { path: 'keys', title: '密钥', icon: 'KeyRound', dock: true, group: 'ops',
@@ -27,7 +27,7 @@ export const ROUTES = [
 
 // 设置页的标签：地址为 #/settings/<id>。
 export const SETTINGS_TABS = [
-  { id: 'gateway', title: '网关行为', icon: 'Server', keywords: '保留积分 每日限额 自动切换 Messages 网络工具 测试模型 打卡' },
+  { id: 'gateway', title: '网关行为', icon: 'Server', keywords: '保留积分 每日限额 自动切换 Messages 网络工具 接口测试模型 打卡' },
   { id: 'proxy', title: '代理槽', icon: 'Network', keywords: '代理 出口 槽位' },
   { id: 'security', title: '面板密码', icon: 'ShieldCheck', keywords: '密码 安全 登录' },
   { id: 'about', title: '运行信息', icon: 'Info', keywords: '版本 目录 关于' },

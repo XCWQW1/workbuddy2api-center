@@ -56,14 +56,14 @@ export function chip(label, active, onClick, count) {
 }
 
 /** 统计卡。tone：success / warning / danger / info / violet，缺省为中性。 */
-export function statCard({ label, value, icon: iconName, tone = '', hint = nothing, hintTone = '', delay = 0 }) {
+export function statCard({ label, value, icon: iconName, tone = '', hint = nothing, hintTone = '', delay = 0, compact = false }) {
   return html`
-    <div class="stat" style="animation-delay:${delay}s">
+    <div class="stat ${compact ? 'stat-compact' : ''}" style="animation-delay:${delay}s">
       <div class="stat-top">
         <span class="stat-label">${label}</span>
         ${iconName ? html`<span class="stat-icon ${tone ? 'tone-' + tone : ''}">${icon(iconName)}</span>` : nothing}
       </div>
-      <div class="stat-value ${tone ? 'tone-' + tone : ''}">${value}</div>
+      <div class="stat-value ${compact ? 'stat-value-compact' : ''} ${tone ? 'tone-' + tone : ''}">${value}</div>
       ${hint !== nothing && hint !== '' && hint !== undefined ? html`<div class="stat-hint ${hintTone ? 'tone-' + hintTone : ''}">${hint}</div>` : nothing}
     </div>`;
 }

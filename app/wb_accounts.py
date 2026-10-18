@@ -225,6 +225,34 @@ DEFAULT_UA_VERSION = wb_identity.DESKTOP_VERSION_INTL
 def get_realm_config(realm):
     return REALM_CONFIGS.get(realm) or REALM_CONFIGS["intl"]
 
+
+def login_headers(realm, product, method="POST"):
+    """auth/state 与 auth/token 的请求头，与所选官方客户端一致。
+
+    桌面端由主进程直接发 Node 请求，带 X-Custom-Channel-Id 与链路头；VS Code
+    插件与 CLI 只带链路头和 X-No-* 标记头。三者在登录时都不带浏览器的 Origin、
+    Referer 与 X-Requested-With；GET 请求也没有 Content-Type。设备令牌
+    （X-Device-Token）与设备标识（X-Device-Id-List）来自本机原生 SDK，网关
+    没有对应的来源，因此不发。
+    """
+    product = wb_identity.normalize_product(product)
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": wb_identity.identity_user_agent(realm, product),
+        # 告诉服务端不要从会话里补认证信息：官方客户端在登录请求上固定发送。
+        "X-No-Authorization": "true",
+        "X-No-User-Id": "true",
+        "X-No-Enterprise-Id": "true",
+        "X-No-Department-Info": "true",
+    }
+    if method == "GET":
+        headers.pop("Content-Type", None)
+    headers.update(wb_identity.login_trace_headers())
+    if product == wb_identity.PRODUCT_DESKTOP:
+        headers["X-Custom-Channel-Id"] = "unknown"
+    return headers
+
 def _jwt_claims(token):
     try:
         segment = str(token).split(".")[1]
@@ -1145,7 +1173,7 @@ class Account(object):
             old = self.model_caps.get(model)
             if old is not None and float(old.get("reset") or 0) == reset:
                 # 同一个窗口的重复撞线：不用重写凭证档，但冷却要重新挂上——
-                # 中间可能被换身分之类的清理顺手清掉过；挂不回来，这个窗口
+                # 中间可能被换身份之类的清理顺手清掉过；挂不回来，这个窗口
                 # 就一直不会被禁用（真机实测）。
                 if self.model_cooldowns.get(model, 0.0) < reset:
                     self.model_cooldowns[model] = reset
@@ -1290,7 +1318,7 @@ class Account(object):
         """这个账号被人工禁用了该模型？空名单恒为 False。
 
         与自动节流区分：`model_cooldowns` / `model_caps` 表达「暂时不该用」，
-        这里是使用者明确指定的「这个号就别碰这几个模型」。精确匹配（名单在
+        这里是用户明确指定的「这个号就别碰这几个模型」。精确匹配（名单在
         加载时已按小写归一），不做前缀匹配。
         """
         if not model or not self.disabled_models:
@@ -1342,11 +1370,11 @@ class Account(object):
         """组出这一轮的出站标头。
 
         chat 用途走 wb_identity（CLI 头 / WorkBuddy 头，可切换）；
-        billing 用途维持原本的轻量标头，计费端点不吃那套身分。
+        billing 用途维持原本的轻量标头，计费端点不使用那套身份。
 
         chat 标头按 5.8.4 抓包整理：官方对话请求不带 X-Machine-ID /
-        X-Session-ID（那两个只用于反馈上报），所以这里也不再发——之前发的
-        是每个账号恒定的派生值，反而是一处「网关特征」。
+        X-Session-ID（那两个只用于反馈上报），所以这里也不发，避免每个账号
+        恒定的派生值成为一处「网关特征」。
 
         billing 标头仍带 X-Machine-ID / X-Session-ID，但两个都必须按账号派生：
         网关是一个进程冒充几十台设备，一旦取进程级的值，全部账号就会共用同一个
@@ -1428,9 +1456,9 @@ class Account(object):
         return nickname
 
     def set_product(self, value):
-        """切换出站身分（cli <-> workbuddy）。回传 True 表示真的换了。
+        """切换出站身份（cli <-> workbuddy）。返回 True 表示真的换了。
 
-        身分会写回凭证档，重启后仍然有效。save() 需要目录参数。
+        身份会写回凭证档，重启后仍然有效。save() 需要目录参数。
         """
         new = wb_identity.normalize_product(value)
         if new == self.product:
@@ -1438,14 +1466,14 @@ class Account(object):
         self.product = new
         try:
             # 清的是限流状态；上游判定额度用满的禁用（仍在恢复期内的
-            # model_caps）跨身分成立，不能被这次切换顺手清掉。
+            # model_caps）跨身份成立，不能被这次切换顺手清掉。
             self.clear_error(keep_caps=True)
         except Exception:
             pass
         return True
 
     def chat_base_url(self):
-        """这个帐号目前身分该打的端点。"""
+        """这个账号当前身份应当请求的端点。"""
         return wb_identity.endpoint_for(self.realm, self.product)[0]
 
     def refresh(self, force=False):
@@ -1720,7 +1748,7 @@ class Account(object):
     def daily_chat(self, web=None, trigger="unknown"):
         """国际版每日活跃对话（官方每日活跃 30/50 积分）。
 
-        两步：桌面端身分的轻量对话（一直以来的做法），以及网页通道的会话
+        两步：桌面端身份的轻量对话（一直以来的做法），以及网页通道的会话
         （issue #75/#59/#90：算数的是「跑完的 agent 会话」）。web=None 时按
         settings.json 里的 daily_chat_web 决定，True/False 可显式指定。
 
@@ -2478,7 +2506,7 @@ self.balance_until - now, self.breaker_until - now, self.degrade_until - now)
     def clear_error(self, model=None, keep_caps=False):
         """清掉限流状态；keep_caps 保留「上游判定额度用满」的禁用。
 
-        换身分/重试要清的是限流窗口，而 6004 的禁用是上游给的窗口事实（恢复
+        换身份/重试要清的是限流窗口，而 6004 的禁用是上游给的窗口事实（恢复
         时刻之前这个组合就是不可用），不能顺手清掉——真机实测（2026-10-10）：
         auto-switch 开着时它会把刚记下的 cap 冷却一起清掉，6004 之后账号立刻
         又可用，禁用形同不存在。
@@ -2827,9 +2855,9 @@ def _realm_limit(values, realm):
 class CreditsRefresher(threading.Thread):
     """Keep account credit balances fresh, off the request path.
 
-    The dispatch preference reads `account.credits`, which only the sign-in and
-    daily-activity tasks used to refresh: an account could go days without an
-    update, and a restart inherited whatever balance was on disk. Every tick
+    The dispatch preference reads `account.credits`; without this thread only
+    the sign-in and daily-activity tasks would refresh it, and a restart would
+    inherit whatever balance was on disk. Every tick
     this refreshes the single stalest account that is past the TTL, so the
     upstream billing calls stay bounded - one per tick - and land spread across
     the pool instead of arriving as a burst. A failed account is parked for six
@@ -3884,17 +3912,17 @@ class AccountPool(object):
                 if account.access_token: return account
             return candidates[0] if candidates else None
 
-    def start_login(self, realm="intl", platform="CLI"):
-        cfg = get_realm_config(realm)
-        url = "%s%s?platform=%s" % (cfg["chat_upstream"], AUTH_STATE_PATH, urllib.parse.quote(str(platform)))
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/plain, */*",
-            "X-Requested-With": "XMLHttpRequest",
-            "User-Agent": cfg["billing_ua"],
-            "Origin": cfg["origin"],
-            "Referer": cfg["origin"] + "/",
-        }
+    def start_login(self, realm, product):
+        """向上游申请授权链接，platform 参数与所选官方客户端一致。
+
+        product 同时记下来，登录完成后成为新账号的出站身份，登录用的客户端与
+        之后对话用的客户端保持同一个。
+        """
+        product = wb_identity.normalize_product(product)
+        platform = wb_identity.login_platform(realm, product)
+        url = "%s%s?platform=%s" % (wb_identity.endpoint_for(realm, product)[0], AUTH_STATE_PATH,
+                                    urllib.parse.quote(platform))
+        headers = login_headers(realm, product)
         payload = http_json(url, data=b"{}", method="POST", headers=headers,
                             timeout=30, retries=3, log=self.log)
         data = payload.get("data") or {}
@@ -3903,8 +3931,10 @@ class AccountPool(object):
         if not state or not auth_url:
             raise RuntimeError("auth/state returned no state/authUrl: %s" % payload)
         with self._lock:
-            self.logins[state] = {"created": time.time(), "platform": platform, "realm": realm}
-        return {"state": state, "authUrl": auth_url, "realm": realm, "platform": platform}
+            self.logins[state] = {"created": time.time(), "platform": platform,
+                                  "product": product, "realm": realm}
+        return {"state": state, "authUrl": auth_url, "realm": realm,
+                "platform": platform, "product": product}
 
     def poll_login(self, state):
         state = str(state or "").strip()
@@ -3916,16 +3946,9 @@ class AccountPool(object):
             with self._lock: self.logins.pop(state, None)
             return {"status": "expired", "message": "login window expired - start again"}
         realm = info.get("realm") or "intl"
-        cfg = get_realm_config(realm)
-        url = "%s%s?state=%s" % (cfg["chat_upstream"], AUTH_TOKEN_PATH, urllib.parse.quote(state))
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/plain, */*",
-            "X-Requested-With": "XMLHttpRequest",
-            "User-Agent": cfg["billing_ua"],
-            "Origin": cfg["origin"],
-            "Referer": cfg["origin"] + "/",
-        }
+        url = "%s%s?state=%s" % (wb_identity.endpoint_for(realm, info["product"])[0],
+                                 AUTH_TOKEN_PATH, urllib.parse.quote(state))
+        headers = login_headers(realm, info["product"], method="GET")
         try:
             payload = http_json(url, method="GET", headers=headers, timeout=30, retries=2)
         except Exception as exc:
@@ -3942,8 +3965,13 @@ class AccountPool(object):
         uid = jwt_uid(token)
         nickname = ""
         try:
-            acct_url = "%s%s?state=%s" % (cfg["chat_upstream"], LOGIN_ACCOUNT_PATH, urllib.parse.quote(state))
+            acct_url = "%s%s?state=%s" % (
+                wb_identity.endpoint_for(realm, info["product"])[0],
+                LOGIN_ACCOUNT_PATH, urllib.parse.quote(state))
+            # 拉昵称是带凭据的请求：官方只去掉 X-No-Authorization，其余三个
+            # 标记头与链路头保留，也不额外补 X-User-Id / X-Domain。
             acct_headers = dict(headers)
+            acct_headers.pop("X-No-Authorization", None)
             acct_headers["Authorization"] = "Bearer " + token
             req_acct = urllib.request.Request(acct_url, method="GET", headers=acct_headers)
             with urllib.request.urlopen(req_acct, timeout=15) as resp_acct:
@@ -3954,9 +3982,11 @@ class AccountPool(object):
         account = Account({
             "uid": uid,
             "nickname": nickname or uid[:8],
-            "domain": data.get("domain") or cfg["domain"],
+            "domain": data.get("domain") or wb_identity.endpoint_for(
+                realm, info["product"])[1],
             "realm": realm,
             "platform": info["platform"],
+            "product": info["product"],
             "accessToken": token,
             "refreshToken": data.get("refreshToken") or "",
             "expiresAt": normalize_epoch(data.get("expiresAt")) or jwt_exp(token),

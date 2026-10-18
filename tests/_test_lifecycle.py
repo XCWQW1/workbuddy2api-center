@@ -1,14 +1,3 @@
-"""The shared lifecycle pair must clean up what it promises.
-
-    python tests/_test_lifecycle.py
-
-Real processes, no mocks: a spare port is bindable, and stop_managed() ends a
-process from spawn_managed() together with anything it started - including the
-case where the parent has already exited and only its grandchild is left. On
-Windows a dead pid cannot be walked for its children, so stop_managed() returns
-False there and this suite removes the orphan itself; that platform difference is
-the point of the last check.
-"""
 import os
 import socket
 import subprocess
