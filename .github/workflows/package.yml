@@ -3,7 +3,7 @@ name: package
 # 绿色包：内置 Windows Python 运行时的整包 zip。触发方式：
 #   - Release 发布时自动构建并附加到 Release 资源
 #   - release.yml 流水线调用
-#   - 手动运行（只上传为 Actions 运行产物，不附加到 Release）
+#   - 手动运行（该标签已有 Release 时附加为资源，否则只上传为 Actions 运行产物）
 
 on:
   release:
@@ -46,9 +46,13 @@ jobs:
         name: wb-proxy-center-v${{ steps.version.outputs.value }}
         path: dist/*.zip
     - name: Attach to release
-      if: github.event_name == 'release' || github.event_name == 'workflow_call'
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
         TAG: ${{ inputs.tag || github.event.release.tag_name }}
-      run: gh release upload "$TAG" dist/*.zip --clobber
+      run: |
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          gh release upload "$TAG" dist/*.zip --clobber
+        else
+          echo "Release $TAG 不存在，只保留 Actions 运行产物"
+        fi

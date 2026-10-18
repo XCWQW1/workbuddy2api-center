@@ -22,7 +22,8 @@ def stub_pool(account, pick=None):
     class Pool(object):
         accounts = [account]
         smart_routing = False
-        affinity = types.SimpleNamespace(unbind=lambda _key: None)
+        affinity = types.SimpleNamespace(unbind=lambda _key: None,
+                                         demote=lambda _key, _uid=None: None)
 
         def count_ready(self, realm, model=None):
             return sum(a.ready(model=model) for a in self.accounts)
@@ -31,7 +32,7 @@ def stub_pool(account, pick=None):
             return account if uid == account.uid else None
 
         def pick_for_session(self, realm, session_key=None, exclude=(), model=None,
-                             claim=None):
+                             page=None, claim=None):
             if pick is not None:
                 return pick(account, exclude, model)
             return next((a for a in self.accounts
@@ -40,6 +41,9 @@ def stub_pool(account, pick=None):
 
         def apply_daily_token_limit(self, value=None, usage=None):
             return value or 0
+
+        def apply_remaining_weights(self, weights=None):
+            return weights or {}
 
     return Pool()
 

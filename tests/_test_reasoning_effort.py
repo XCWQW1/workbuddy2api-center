@@ -217,6 +217,9 @@ class FakeHandler(object):
         self.written = []
         self.json_body = None
 
+    def _key_id(self):
+        return None
+
     class _WFile(object):
         def __init__(self, sink):
             self.sink = sink

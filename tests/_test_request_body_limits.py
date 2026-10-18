@@ -44,6 +44,7 @@ class BodyLimitTests(unittest.TestCase):
         sock.settimeout(wait)
         sock.sendall(raw)
         data = b""
+        length = 0
         try:
             while b"\r\n\r\n" not in data:
                 piece = sock.recv(65536)

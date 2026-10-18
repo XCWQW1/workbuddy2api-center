@@ -20,6 +20,7 @@ os.environ["WB_PROXY_USAGE_DIR"] = _TMP
 os.makedirs(os.environ["ACCOUNTS_DIR"], exist_ok=True)
 
 import wb_proxy as proxy
+import wb_messages_responses
 
 MODEL = "deepseek-v4.1-flash"
 
@@ -71,11 +72,17 @@ class HandlerStub(object):
     _chat_stream_response = proxy.Handler._chat_stream_response
     _chat_nonstream_response = proxy.Handler._chat_nonstream_response
     _responses_stream_response = proxy.Handler._responses_stream_response
-    _messages_stream_headers = proxy.Handler._messages_stream_headers
-    _messages_stream_close = proxy.Handler._messages_stream_close
-    _messages_stream_aborted = proxy.Handler._messages_stream_aborted
-    _messages_stream_from_chat = proxy.Handler._messages_stream_from_chat
-    _messages_stream_from_responses = proxy.Handler._messages_stream_from_responses
+    _messages_stream_response = proxy.Handler._messages_stream_response
+
+    def _key_id(self):
+        return None
+
+    def _messages_stream_from_responses(self, upstream, model, custom_names, request_meta,
+                                        chat_req, namespace_map, session_meta, account,
+                                        t_start, effort=None, lease=None):
+        return wb_messages_responses._messages_stream(
+            self, upstream, model, custom_names, request_meta, chat_req,
+            namespace_map, None, account, t_start, None, effort)
 
     class _WFile(object):
         def __init__(self, sink):
@@ -196,8 +203,8 @@ class HeartbeatTests(unittest.TestCase):
     def test_messages_relay_forwards_heartbeats(self):
         upstream = FakeUpstream([b": ping\n"] + data_lines(text_delta("hi"), finish())
                                 + [b"data: [DONE]\n"])
-        handler, drop, errors = run("_messages_stream_from_chat", upstream, MODEL, CHAT_REQ,
-                                    None, FakeAccount(), time.time())
+        handler, drop, errors = run("_messages_stream_response", upstream, MODEL, None,
+                                    FakeAccount(), time.time(), base_body=CHAT_REQ)
         self.assertEqual(handler.comments(), [": ping"])
         self.assertEqual(handler.events()[-1][0], "message_stop")
         self.assertFalse(errors)
@@ -337,8 +344,8 @@ class MessagesStreamTests(unittest.TestCase):
 
     def test_chat_pipeline_error_event(self):
         upstream = FakeUpstream(data_lines(text_delta("half")))
-        handler, usage, errors = run("_messages_stream_from_chat", upstream, MODEL, CHAT_REQ,
-                                     None, FakeAccount(), time.time())
+        handler, usage, errors = run("_messages_stream_response", upstream, MODEL, None,
+                                     FakeAccount(), time.time(), base_body=CHAT_REQ)
         events = handler.events()
         self.assertEqual(events[-1][0], "error")
         self.assertNotIn("message_stop", [e for e, _ in events])
@@ -348,8 +355,8 @@ class MessagesStreamTests(unittest.TestCase):
 
     def test_chat_pipeline_upstream_error_frame(self):
         upstream = FakeUpstream(data_lines(text_delta("half"), {"error": {"message": "boom"}}))
-        handler, usage, errors = run("_messages_stream_from_chat", upstream, MODEL, CHAT_REQ,
-                                     None, FakeAccount(), time.time())
+        handler, usage, errors = run("_messages_stream_response", upstream, MODEL, None,
+                                     FakeAccount(), time.time(), base_body=CHAT_REQ)
         self.assertEqual(handler.events()[-1][0], "error")
         self.assertIn("boom", json.loads(handler.events()[-1][1])["error"]["message"])
         self.assertEqual(errors[0]["status"], 502)
@@ -357,16 +364,16 @@ class MessagesStreamTests(unittest.TestCase):
     def test_chat_pipeline_read_exception(self):
         upstream = FakeUpstream(data_lines(text_delta("half")),
                                 raises=http.client.IncompleteRead(b"x", 5))
-        handler, usage, errors = run("_messages_stream_from_chat", upstream, MODEL, CHAT_REQ,
-                                     None, FakeAccount(), time.time())
+        handler, usage, errors = run("_messages_stream_response", upstream, MODEL, None,
+                                     FakeAccount(), time.time(), base_body=CHAT_REQ)
         self.assertEqual(handler.events()[-1][0], "error")
         self.assertIn("stream aborted", json.loads(handler.events()[-1][1])["error"]["message"])
         self.assertEqual(errors[0]["status"], 502)
 
     def test_chat_pipeline_complete_stream(self):
         upstream = FakeUpstream(data_lines(text_delta("hi"), finish()) + [b"data: [DONE]\n"])
-        handler, usage, errors = run("_messages_stream_from_chat", upstream, MODEL, CHAT_REQ,
-                                     None, FakeAccount(), time.time())
+        handler, usage, errors = run("_messages_stream_response", upstream, MODEL, None,
+                                     FakeAccount(), time.time(), base_body=CHAT_REQ)
         self.assertEqual(handler.events()[-1][0], "message_stop")
         self.assertFalse(errors)
         self.assertEqual(usage[0]["outcome"], "completed")
@@ -413,6 +420,22 @@ class AggregateStreamTests(unittest.TestCase):
         upstream = FakeUpstream(data_lines(text_delta("hi"), finish("length")))
         out = proxy.aggregate_stream(upstream, MODEL, None)
         self.assertEqual(out["choices"][0]["finish_reason"], "length")
+
+    def test_arguments_only_function_call_chunks_survive(self):
+        # legacy function_call 的后续分片只带 arguments；按 name 判空会把这些
+        # 分片全丢掉，客户端收到的工具参数只剩第一片。
+        first = {"choices": [{"delta": {"function_call": {"name": "lookup", "arguments": ""}}}]}
+        second = {"choices": [{"delta": {"function_call": {"arguments": "{\"q\":"}}}]}
+        third = {"choices": [{"delta": {"function_call": {"arguments": "\"x\"}"}}}]}
+        tail = {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}
+        cleaned = json.loads(proxy.clean_chunk(json.dumps(second)))
+        self.assertIn("function_call", cleaned["choices"][0]["delta"])
+        out = proxy.aggregate_stream(
+            FakeUpstream(data_lines(first, second, third, tail) + [b"data: [DONE]\n"]),
+            MODEL, None)
+        call = out["choices"][0]["message"]["tool_calls"][0]
+        self.assertEqual(call["function"]["name"], "lookup")
+        self.assertEqual(json.loads(call["function"]["arguments"]), {"q": "x"})
 
 
 class ErrorFrameShapeTests(unittest.TestCase):

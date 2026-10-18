@@ -17,6 +17,7 @@ import {
   STATUS_TEXT,
   STATUS_TONE,
   authSummary,
+  buildSavePayload,
   deriveKeyStatus,
   expiryHint,
   expiryText,
@@ -80,17 +81,29 @@ export function mount(host, ctx) {
     if (successText) toast.success(successText);
   }
 
+  // 整份列表是最后写入者胜出：两次操作如果同时读旧 state，后到的旧清单
+  // 会把先前的改动覆盖回去。所有写操作排队执行，排到时再读当前 state。
+  let saveQueue = Promise.resolve();
+  function enqueue(job) {
+    const run = saveQueue.then(job);
+    saveQueue = run.catch(() => {});
+    return run;
+  }
+
   /** 目标行在列表里的下标，找不到返回 -1。 */
   function rowIndex(id) {
     return state.rows.findIndex((row) => (row.id || '') === (id || ''));
   }
 
   async function saveEntry(entry) {
-    const rows = state.rows.map(keyRowPayload);
-    const index = rowIndex(entry.id);
-    if (index >= 0) rows[index] = entry;
-    else rows.push(entry);
-    await submit({ api_keys: rows });
+    return enqueue(async () => {
+      const rows = state.rows.map(keyRowPayload);
+      const index = rowIndex(entry.id);
+      if (index >= 0) rows[index] = entry;
+      else rows.push(entry);
+      // 显式空删除列表 = upsert：另一个标签页新增的密钥不会被这份旧列表带走。
+      await submit(buildSavePayload(rows));
+    });
   }
 
   function openCreate() {
@@ -119,11 +132,15 @@ export function mount(host, ctx) {
 
   function toggleRow(row, index) {
     const enabled = row.enabled !== false;
-    const apply = async () => {
+    const apply = () => enqueue(async () => {
       const rows = state.rows.map(keyRowPayload);
-      rows[index] = { ...rows[index], enabled: !enabled };
-      await submit({ api_keys: rows }, enabled ? `已停用密钥「${row.name || '未命名'}」` : `已启用密钥「${row.name || '未命名'}」`);
-    };
+      const at = rowIndex(row.id);
+      const target = at >= 0 ? at : index;
+      if (target < 0 || target >= rows.length) throw new Error('这一行已经不在列表里');
+      rows[target] = { ...rows[target], enabled: !enabled };
+      await submit(buildSavePayload(rows),
+                   enabled ? `已停用密钥「${row.name || '未命名'}」` : `已启用密钥「${row.name || '未命名'}」`);
+    });
     if (!enabled) {
       // 启用不需要确认；失败在这里给提示，避免未处理的 Promise 拒绝。
       apply().catch((err) => toastError('启用密钥失败', err));
@@ -138,7 +155,7 @@ export function mount(host, ctx) {
     });
   }
 
-  function resetUsage(row, index) {
+  function resetUsage(row) {
     if (!row.id) {
       toast.warn('这一行还没有保存，无法重置用量');
       return;
@@ -147,23 +164,24 @@ export function mount(host, ctx) {
       title: '重置用量？',
       desc: `将把密钥「${row.name || '未命名'}」的 Token 与积分统计清零，配额从零开始计算。已经发生的调用记录不会删除。`,
       confirmText: '重置',
-      onConfirm: async () => {
-        await submit({ reset_key_usage: row.id }, `已重置密钥「${row.name || '未命名'}」的用量`);
-      },
+      onConfirm: () => enqueue(
+        () => submit({ reset_key_usage: row.id }, `已重置密钥「${row.name || '未命名'}」的用量`)),
     });
   }
 
-  function removeRow(row, index) {
+  function removeRow(row) {
     confirmDialog({
       title: '删除密钥',
       desc: `将删除密钥「${row.name || '未命名'}」。使用它的客户端会立即收到 401，此操作无法撤销。`,
       confirmText: '删除',
       danger: true,
-      onConfirm: async () => {
-        const rows = state.rows.map(keyRowPayload);
-        rows.splice(index, 1);
-        await submit({ api_keys: rows }, '密钥已删除');
-      },
+      onConfirm: () => enqueue(async () => {
+        const keep = state.rows.filter((candidate) => (
+          row.id ? (candidate.id || '') !== row.id : candidate !== row));
+        const payload = buildSavePayload(keep);
+        payload.deleted_api_key_ids = row.id ? [row.id] : [];
+        await submit(payload, '密钥已删除');
+      }),
     });
   }
 
@@ -196,8 +214,8 @@ export function mount(host, ctx) {
       <button class="btn btn-ghost btn-icon btn-xs" title="编辑" @click=${() => openEdit(row)}>${icon('Pencil')}</button>
       <button class="btn btn-ghost btn-icon btn-xs" title=${row.enabled === false ? '启用' : '停用'}
               @click=${() => toggleRow(row, index)}>${icon(row.enabled === false ? 'CircleCheck' : 'Ban')}</button>
-      <button class="btn btn-ghost btn-icon btn-xs" title="重置用量" @click=${() => resetUsage(row, index)}>${icon('RotateCcw')}</button>
-      <button class="btn btn-ghost btn-icon btn-xs tone-danger" title="删除" @click=${() => removeRow(row, index)}>${icon('Trash2')}</button>`;
+      <button class="btn btn-ghost btn-icon btn-xs" title="重置用量" @click=${() => resetUsage(row)}>${icon('RotateCcw')}</button>
+      <button class="btn btn-ghost btn-icon btn-xs tone-danger" title="删除" @click=${() => removeRow(row)}>${icon('Trash2')}</button>`;
   }
 
   function noticeBlock() {

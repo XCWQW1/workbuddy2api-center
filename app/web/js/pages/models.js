@@ -26,6 +26,7 @@ export function mount(host, ctx) {
     showExcluded: false,
     pending: new Set(),  // 正在保存勾选状态的模型 id
   };
+  let saveQueue = Promise.resolve();
 
   async function load(force) {
     const url = panelModelsUrl(realm, force);
@@ -52,27 +53,32 @@ export function mount(host, ctx) {
 
   async function toggleModel(id, enabled) {
     if (state.pending.has(id)) return;
-    const previous = state.data;
     state.data = withEnabled(state.data, id, enabled);
     state.pending.add(id);
     draw();
-    let reply = null;
-    try {
-      reply = await postJSON('/settings/save', { disabled_models: disabledIds(state.data) });
-      if (enabled) toast.success('已开始处理 ' + id, '网关会把这个模型的请求转给上游账号');
-      else toast.warn('已停止处理 ' + id, '这个模型的请求会被直接拒绝');
-    } catch (err) {
-      state.data = previous;
-      toastError('保存模型处理状态失败', err);
-    } finally {
-      state.pending.delete(id);
-      // 以服务端整理后的清单为准；同时还有别的勾选在保存时不覆盖它，等那一次的结果
-      if (reply && !state.pending.size) {
-        const disabled = new Set((reply.disabled_models || []).map((v) => String(v).toLowerCase()));
-        state.data = state.data.map((m) => ({ ...m, enabled: !disabled.has(m.id.toLowerCase()) }));
+    // 两次快速勾选各自读到整份 disabled_models；让保存按点击顺序排队，
+    // 后一次永远基于前一次已提交的状态，避免旧清单把新改动覆盖回去。
+    const job = saveQueue.then(async () => {
+      let reply = null;
+      try {
+        reply = await postJSON('/settings/save', { disabled_models: disabledIds(state.data) });
+        if (enabled) toast.success('已开始处理 ' + id, '网关会把这个模型的请求转给上游账号');
+        else toast.warn('已停止处理 ' + id, '这个模型的请求会被直接拒绝');
+      } catch (err) {
+        state.data = withEnabled(state.data, id, !enabled);
+        toastError('保存模型处理状态失败', err);
+      } finally {
+        state.pending.delete(id);
+        // 以服务端整理后的清单为准；同时还有别的勾选在保存时不覆盖它，等那一次的结果
+        if (reply && !state.pending.size) {
+          const disabled = new Set((reply.disabled_models || []).map((v) => String(v).toLowerCase()));
+          state.data = state.data.map((m) => ({ ...m, enabled: !disabled.has(m.id.toLowerCase()) }));
+        }
+        draw();
       }
-      draw();
-    }
+    });
+    saveQueue = job.catch(() => {});
+    return job;
   }
 
   function sourceLine() {
@@ -154,7 +160,7 @@ export function mount(host, ctx) {
       <div class="model-cell">
         <div class="row-wrap" style="gap:6px">
           <span class="strong">${m.name || m.id}</span>
-          ${m.excluded ? badge('被排除', 'warning', { small: true, title: '上游目录里列出了它，但筛选规则把它排除了；默认不处理它的请求' }) : nothing}
+          ${m.excluded ? badge('被排除', 'warning', { small: true, title: '上游目录里列出了它，但筛选规则把它排除了；它不会出现在 /v1/models，需要拒绝请求时请取消勾选' }) : nothing}
           ${capabilityBadges(m).map((b) => badge(b.label, b.tone, { small: true, title: b.title }))}
         </div>
         ${m.name && m.name !== m.id ? html`<span class="mono text-2xs muted break-all">${m.id}</span>` : nothing}

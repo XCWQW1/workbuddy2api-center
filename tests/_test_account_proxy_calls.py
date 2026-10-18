@@ -5,7 +5,12 @@ argument leaks the host IP, and stubbed helpers make that fail here. No network 
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
+# checkin() writes one row into the account activity history (issue #34), so a
+# suite that exercises it has to point the usage tree somewhere disposable
+# instead of at the repo's own usage/ directory.
+_TMP = isolated_data_dirs("wb-account-proxy-calls-")
 
 import wb_accounts
 

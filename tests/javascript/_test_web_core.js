@@ -80,6 +80,15 @@ assert.equal(lost, 0, '400 不应被当作会话失效');
 server = { status: 401, body: { error: { message: 'panel password required' } } };
 await assert.rejects(api.getJSON('/accounts'), (err) => api.isAuthError(err));
 assert.equal(lost, 1);
+server = { status: 401, body: { error: { message: 'current password is wrong' } } };
+await assert.rejects(api.postJSON('/panel/password', { current: 'x' }),
+  (err) => err instanceof api.ApiError && err.status === 401
+    && err.message === 'current password is wrong');
+assert.equal(lost, 1, '修改密码时的 401 是表单错误，不能登出面板');
+server = { status: 403, body: { error: { message: 'realm not allowed' } } };
+await assert.rejects(api.postJSON('/settings/save', {}),
+  (err) => err instanceof api.ApiError && err.status === 403 && !api.isAuthError(err));
+assert.equal(lost, 1, '403 不等于会话失效');
 server = { status: 502, body: '<html>Bad Gateway</html>' };
 await assert.rejects(api.getJSON('/usage'), (err) => err.status === 502 && err.message.includes('Bad Gateway'));
 server = { status: 200, body: { ok: true } };

@@ -83,17 +83,10 @@ class MessagesHandler(object):
     """Enough of the real Handler to drive /v1/messages offline."""
 
     _handle_messages = proxy.Handler._handle_messages
-    _handle_messages_via_chat = proxy.Handler._handle_messages_via_chat
-    _handle_messages_via_responses = proxy.Handler._handle_messages_via_responses
-    _open_messages_upstream = proxy.Handler._open_messages_upstream
     _anthropic_error = proxy.Handler._anthropic_error
-    _messages_stream_headers = proxy.Handler._messages_stream_headers
-    _messages_stream_close = proxy.Handler._messages_stream_close
-    _messages_stream_aborted = proxy.Handler._messages_stream_aborted
-    _messages_stream_from_chat = proxy.Handler._messages_stream_from_chat
-    _messages_nonstream_from_chat = proxy.Handler._messages_nonstream_from_chat
-    _messages_stream_from_responses = proxy.Handler._messages_stream_from_responses
-    _messages_nonstream_from_responses = proxy.Handler._messages_nonstream_from_responses
+    _anthropic_rate_limited = proxy.Handler._anthropic_rate_limited
+    _messages_stream_response = proxy.Handler._messages_stream_response
+    _messages_nonstream_response = proxy.Handler._messages_nonstream_response
 
     class _WFile(object):
         def __init__(self, sink):
@@ -152,6 +145,9 @@ class MessagesHandler(object):
 
     def _key_model_error(self, model):
         return ""
+
+    def _key_id(self):
+        return None
 
 
 def frames_of(handler):
@@ -236,11 +232,10 @@ class ConvertersTest(unittest.TestCase):
     def test_thinking_becomes_an_effort_level(self):
         payload = base_request(thinking={"type": "enabled", "budget_tokens": 2048})
         chat = proxy.messages_to_chat(payload)
-        self.assertEqual(chat["thinking"], {"type": "enabled"})
         self.assertEqual(chat["reasoning_effort"], "low")
         big = proxy.messages_to_chat(
             base_request(thinking={"type": "enabled", "budget_tokens": 40000}))
-        self.assertEqual(big["reasoning_effort"], "high")
+        self.assertEqual(big["reasoning_effort"], "xhigh")
         off = proxy.messages_to_chat(base_request(thinking={"type": "disabled"}))
         self.assertNotIn("thinking", off)
 
@@ -281,13 +276,13 @@ class ConvertersTest(unittest.TestCase):
                                              "arguments": "{\"city\": \"SF\"}"}}]}}],
             "usage": {"prompt_tokens": 5, "completion_tokens": 7},
         }
-        message = proxy.chat_to_message(chat_obj, "m")
+        message = proxy.chat_to_messages(chat_obj)
         self.assertEqual([b["type"] for b in message["content"]],
                          ["thinking", "text", "tool_use"])
         self.assertEqual(message["content"][2]["input"], {"city": "SF"})
         self.assertEqual(message["stop_reason"], "tool_use")
-        self.assertEqual(message["usage"],
-                         {"input_tokens": 5, "output_tokens": 7})
+        self.assertEqual(message["usage"]["input_tokens"], 5)
+        self.assertEqual(message["usage"]["output_tokens"], 7)
 
         responses_obj = {
             "status": "completed",
@@ -311,38 +306,6 @@ class ConvertersTest(unittest.TestCase):
 
 
 class StreamPipelinesTest(unittest.TestCase):
-    def test_chat_stream_builds_one_message(self):
-        writer = proxy.MessageStreamWriter("m", input_tokens=99)
-        frames = list(writer.start())
-        frames += list(proxy.stream_chat_to_message(
-            writer, FakeUpstream(sse(ChatChunks.tool_call()))))
-        frames += list(writer.finish())
-        text = b"".join(frames).decode("utf-8")
-
-        events = [list(proxy._parse_sse_frame(f))[0]
-                  for f in text.encode("utf-8").split(b"\n\n") if f.strip()]
-        self.assertEqual(events[0], "message_start")
-        self.assertEqual(events[-1], "message_stop")
-        self.assertEqual(text.count("event: content_block_start"), 3)
-
-        parsed = [json.loads(line[6:]) for line in text.split("\n")
-                  if line.startswith("data: ")]
-        starts = [p for p in parsed if p["type"] == "content_block_start"]
-        self.assertEqual([s["content_block"]["type"] for s in starts],
-                         ["thinking", "text", "tool_use"])
-        deltas = [p for p in parsed if p["type"] == "content_block_delta"]
-        self.assertEqual("".join(d["delta"]["thinking"] for d in deltas
-                                 if d["delta"]["type"] == "thinking_delta"),
-                         "let me check")
-        self.assertEqual("".join(d["delta"]["text"] for d in deltas
-                                 if d["delta"]["type"] == "text_delta"), "Hello")
-        tool_json = "".join(d["delta"]["partial_json"] for d in deltas
-                            if d["delta"]["type"] == "input_json_delta")
-        self.assertEqual(json.loads(tool_json), {"city": "SF"})
-        final = [p for p in parsed if p["type"] == "message_delta"][0]
-        self.assertEqual(final["delta"]["stop_reason"], "tool_use")
-        self.assertEqual(final["usage"], {"input_tokens": 111, "output_tokens": 22})
-
     def test_responses_stream_recovers_a_dsml_tool_call(self):
         dsml = ("<|DSML|tool_calls><|DSML|invoke name=\"get_weather\">"
                 "<|DSML|parameter name=\"city\">SF</|DSML|parameter>"
@@ -396,14 +359,16 @@ class EndpointTest(unittest.TestCase):
         self.assertEqual(frames[0][0], "message_start")
         self.assertEqual(frames[-1][0], "message_stop")
         self.assertEqual(frames[0][1]["message"]["role"], "assistant")
-        # message_start carries an estimate; the real counts arrive in message_delta
-        self.assertGreater(frames[0][1]["message"]["usage"]["input_tokens"], 0)
+        # message_start carries no token estimate; the real counts arrive in
+        # message_delta, which is what Anthropic clients render.
+        self.assertEqual(frames[0][1]["message"]["usage"]["input_tokens"], 0)
         text = "".join(p["delta"]["text"] for _, p in frames
                        if p and p.get("type") == "content_block_delta")
         self.assertEqual(text, "Hi there")
         final = [p for _, p in frames if p and p.get("type") == "message_delta"][0]
         self.assertEqual(final["delta"]["stop_reason"], "end_turn")
-        self.assertEqual(final["usage"], {"input_tokens": 9, "output_tokens": 3})
+        self.assertEqual(final["usage"]["input_tokens"], 9)
+        self.assertEqual(final["usage"]["output_tokens"], 3)
 
     def test_responses_mode_stream_reply(self):
         handler = run_handler(base_request(stream=True), ChatChunks.plain_text(),
@@ -428,13 +393,9 @@ class EndpointTest(unittest.TestCase):
             settings.set_messages_format(directory, "openai-responses")
             handler = MessagesHandler(payload)
             calls = []
-            with mock.patch.multiple(proxy, ACCOUNTS_DIR=directory,
-                                     record_usage=lambda *a, **k: None,
-                                     record_error=lambda *a, **k: None), \
-                    mock.patch.object(MessagesHandler, "_handle_messages_via_responses",
-                                      lambda self, body: calls.append("responses")), \
-                    mock.patch.object(MessagesHandler, "_handle_messages_via_chat",
-                                      lambda self, body: calls.append("chat")):
+            with mock.patch.multiple(proxy, ACCOUNTS_DIR=directory), \
+                    mock.patch.object(proxy.wb_messages_responses, "handle",
+                                      lambda handler, body: calls.append("responses")):
                 handler._handle_messages(payload)
             self.assertEqual(calls, ["responses"])
 

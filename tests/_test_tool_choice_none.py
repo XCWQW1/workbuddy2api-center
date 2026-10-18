@@ -4,10 +4,12 @@
 """
 import json, os, sys, tempfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app"))
-_TMP = tempfile.mkdtemp(prefix="wb-tool-choice-")
-os.environ["ACCOUNTS_DIR"] = os.path.join(_TMP, "accounts")
-os.environ["WB_PROXY_USAGE_DIR"] = _TMP
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
+# Its own directories, removed when this process exits. This suite used to share
+# tests/_acc and tests/_use with _test_custom_tools.py, which made the two unsafe
+# to run at the same time and left directories in the repo after a run.
+_TMP = isolated_data_dirs("wb-tool-choice-")
 
 import wb_proxy as P
 

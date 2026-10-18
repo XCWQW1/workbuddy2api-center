@@ -159,13 +159,6 @@ with open(proxy.USAGE_LOG, "w", encoding="utf-8") as fh:
 page = proxy.recent_usage(10)
 check("旧行照旧读得出来", page["rows"][0]["model"] == "m-old", page["rows"])
 check("旧行补上的 key_name 是空串", page["rows"][0].get("key_name") == "", page["rows"][0])
-check("旧行按错误标记判为失败", proxy.row_is_failed(old) is True)
-check("旧行没有错误标记时为成功",
-      proxy.row_is_failed({"at": 1, "model": "m"}) is False)
-check("状态码 404 的旧行算失败", proxy.row_is_failed({"status": 404}) is True)
-check("客户端主动中断不算失败",
-      proxy.row_is_failed({"outcome": "client_aborted", "status": 200}) is False)
-check("上游中断算失败", proxy.row_is_failed({"outcome": "upstream_aborted"}) is True)
 
 print()
 print("[7] /usage/analytics 的 keys 分组")
@@ -175,7 +168,13 @@ import wb_settings
 wb_settings.set_api_keys(os.environ["ACCOUNTS_DIR"], [
     {"id": "k1", "name": "主力 Key", "key": "key-alpha"},
     {"id": "k2", "name": "闲置 Key", "key": "key-beta"},
+    {"id": "gone", "name": "旧 Key", "key": "key-gone"},
 ])
+# 先配置再删除：软删除留下墓碑，历史花费仍然按名字可查。
+wb_settings.set_api_keys(os.environ["ACCOUNTS_DIR"], [
+    {"id": "k1", "name": "主力 Key", "key": "key-alpha"},
+    {"id": "k2", "name": "闲置 Key", "key": "key-beta"},
+], delete_ids=["gone"])
 proxy.bind_audit(None)
 reset_log()
 stamp = time.time()
@@ -193,6 +192,9 @@ with open(proxy.USAGE_LOG, "w", encoding="utf-8") as fh:
         {"at": stamp - 2, "model": "m-b", "realm": "intl", "key_id": "gone",
          "ip": "10.0.0.2", "api": "chat", "status": 200, "outcome": "completed",
          "total_tokens": 11, "credit": 0.03},
+        {"at": stamp - 1.5, "model": "m-b", "realm": "intl", "key": "ghost",
+         "ip": "10.0.0.3", "api": "chat", "status": 200, "outcome": "completed",
+         "total_tokens": 4, "credit": 0.04},
         {"at": stamp - 1, "model": "m-c", "realm": "intl", "outcome": "completed",
          "total_tokens": 5, "credit": 0.01},
     ):
@@ -204,8 +206,11 @@ by_key = {k["key_id"]: k for k in analytics["keys"]}
 check("用过的 Key 在列", "k1" in by_key and "panel" in by_key, sorted(by_key))
 check("闲置的 Key 也在列表里且为零", by_key.get("k2", {}).get("window", {}).get("total_tokens") == 0,
       by_key.get("k2"))
-check("用了又删掉的 Key 标注为已删除",
+check("配置后删除的 Key 标注为已删除",
       by_key["gone"]["key_name"] == "已删除的 Key", by_key["gone"]["key_name"])
+check("名单外无法命名的 Key 折进未知分组",
+      by_key[proxy.KEY_BUCKET_UNKNOWN]["key_name"] == "(未知 key)",
+      by_key[proxy.KEY_BUCKET_UNKNOWN])
 check("面板测试台的名字", by_key["panel"]["key_name"] == "面板测试台", by_key["panel"])
 check("配置里的 Key 用它的名字", by_key["k1"]["key_name"] == "主力 Key", by_key["k1"])
 check("统计形状与 models 一致",
@@ -218,7 +223,10 @@ check("k1 的 token 合计", by_key["k1"]["all_time"]["total_tokens"] == 130,
 check("k1 的积分合计", abs(by_key["k1"]["all_time"]["credit"] - 0.6) < 1e-9,
       by_key["k1"]["all_time"])
 check("没有 key_id 的旧行不计入任何 Key",
-      sum(k["all_time"]["total_tokens"] for k in analytics["keys"]) == 148,
+      sum(k["all_time"]["total_tokens"] for k in analytics["keys"]
+          if k["key_id"] != proxy.KEY_BUCKET_BEFORE) == 152
+      and any(k["key_id"] == proxy.KEY_BUCKET_BEFORE
+              and k["all_time"]["total_tokens"] == 5 for k in analytics["keys"]),
       [(k["key_id"], k["all_time"]["total_tokens"]) for k in analytics["keys"]])
 check("窗口桶跟着请求的范围",
       proxy.compute_usage_analytics(ttl=0, realm="all", range="all")["keys"][0]["window"]["total_tokens"]

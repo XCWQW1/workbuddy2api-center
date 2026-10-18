@@ -25,8 +25,13 @@ class Request(object):
     def __init__(self, authenticated=False):
         self._authenticated = authenticated
         self.sent = None
+        self.headers = {}
+        self.key_entry = None
 
     def _panel_ok(self):
+        return self._authenticated
+
+    def _key_ok(self):
         return self._authenticated
 
     def _handle_expect_continue(self):
@@ -48,6 +53,9 @@ class FakePool(object):
     def count_ready(self, realm=None, model=None):
         return self._ready
 
+    def representative(self):
+        return None
+
 
 class HealthTests(unittest.TestCase):
     def health(self, pool):
@@ -55,36 +63,44 @@ class HealthTests(unittest.TestCase):
             return proxy.Handler._get_health(Request())
 
     def test_alive_with_a_ready_account(self):
-        self.assertEqual(self.health(FakePool(total=2, ready=1)), (200, {"ok": True}))
+        status, info = self.health(FakePool(total=2, ready=1))
+        self.assertEqual(status, 200)
+        self.assertTrue(info["ok"])
+        self.assertEqual((info["accounts"], info["accounts_ready"]), (2, 1))
 
-    def test_no_account_can_serve_answers_503(self):
-        self.assertEqual(self.health(FakePool(total=2, ready=0)),
-                         (503, {"ok": False, "error": "no account available"}))
-        self.assertEqual(self.health(FakePool(total=0, ready=0)),
-                         (503, {"ok": False, "error": "no account available"}))
+    def test_no_account_can_serve_is_still_alive(self):
+        for pool in (FakePool(total=2, ready=0), FakePool(total=0, ready=0)):
+            status, info = self.health(pool)
+            self.assertEqual(status, 200)
+            self.assertTrue(info["ok"])
+            self.assertEqual(info["accounts_ready"], 0)
 
     def test_a_pool_that_never_loaded(self):
-        self.assertEqual(self.health(None), (503, {"ok": False, "error": "startup failed"}))
+        status, info = self.health(None)
+        self.assertEqual(status, 200)
+        self.assertTrue(info["ok"])
+        self.assertEqual(info["accounts"], 0)
 
     def test_a_configured_key_does_not_change_the_body(self):
         with tempfile.TemporaryDirectory(prefix="wb-status-keys-") as directory:
             key = {"name": "panel key", "key": "panel-secret", "enabled": True}
             wb_settings.set_api_keys(directory, [key])
             with mock.patch.multiple(proxy, ACCOUNTS_DIR=directory, POOL=FakePool(total=1, ready=1)):
-                self.assertEqual(proxy.Handler._get_health(Request()), (200, {"ok": True}))
+                status, info = proxy.Handler._get_health(Request())
+                self.assertEqual(status, 200)
+                self.assertTrue(info["ok"])
+                self.assertNotIn("uid", info)
 
 
 class PanelStatusTests(unittest.TestCase):
-    def test_without_a_session_the_route_answers_401(self):
+    def test_without_a_session_it_reports_unauthenticated(self):
         request = Request(authenticated=False)
         with tempfile.TemporaryDirectory(prefix="wb-status-panel-") as directory:
             with mock.patch.multiple(proxy, ACCOUNTS_DIR=directory, POOL=FakePool(total=4, ready=2)):
-                # 错误路径自己发出 401 并返回 None
-                self.assertIsNone(proxy.Handler._get_panel_status(request))
-        status, info = request.sent
-        self.assertEqual(status, 401)
-        self.assertEqual(set(info), {"error"})
-        self.assertEqual(info["error"]["message"], "panel password required")
+                status, info = proxy.Handler._get_panel_status(request)
+        self.assertEqual(status, 200)
+        self.assertFalse(info["authenticated"])
+        self.assertNotIn("accounts", info)
 
     def test_with_a_session_it_carries_the_account_counts(self):
         with tempfile.TemporaryDirectory(prefix="wb-status-panel-") as directory:

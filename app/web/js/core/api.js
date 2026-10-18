@@ -18,7 +18,7 @@ export class ApiError extends Error {
 }
 
 export function isAuthError(err) {
-  return err instanceof ApiError && (err.status === 401 || err.status === 403);
+  return err instanceof ApiError && err.status === 401;
 }
 
 export function setPanelToken(token) {
@@ -71,9 +71,18 @@ async function request(method, url, body) {
       parsed = { raw: text };
     }
   }
-  if (response.status === 401 || response.status === 403) {
+  if (response.status === 401) {
+    // 修改密码接口用 401 表示「当前密码不对」，那是表单错误，不能当成会话
+    // 失效把整个面板登出。
+    if (url.startsWith('/panel/password')) {
+      throw new ApiError(401, errorMessage(401, parsed), parsed);
+    }
     if (unauthorizedHandler) unauthorizedHandler();
-    throw new ApiError(response.status, '面板会话已失效，请重新登录', parsed);
+    throw new ApiError(401, '面板会话已失效，请重新登录', parsed);
+  }
+  if (response.status === 403) {
+    // 权限不足不等于会话失效：例如只用 API Key 的会话修改默认出口。
+    throw new ApiError(403, errorMessage(403, parsed), parsed);
   }
   if (!response.ok) throw new ApiError(response.status, errorMessage(response.status, parsed), parsed);
   return parsed;

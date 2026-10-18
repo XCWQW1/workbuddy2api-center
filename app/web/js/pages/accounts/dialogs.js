@@ -10,7 +10,7 @@ import { toast, toastError } from '../../ui/toast.js';
 import { copyWithToast } from '../../ui/copy.js';
 import * as acct from './actions.js';
 
-const REALM_LABEL = { cn: '国内版 (copilot.tencent.com)', intl: '国际版 (www.workbuddy.ai)' };
+const REALM_LABEL = { cn: '国内版 (www.workbuddy.cn)', intl: '国际版 (www.workbuddy.ai)' };
 
 /** 二维码只用 SVG 一种形态，按链接缓存，重新生成链接时才重算。 */
 const qrCache = new Map();
@@ -460,7 +460,7 @@ export function openDesktopScanDialog() {
     }
     return html`
       ${section('国际版 (www.workbuddy.ai)', valid.filter((item) => item.realm !== 'cn'))}
-      ${section('国内版 (copilot.tencent.com)', valid.filter((item) => item.realm === 'cn'))}
+      ${section('国内版 (www.workbuddy.cn)', valid.filter((item) => item.realm === 'cn'))}
       ${bad.length ? html`
         <div class="scan-group">
           <div class="text-xs medium tone-warning">无法读取的凭证 · ${bad.length} 个</div>

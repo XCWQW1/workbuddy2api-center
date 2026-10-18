@@ -103,12 +103,14 @@ print("[2] 启动时的等待可被打断")
 sched2 = S.Scheduler(EmptyPool())
 sched2.start()
 time.sleep(0.1)
+thread2 = sched2._thread
 started = time.time()
 sched2.stop()
-sched2._thread.join(3)
+# stop() 会回收已退出的线程引用, 所以先拿住句柄再停。
+thread2.join(3)
 waited = time.time() - started
 check("stop() 后线程立刻退出, 不再睡满 10 秒",
-      not sched2._thread.is_alive() and waited < 3, "%.2fs" % waited)
+      not thread2.is_alive() and waited < 3, "%.2fs" % waited)
 
 # ---- [3] 整点判断按固定 UTC+8 ------------------------------------------------
 print()
@@ -121,13 +123,14 @@ S.time = S.wb_tasks.time = clock
 try:
     sched3 = S.Scheduler(EmptyPool())
     sched3.start()
+    thread3 = sched3._thread
     deadline = time.time() + 15
-    while time.time() < deadline and not any("到达整点调度时间" in line for line in sched3.logs):
+    while time.time() < deadline and not any("整点排程命中 (9:00)" in line for line in sched3.logs):
         time.sleep(0.05)
-    check("CST 09:00 触发整点巡检", any("到达整点调度时间（9:00）" in line for line in sched3.logs),
+    check("CST 09:00 触发整点巡检", any("整点排程命中 (9:00)" in line for line in sched3.logs),
           sched3.logs[-3:])
     sched3.stop()
-    sched3._thread.join(3)
+    thread3.join(3)
 finally:
     S.time = S.wb_tasks.time = real_time
 
@@ -166,7 +169,7 @@ while time.time() < deadline and not any("pool-exploded" in line for line in sch
 check("异常出现在调度器日志里",
       any("pool-exploded" in line for line in sched5.logs), sched5.logs[-3:])
 check("日志标明是手动触发",
-      any("手动触发" in line for line in sched5.logs), sched5.logs[-3:])
+      any("手动立即触发" in line for line in sched5.logs), sched5.logs[-3:])
 
 deadline = time.time() + 3
 while time.time() < deadline and sched5._run_lock.locked():

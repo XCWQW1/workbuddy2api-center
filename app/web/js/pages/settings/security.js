@@ -57,7 +57,7 @@ export function createSecurityTab(page) {
       } catch (err) {
         busy = false;
         // 输错当前密码属于填写错误，就地提示；其它失败交给全局提示。
-        if (err.status === 400) error = '当前密码不正确，请重新输入。';
+        if (err.status === 400 || err.status === 401) error = '当前密码不正确，请重新输入。';
         else toastError('修改失败', err);
         ctl.update();
       }

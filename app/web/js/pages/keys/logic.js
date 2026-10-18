@@ -399,7 +399,9 @@ export function keyRowPayload(row) {
 }
 
 export function buildSavePayload(rows) {
-  return { api_keys: (rows || []).map(keyRowPayload) };
+  // 显式空删除列表 = upsert：这份列表只增改自己带来的行，不会把另一个标签页
+  // 新建、而本地尚未刷新到的密钥当成“没提交”删掉。删除操作另外附带 id。
+  return { api_keys: (rows || []).map(keyRowPayload), deleted_api_key_ids: [] };
 }
 
 /** 本地行列表 → 逐行提交载荷，供开关、删除等操作复用。 */

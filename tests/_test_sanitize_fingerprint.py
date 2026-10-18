@@ -1,10 +1,13 @@
 """Tests for fingerprint sanitization, including PR #62 OmO Sisyphus-Junior fix."""
 import json, os, sys, tempfile, unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app"))
-_TMP = tempfile.mkdtemp(prefix="wb-fingerprint-")
-os.environ["ACCOUNTS_DIR"] = os.path.join(_TMP, "accounts")
-os.environ["WB_PROXY_USAGE_DIR"] = _TMP
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
+# Its own directories, removed when this process exits. This suite used to share
+# tests/_acc_test and tests/_use_test with _test_daily_chat.py and
+# _test_tasks_cache.py, which made them unsafe to run at the same time and left
+# directories in the repo after a run.
+_TMP = isolated_data_dirs("wb-fingerprint-")
 
 import wb_proxy as P
 

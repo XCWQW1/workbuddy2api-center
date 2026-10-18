@@ -193,7 +193,10 @@ const rows = [keyRow({ id: 'k1', name: '甲' }), keyRow({ id: 'k2', name: '乙' 
 assert.deepEqual(logic.rowsAfterReplace(rows, 2, null).map((r) => r.id), ['k1', 'k2'], '删除只去掉那一行');
 assert.deepEqual(logic.rowsAfterReplace(rows, 1, keyRow({ id: 'k2', name: '乙改' })).map((r) => r.name), ['甲', '乙改', '丙']);
 assert.deepEqual(logic.rowsAfterReplace(rows, -1, keyRow({ id: 'k4', name: '丁' })).map((r) => r.id), ['k1', 'k2', 'k3', 'k4']);
-assert.deepEqual(logic.buildSavePayload(rows).api_keys.length, 3);
+const savePayload = logic.buildSavePayload(rows);
+assert.deepEqual(savePayload.api_keys.length, 3);
+assert.deepEqual(savePayload.deleted_api_key_ids, [],
+  '整表保存必须显式声明空删除列表，否则会把其他标签页新建的密钥删掉');
 
 // ---- 创建成功后的接入片段
 assert.equal(logic.apiBaseUrl('http://127.0.0.1:8788/'), 'http://127.0.0.1:8788/v1');

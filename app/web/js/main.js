@@ -8,7 +8,7 @@ import { initTheme, themeMode, setThemeMode } from './core/theme.js';
 import { mountDock, setDockActive, dockMode, setDockMode } from './ui/dock.js';
 import { installPaletteShortcut, paletteTrigger } from './ui/palette.js';
 import { openDialog } from './ui/dialog.js';
-import { toast } from './ui/toast.js';
+import { toast, toastError } from './ui/toast.js';
 import { showLogin } from './pages/login.js';
 
 const app = document.getElementById('app');
@@ -46,7 +46,7 @@ function topbar() {
           <button type="button" class=${viewRealm === 'intl' ? 'active' : ''} role="radio" aria-checked=${viewRealm === 'intl' ? 'true' : 'false'}
                   title="查看国际版 (www.workbuddy.ai) 的账号与模型" @click=${() => setViewRealm('intl')}>${icon('Globe')}国际版</button>
           <button type="button" class=${viewRealm === 'cn' ? 'active' : ''} role="radio" aria-checked=${viewRealm === 'cn' ? 'true' : 'false'}
-                  title="查看国内版 (copilot.tencent.com) 的账号与模型" @click=${() => setViewRealm('cn')}>${icon('House')}国内版</button>
+                  title="查看国内版 (www.workbuddy.cn) 的账号与模型" @click=${() => setViewRealm('cn')}>${icon('House')}国内版</button>
         </div>
       </div>
     </div>`;
@@ -137,24 +137,31 @@ async function onDockAction(id) {
 async function startShell() {
   if (shellRunning) return;
   shellRunning = true;
-  const [status, settings] = await Promise.all([getJSON('/panel/status'), getJSON('/settings')]);
-  setPanelStatus(status);
-  setVersion(settings.version);
-  await initRealms();
-  render(html`
-    <div class="shell">
-      <div class="shell-body">
-        <div id="topbar"></div>
-        <main id="pageHost"></main>
-      </div>
-      <div id="dock"></div>
-    </div>`, app);
-  drawTopbar();
-  mountDock(document.getElementById('dock'), onDockAction);
-  await startRouter(document.getElementById('pageHost'), (route) => setDockActive(route.path));
-  setDockActive(currentRoute().path);
-  pollGateway();
-  armGatewayTimer();
+  try {
+    const [status, settings] = await Promise.all([getJSON('/panel/status'), getJSON('/settings')]);
+    setPanelStatus(status);
+    setVersion(settings.version);
+    await initRealms();
+    render(html`
+      <div class="shell">
+        <div class="shell-body">
+          <div id="topbar"></div>
+          <main id="pageHost"></main>
+        </div>
+        <div id="dock"></div>
+      </div>`, app);
+    drawTopbar();
+    mountDock(document.getElementById('dock'), onDockAction);
+    await startRouter(document.getElementById('pageHost'), (route) => setDockActive(route.path));
+    setDockActive(currentRoute().path);
+    pollGateway();
+    armGatewayTimer();
+  } catch (err) {
+    // 失败必须放开这把锁：否则登录成功后 startShell 直接返回，面板永远停在
+    // 禁用的登录框上。
+    shellRunning = false;
+    throw err;
+  }
 }
 
 /** 按设置的间隔轮询顶栏状态点；间隔为 0 时不挂定时器。 */
@@ -177,9 +184,13 @@ function showLoginScreen(message) {
   showLogin(app, {
     message,
     autoPassword: takeUrlParam('pwd') || '',
-    onSuccess: (data) => {
+    onSuccess: async (data) => {
       if (data.using_default_password) toast.warn('当前是默认密码 admin', '建议到「设置 → 面板密码」修改');
-      startShell();
+      try {
+        await startShell();
+      } catch (err) {
+        toastError('加载面板失败', err);
+      }
     },
   });
 }

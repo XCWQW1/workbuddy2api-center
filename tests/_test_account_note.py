@@ -1,202 +1,104 @@
-"""账号备注是纯本地字段：写入凭证文件，导入导出带着走，超过 100 字被拒绝；不联网，只用临时目录与打桩的请求对象。
-"""
+"""账号备注：面板标记「批量」/「自用」，随凭证档持久化。
 
-import json
+备注是纯展示字段：不参与任何调度判断，落盘、导出/导入照常携带，看板在账号
+行内显示并可直接编辑（有备注的账号在表格里置顶——那是前端排序，由
+tests/_test_account_weight.js 钉住）。这里钉住字段本身：
+
+  1. 默认空、坏数据回落空串、超长截断；
+  2. 随凭证档与公共视图走（to_dict / public / 导入导出）；
+  3. set_note 落盘、空串清除、未知 uid 返回 None；
+  4. 看板接线存在（accountRow 渲染备注行 + editAccountNote 走 /accounts/set）。
+
+Run with the current interpreter (python tests/run_all.py note).
+"""
 import os
 import sys
 import tempfile
 import unittest
-from unittest import mock
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app"))
-_TMP = tempfile.mkdtemp(prefix="wb-account-note-")
-os.environ["ACCOUNTS_DIR"] = os.path.join(_TMP, "accounts")
-os.environ["WB_PROXY_USAGE_DIR"] = _TMP
-os.makedirs(os.environ["ACCOUNTS_DIR"], exist_ok=True)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import wb_accounts as A
-import wb_proxy as P
+import wb_accounts
 
-LIMIT = 100
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def account(uid="uid-note", realm="intl", **fields):
-    # 令牌形状要像 JWT：导入行会校验它，Account 本身不校验。
-    data = {"uid": uid, "accessToken": "e30.e30.sig", "realm": realm}
-    data.update(fields)
-    return A.Account(data)
+def make_account(uid, note=None, **extra):
+    data = {"uid": uid, "accessToken": "token-%s" % uid, "realm": "cn"}
+    if note is not None:
+        data["note"] = note
+    data.update(extra)
+    return wb_accounts.Account(data)
 
 
-class FakeRequest(object):
-    """POST 处理函数只需要 JSON 输出与错误输出。"""
+class NoteFieldTests(unittest.TestCase):
+    def test_default_note_is_empty(self):
+        self.assertEqual(make_account("n-def").note, "")
 
-    def _json(self, status, payload):
-        return status, payload
+    def test_note_is_stripped_and_clamped(self):
+        self.assertEqual(make_account("n-pad", note="  批量  ").note, "批量")
+        long = "x" * 500
+        self.assertEqual(len(make_account("n-long", note=long).note),
+                         wb_accounts.MAX_ACCOUNT_NOTE)
 
-    def _error(self, status, message, kind=None):
-        return status, {"error": {"message": message, "code": status}}
+    def test_junk_falls_back_to_empty(self):
+        for junk in (None, 123, [], {}, True):
+            self.assertEqual(make_account("n-junk", note=junk).note, "")
 
+    def test_to_dict_and_public_carry_note(self):
+        account = make_account("n-view", note="自用")
+        self.assertEqual(account.to_dict()["note"], "自用")
+        self.assertEqual(account.public()["note"], "自用")
+        self.assertEqual(make_account("n-view2").public()["note"], "")
 
-class NormaliseNoteTests(unittest.TestCase):
-    def test_whitespace_is_stripped(self):
-        self.assertEqual(A.normalise_account_note("  小北的账号  "), ("小北的账号", ""))
-
-    def test_none_and_empty_clear_the_note(self):
-        self.assertEqual(A.normalise_account_note(None), ("", ""))
-        self.assertEqual(A.normalise_account_note(""), ("", ""))
-        self.assertEqual(A.normalise_account_note("   "), ("", ""))
-
-    def test_the_limit_is_inclusive(self):
-        note = "字" * LIMIT
-        self.assertEqual(A.normalise_account_note(note), (note, ""))
-
-    def test_a_longer_note_is_refused_with_the_limit_in_the_message(self):
-        note, problem = A.normalise_account_note("字" * (LIMIT + 1))
-        self.assertEqual(note, "")
-        self.assertIn(str(LIMIT), problem)
-        self.assertIn("note", problem)
-
-    def test_non_strings_are_refused(self):
-        for value in (7, True, ["note"], {"note": "x"}):
-            with self.subTest(value=value):
-                note, problem = A.normalise_account_note(value)
-                self.assertEqual(note, "")
-                self.assertIn("note", problem)
+    def test_note_round_trips_through_the_credential_file(self):
+        with tempfile.TemporaryDirectory(prefix="note-persist-") as directory:
+            make_account("n-disk", note="批量01").save(directory)
+            pool = wb_accounts.AccountPool(directory, log=lambda _m: None)
+            loaded = {a.uid: a for a in pool.load()}
+            self.assertEqual(loaded["n-disk"].note, "批量01")
 
 
-class NoteStorageTests(unittest.TestCase):
+class SetNoteTests(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory(prefix="wb-note-store-")
-        self.addCleanup(self._tmp.cleanup)
-        self.directory = self._tmp.name
-        account("uid-note").save(self.directory)
-        self.pool = A.AccountPool(self.directory)
-        self.pool.load()
+        self.directory = tempfile.mkdtemp(prefix="note-set-")
+        self.pool = wb_accounts.AccountPool(self.directory, log=lambda _m: None)
+        self.pool.accounts = [make_account("s-a"), make_account("s-b", note="旧备注")]
 
-    def test_set_and_clear_round_trip(self):
-        updated = self.pool.set_note("uid-note", "  小北的账号  ")
-        self.assertEqual(updated["note"], "小北的账号")
-        path = self.pool.get("uid-note").path
-        with open(path, encoding="utf-8") as fh:
-            on_disk = json.load(fh)
-        self.assertEqual(on_disk["note"], "小北的账号")
-        self.assertEqual(A.Account(on_disk, path).note, "小北的账号")
+    def test_sets_and_clears(self):
+        updated = self.pool.set_note("s-a", "  批量  ")
+        self.assertEqual(updated["note"], "批量")
+        self.assertEqual(self.pool.set_note("s-a", "   ")["note"], "")
+        self.assertEqual(self.pool.get("s-a").note, "")
 
-        self.assertEqual(self.pool.set_note("uid-note", "")["note"], "")
-        with open(path, encoding="utf-8") as fh:
-            self.assertEqual(json.load(fh)["note"], "")
-        self.assertEqual(self.pool.list_public()[0]["note"], "")
+    def test_overwrites_the_old_note(self):
+        self.assertEqual(self.pool.set_note("s-b", "自用")["note"], "自用")
+        self.assertEqual(self.pool.get("s-b").note, "自用")
 
-    def test_an_unknown_uid_returns_none(self):
-        self.assertIsNone(self.pool.set_note("uid-missing", "x"))
+    def test_unknown_uid_returns_none(self):
+        self.assertIsNone(self.pool.set_note("nope", "x"))
 
-    def test_a_hand_edited_file_is_clamped_and_non_strings_are_dropped(self):
-        self.assertEqual(account(note="字" * 250).note, "字" * LIMIT)
-        self.assertEqual(account(note={"$wbEncrypted": "x"}).note, "")
-        self.assertEqual(account(note=7).note, "")
-        self.assertEqual(account().note, "")
+    def test_note_change_reaches_the_disk(self):
+        self.pool.set_note("s-b", "批量02")
+        # 重新从原目录读，确认落盘
+        pool2 = wb_accounts.AccountPool(self.directory, log=lambda _m: None)
+        self.assertEqual({a.uid: a for a in pool2.load()}["s-b"].note, "批量02")
 
 
-class NoteExportImportTests(unittest.TestCase):
-    """没有备注的导入文档不会抹掉已有备注。"""
+class DashboardWiringTests(unittest.TestCase):
+    """看板接线的结构断言（渲染细节由 JS 套件钉）。"""
 
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory(prefix="wb-note-import-")
-        self.addCleanup(self._tmp.cleanup)
-        self.directory = self._tmp.name
+    def test_dashboard_has_note_editing(self):
+        with open(os.path.join(ROOT, "dashboard.html"), encoding="utf-8") as fh:
+            html = fh.read()
+        self.assertIn("editAccountNote", html)
+        self.assertIn("{uid: uid, note: next}", html)
+        self.assertIn("+ 备注", html)
 
-    def make_pool(self, note=""):
-        account("uid-note", note=note).save(self.directory)
-        pool = A.AccountPool(self.directory)
-        pool.load()
-        return pool
-
-    def test_an_exported_document_carries_the_note(self):
-        pool = self.make_pool("小北的账号")
-        doc = A.build_export_document(pool.accounts)
-        self.assertEqual(doc["accounts"][0]["note"], "小北的账号")
-        rows, problem = A._coerce_account_rows(doc)
-        self.assertEqual(problem, "")
-        self.assertEqual(rows[0]["note"], "小北的账号")
-        self.assertEqual(A.normalise_import_row(rows[0])["note"], "小北的账号")
-
-    def test_import_writes_the_note_back(self):
-        source = self.make_pool("原机器的备注")
-        doc = A.build_export_document(source.accounts)
-        with tempfile.TemporaryDirectory(prefix="wb-note-target-") as target:
-            rows, _ = A._coerce_account_rows(doc)
-            pool = A.AccountPool(target)
-            pool.import_rows(rows)
-            self.assertEqual(pool.get("uid-note").note, "原机器的备注")
-            self.assertEqual(pool.list_public()[0]["note"], "原机器的备注")
-
-    def test_a_document_without_a_note_keeps_the_stored_one(self):
-        pool = self.make_pool("本机备注")
-        row = {"uid": "uid-note", "realm": "intl", "accessToken": "e30.e30.sig"}
-        result = pool.import_rows([row], overwrite=True)
-        self.assertEqual(result["updated"], ["uid-note"])
-        self.assertEqual(pool.get("uid-note").note, "本机备注")
-
-    def test_a_re_login_keeps_the_note(self):
-        """OAuth 重新登录的数据里没有 note，不能因此抹掉面板上的备注。"""
-        pool = self.make_pool("本机备注")
-        pool.add(account("uid-note", accessToken="fresh-token"))
-        self.assertEqual(pool.get("uid-note").note, "本机备注")
-        with open(pool.get("uid-note").path, encoding="utf-8") as fh:
-            self.assertEqual(json.load(fh)["note"], "本机备注")
-
-
-class NoteRouteTests(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory(prefix="wb-note-route-")
-        self.addCleanup(self._tmp.cleanup)
-        self.directory = self._tmp.name
-        account("uid-note").save(self.directory)
-        self.pool = A.AccountPool(self.directory)
-        self.pool.load()
-
-    def post(self, payload):
-        with mock.patch.multiple(P, ACCOUNTS_DIR=self.directory, POOL=self.pool):
-            return P.Handler._route_accounts_set(FakeRequest(), payload)
-
-    def stored_note(self):
-        with open(self.pool.get("uid-note").path, encoding="utf-8") as fh:
-            return json.load(fh)["note"]
-
-    def test_set_and_clear(self):
-        status, body = self.post({"uid": "uid-note", "note": " 小北 "})
-        self.assertEqual(status, 200)
-        self.assertEqual(body["account"]["note"], "小北")
-        self.assertEqual(self.stored_note(), "小北")
-
-        status, body = self.post({"uid": "uid-note", "note": ""})
-        self.assertEqual(status, 200)
-        self.assertEqual(body["account"]["note"], "")
-        self.assertEqual(self.stored_note(), "")
-
-    def test_a_too_long_note_is_refused_and_nothing_is_written(self):
-        self.post({"uid": "uid-note", "note": "保留"})
-        status, body = self.post({"uid": "uid-note", "note": "字" * (LIMIT + 1)})
-        self.assertEqual(status, 400)
-        self.assertIn(str(LIMIT), body["error"]["message"])
-        self.assertEqual(self.stored_note(), "保留")
-
-    def test_a_non_string_note_is_refused(self):
-        for value in (7, True, ["x"], {"note": "x"}):
-            with self.subTest(value=value):
-                status, body = self.post({"uid": "uid-note", "note": value})
-                self.assertEqual(status, 400)
-                self.assertIn("note", body["error"]["message"])
-        self.assertEqual(self.stored_note(), "")
-
-    def test_an_unknown_uid_is_rejected(self):
-        status, _ = self.post({"uid": "uid-missing", "note": "x"})
-        self.assertEqual(status, 404)
-
-    def test_the_message_lists_note_as_updatable(self):
-        status, body = self.post({"uid": "uid-note"})
-        self.assertEqual(status, 400)
-        self.assertIn("note", body["error"]["message"])
+    def test_dashboard_sorts_note_accounts_first(self):
+        with open(os.path.join(ROOT, "dashboard.html"), encoding="utf-8") as fh:
+            html = fh.read()
+        self.assertIn("const nx = x[0].note ? 0 : 1, ny = y[0].note ? 0 : 1;", html)
 
 
 if __name__ == "__main__":

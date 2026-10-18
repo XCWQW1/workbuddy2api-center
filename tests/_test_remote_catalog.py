@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 _TMP = tempfile.mkdtemp(prefix="wb-remote-")
 os.environ["ACCOUNTS_DIR"] = os.path.join(_TMP, "accounts")
 os.environ["WB_PROXY_USAGE_DIR"] = _TMP
+os.environ["WB_PROXY_CATALOG_DIR"] = os.path.join(_TMP, "catalog")
 os.makedirs(os.environ["ACCOUNTS_DIR"], exist_ok=True)
 
 import wb_proxy as P
@@ -67,9 +68,10 @@ class RemoteCatalogTests(unittest.TestCase):
     def setUp(self):
         P._models_cache["intl"] = {"at": 0.0, "data": None}
         P._models_cache["cn"] = {"at": 0.0, "data": None}
-        cache = P.catalog_cache_path()
-        if os.path.exists(cache):
-            os.remove(cache)
+        for realm in ("intl", "cn"):
+            for cache in (P.catalog_cache_path(realm), P.catalog_snapshot_path(realm)):
+                if os.path.exists(cache):
+                    os.remove(cache)
         self._orig = (P.fetch_remote_product_config,
                                 P.read_product_config_models,
                                 P.fetch_endpoint_models,
@@ -83,8 +85,45 @@ class RemoteCatalogTests(unittest.TestCase):
                 os.remove(os.path.join(os.environ["ACCOUNTS_DIR"], name))
 
     def served(self, realm, force=False):
-        entries, _info = P.fetch_models(realm, force=force)
-        return [m for m, _ in entries]
+        return [m for m, _ in P.fetch_models(realm, force=force)]
+
+    def test_credits_follow_the_endpoint_and_fall_back_for_a_pinned_model(self):
+        """What the multiplier badge can follow, and what it cannot.
+
+        The badge renders whatever /v1/models reports, so the question is where
+        that value comes from. A model the endpoint still lists follows the
+        endpoint; a model it no longer lists - the cn free hy4-preview-f, pinned
+        by the curated table since #85 - keeps the bundled value, which by
+        definition cannot follow a price change until the endpoint lists it
+        again. Both halves, plus the model_entry() hop the panel reads.
+        """
+        # 1. The endpoint declares a new price for a curated model: it wins.
+        meta = dict(INTL_META)
+        meta["hy4-preview-f"] = {"credits": "x0.29"}
+        P.fetch_remote_product_config = (
+            lambda realm: (INTL_IDS, meta) if realm == "intl" else None)
+        entries = dict(P.fetch_models("intl"))
+        self.assertEqual(entries["hy4-preview-f"]["credits"], "x0.29")
+        self.assertEqual(
+            P.model_entry("hy4-preview-f", entries["hy4-preview-f"])["credits"],
+            "x0.29")
+
+        # 2. The endpoint stops listing it: the bundled value survives, and that
+        #    is exactly what the panel then shows.
+        ids = [m for m in INTL_IDS if m != "hy4-preview-f"]
+        meta = dict(INTL_META)
+        meta.pop("hy4-preview-f", None)
+        P.fetch_remote_product_config = (
+            lambda realm: (ids, meta) if realm == "intl" else None)
+        P.write_catalog_cache({"realms": {"intl": {
+            "fetched_at": time.time() - P.CATALOG_CACHE_TTL - 60}}})
+        P._models_cache["intl"] = {"at": 0.0, "data": None}
+        entries = dict(P.fetch_models("intl"))
+        self.assertIn("hy4-preview-f", entries)
+        self.assertEqual(entries["hy4-preview-f"]["credits"], "x0.00")
+        self.assertEqual(
+            P.model_entry("hy4-preview-f", entries["hy4-preview-f"])["credits"],
+            "x0.00")
 
     def test_parse_keeps_order_and_metadata(self):
         ids, meta = P.parse_remote_catalog(payload(INTL_IDS, INTL_META))
@@ -109,13 +148,13 @@ class RemoteCatalogTests(unittest.TestCase):
         self.assertIn("grok-4.7", curated)
         self.assertIn("hy4-preview-f", curated)
 
-    def test_curate_prefers_the_free_sibling(self):
+    def test_curate_keeps_live_variants(self):
         ids = ["hy4-preview", "hy4-preview-f", "hy3", "hy3-x"]
         meta = {"hy4-preview": {"credits": "x0.29"},
              "hy4-preview-f": {"credits": "x0.00"},
              "hy3": {"credits": "x0.00"}, "hy3-x": {"credits": "x0.05"}}
         self.assertEqual(P.curate_remote_catalog("intl", ids, meta),
-                    ["hy4-preview-f", "hy3"])
+                    ["hy4-preview", "hy4-preview-f", "hy3"])
 
     def test_curate_keeps_a_paid_model_with_no_free_sibling(self):
         ids = ["grok-4.7", "glm-5.3"]
@@ -132,40 +171,19 @@ class RemoteCatalogTests(unittest.TestCase):
             "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
             "gpt-5.4", "grok-4.7", "gemini-3.5-flash", "glm-5.3-flash",
             "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.6", "kimi-k2.8-preview"])
-        _, info = P.fetch_models("intl")
-        self.assertEqual(info["source"], "server")
+        P.fetch_models("intl")
+        info = P.catalog_meta("intl")
+        self.assertEqual(info["source"], "remote")
         self.assertTrue(info["fetched_at"])
 
-    def test_live_reasoning_efforts_win_over_the_bundled_table(self):
-        """活目录声明的推理档位就是答案，固定值不能盖住它。"""
-        meta = dict(INTL_META)
-        meta["deepseek-v4.1-flash"] = {
-            "credits": "x0.00",
-            "reasoning": {"supportedEfforts": ["low", "medium", "high"],
-                          "defaultEffort": "medium"},
-        }
-        P.fetch_remote_product_config = (
-            lambda realm: (INTL_IDS, meta) if realm == "intl" else None)
-        entries = dict(P.fetch_models("intl")[0])
-        item = P.model_entry("deepseek-v4.1-flash", entries["deepseek-v4.1-flash"])
-        self.assertEqual(item["reasoning_efforts"], ["low", "medium", "high"])
-        self.assertEqual(item["reasoning_default_effort"], "medium")
-
-    def test_bundled_efforts_fill_in_when_the_live_entry_has_none(self):
-        P.fetch_remote_product_config = (
-            lambda realm: (INTL_IDS, INTL_META) if realm == "intl" else None)
-        entries = dict(P.fetch_models("intl")[0])
-        item = P.model_entry("deepseek-v4.1-flash", entries["deepseek-v4.1-flash"])
-        self.assertEqual(item["reasoning_efforts"], ["low", "high", "max"])
-        self.assertEqual(item["reasoning_default_effort"], "high")
-
     def test_cn_keeps_the_pinned_free_variant(self):
+        # 实时 meta 为准：上游已下线 hy4-preview-f 且 hy4-preview 为收费 (0.29x) 时，如实对外宣告 hy4-preview
         P.fetch_remote_product_config = (
             lambda realm: (CN_IDS, CN_META) if realm == "cn" else None)
-        ids = self.served("cn")
-        self.assertEqual(ids[0], "hy4-preview-f")
-        self.assertIn("hy4-preview-f", ids)    # pin: free, remote no longer lists it
-        self.assertNotIn("hy4-preview", ids)   # paid sibling of the free one
+        ids = [m for m, _ in P.fetch_models("cn")]
+        self.assertEqual(ids[0], "hy4-preview")
+        self.assertIn("hy4-preview", ids)
+        self.assertNotIn("hy4-preview-f", ids)
         self.assertNotIn("hy3-x", ids)         # -x variant
         self.assertNotIn("auto", ids)          # auto-router alias
 
@@ -182,7 +200,8 @@ class RemoteCatalogTests(unittest.TestCase):
         self.assertEqual(calls, ["intl"])
         # 清掉内存副本,模拟重启后只剩磁盘缓存
         P._models_cache["intl"] = {"at": 0.0, "data": None}
-        ids, info = P.fetch_models("intl")
+        ids = P.fetch_models("intl")
+        info = P.catalog_meta("intl")
         self.assertEqual([m for m, _ in ids][0], "hy4-preview-f")
         self.assertEqual(calls, ["intl"])
         self.assertEqual(info["source"], "cache")
@@ -202,9 +221,10 @@ class RemoteCatalogTests(unittest.TestCase):
 
         P.fetch_remote_product_config = remote
         P._models_cache["intl"] = {"at": 0.0, "data": None}
-        _, info = P.fetch_models("intl")
+        P.fetch_models("intl")
+        info = P.catalog_meta("intl")
         self.assertEqual(calls, ["intl"])
-        self.assertEqual(info["source"], "server")
+        self.assertEqual(info["source"], "remote")
 
     def test_expired_cache_still_answers_when_the_server_fails(self):
         P.fetch_remote_product_config = (
@@ -215,7 +235,8 @@ class RemoteCatalogTests(unittest.TestCase):
         P.write_catalog_cache(data)
         P.fetch_remote_product_config = lambda realm: None
         P._models_cache["intl"] = {"at": 0.0, "data": None}
-        ids, info = P.fetch_models("intl")
+        ids = P.fetch_models("intl")
+        info = P.catalog_meta("intl")
         self.assertEqual(info["source"], "cache")
         self.assertIn("grok-4.7", [m for m, _ in ids])
 
@@ -250,6 +271,88 @@ class RemoteCatalogTests(unittest.TestCase):
         self.assertIn("grok-4.7", ids)   # the bundled snapshot still fills names
         self.assertNotIn("internal-only-model", ids)  # endpoint keeps the table filter
 
+    def test_live_reasoning_efforts_win_over_the_bundled_table(self):
+        """The endpoint's reasoning block is the source of truth.
+
+        deepseek-v4.1-flash used to be pinned to low/high/max in code, which
+        silently overwrote whatever the live catalogue declared (the pin dates
+        from before the gateway called /v3/config at all).
+        """
+        meta = dict(INTL_META)
+        meta["deepseek-v4.1-flash"] = {
+            "credits": "x0.00",
+            "reasoning": {"supportedEfforts": ["low", "medium", "high"],
+                          "defaultEffort": "medium"},
+        }
+        P.fetch_remote_product_config = (
+            lambda realm: (INTL_IDS, meta) if realm == "intl" else None)
+        entries = dict(P.fetch_models("intl"))
+        item = P.model_entry("deepseek-v4.1-flash",
+                             entries["deepseek-v4.1-flash"])
+        self.assertEqual(item["reasoning_efforts"], ["low", "medium", "high"])
+        self.assertEqual(item["reasoning_default_effort"], "medium")
+
+    def test_bundled_efforts_fill_in_when_the_live_entry_has_none(self):
+        """A silent live entry falls back to the snapshot, and says so once."""
+        logged = []
+        original_log = P.log
+        P.log = lambda message, **kw: logged.append(message)
+        try:
+            P.fetch_remote_product_config = (
+                lambda realm: (INTL_IDS, dict(INTL_META)) if realm == "intl" else None)
+            P._catalog_fallback_log.pop("intl", None)
+            entries = dict(P.fetch_models("intl"))
+        finally:
+            P.log = original_log
+        item = P.model_entry("deepseek-v4.1-flash",
+                             entries["deepseek-v4.1-flash"])
+        self.assertEqual(item["reasoning_efforts"], ["low", "high", "max"])
+        self.assertEqual(item["reasoning_default_effort"], "high")
+        self.assertTrue(any("bundled table" in m for m in logged), logged)
+
+    def test_bare_live_effort_keeps_the_model_selectable(self):
+        """Issue #170: a bare live `effort` is the default, not a pin.
+
+        The endpoint answers with {"effort": "high"} for deepseek-v4.1-flash
+        while the bundled table knows the level is selectable. Taking the live
+        block at face value dropped supportedEfforts, so /v1/models advertised
+        the model as pinned to high - and every request was recorded at high
+        even when the client sent max, the level it was really forwarded with.
+        """
+        meta = dict(INTL_META)
+        meta["deepseek-v4.1-flash"] = {
+            "credits": "x0.00",
+            "reasoning": {"effort": "high", "summary": "auto"},
+        }
+        logged = []
+        original_log = P.log
+        P.log = lambda message, **kw: logged.append(message)
+        try:
+            P.fetch_remote_product_config = (
+                lambda realm: (INTL_IDS, meta) if realm == "intl" else None)
+            P._catalog_fallback_log.pop("intl", None)
+            entries = dict(P.fetch_models("intl"))
+        finally:
+            P.log = original_log
+        item = P.model_entry("deepseek-v4.1-flash",
+                             entries["deepseek-v4.1-flash"])
+        self.assertEqual(item["reasoning_efforts"], ["low", "high", "max"])
+        self.assertEqual(item["reasoning_default_effort"], "high")
+        self.assertNotIn("reasoning_fixed_effort", item)
+        # The level the request really ran at follows the client again.
+        self.assertIsNone(P.model_fixed_effort("deepseek-v4.1-flash"))
+        self.assertEqual(
+            P.upstream_effort_of({"reasoning_effort": "max"},
+                                 "deepseek-v4.1-flash"),
+            "max")
+        # A model the live catalogue really does pin is untouched: no snapshot
+        # supportedEfforts to restore, so its bare effort still pins it.
+        pinned = P.model_entry("gemini-3.5-flash", entries["gemini-3.5-flash"])
+        self.assertEqual(pinned["reasoning_fixed_effort"], "medium")
+        self.assertNotIn("reasoning_efforts", pinned)
+        # And the shape is announced, not applied silently.
+        self.assertTrue(any("bundled table" in m for m in logged), logged)
+
     def test_parse_reads_the_desktop_cache_shape(self):
         """The cache file is the same document without the "data" envelope."""
         ids, _ = P.parse_remote_catalog(
@@ -263,17 +366,19 @@ class RemoteCatalogTests(unittest.TestCase):
     def test_cached_desktop_file_drives_the_list_without_the_endpoint(self):
         P.fetch_remote_product_config = lambda realm: None
         payload = {"agents": [{"name": "cli",
-                               "models": CN_IDS + ["new-model-9"]}],
-                   "models": [{"id": "hy3", "credits": "x0.00"}]}
+                               "models": CN_IDS + ["new-model-9", "uncredited-model"]}],
+                   "models": [{"id": "hy3", "credits": "x0.00"},
+                              {"id": "new-model-9", "credits": "x1.50"}]}
         path = os.path.join(_TMP, "acc-product-config-v3.json")
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh)
         P.product_config_path = lambda realm: path
         P._models_cache["cn"] = {"at": 0.0, "data": None}
-        ids = self.served("cn")
-        self.assertEqual(ids[0], "hy4-preview-f")
+        ids = [m for m, _ in P.fetch_models("cn")]
+        self.assertEqual(ids[0], "hy4-preview")
         self.assertNotIn("auto", ids)
-        self.assertIn("new-model-9", ids)   # live-only name ships, no release
+        self.assertIn("new-model-9", ids)   # live-only name with credits ships, no release
+        self.assertNotIn("uncredited-model", ids)  # unpriced model is hidden until credits configured
 
 
 class FakePanelRequest(object):
@@ -286,16 +391,17 @@ class FakePanelRequest(object):
 
 
 class PanelModelListTests(unittest.TestCase):
-    """面板的模型表：被筛选规则排除的模型默认不处理，勾选之后保持启用。"""
+    """面板的模型表：被筛选规则排除的模型单独列出，读取不改变路由状态。"""
 
     EXCLUDED = ["default-model", "fast-model", "balanced-model",
                 "primary-model", "deep-model", "deepseek-v4.1-flash-sg"]
 
     def setUp(self):
         P._models_cache["intl"] = {"at": 0.0, "data": None}
-        cache = P.catalog_cache_path()
-        if os.path.exists(cache):
-            os.remove(cache)
+        for realm in ("intl", "cn"):
+            for cache in (P.catalog_cache_path(realm), P.catalog_snapshot_path(realm)):
+                if os.path.exists(cache):
+                    os.remove(cache)
         settings = wb_settings.settings_path(P.ACCOUNTS_DIR)
         if os.path.exists(settings):
             os.remove(settings)
@@ -319,30 +425,29 @@ class PanelModelListTests(unittest.TestCase):
                 return item
         self.fail("%s not in the panel list" % mid)
 
-    def test_excluded_models_start_switched_off(self):
+    def test_excluded_models_are_listed_without_being_disabled(self):
         payload = self.view(realm="intl")
         self.assertEqual(payload["source"], "server")
         for mid in self.EXCLUDED:
             item = self.row(payload, mid)
             self.assertTrue(item["excluded"], mid)
-            self.assertFalse(item["enabled"], mid)
+            self.assertTrue(item["enabled"], mid)
         served = self.row(payload, "grok-4.7")
         self.assertTrue(served["enabled"])
         self.assertFalse(served["excluded"])
-        self.assertEqual(sorted(wb_settings.disabled_models(P.ACCOUNTS_DIR)),
-                         sorted(self.EXCLUDED))
+        # Reading the panel must not change which models receive traffic.
+        self.assertEqual(wb_settings.disabled_models(P.ACCOUNTS_DIR), [])
 
-    def test_a_checked_excluded_model_stays_checked(self):
+    def test_an_excluded_model_can_be_switched_off(self):
         self.view(realm="intl")
-        keep = [m for m in wb_settings.disabled_models(P.ACCOUNTS_DIR)
-                if m != "deepseek-v4.1-flash-sg"]
-        wb_settings.set_disabled_models(P.ACCOUNTS_DIR, keep)
+        wb_settings.set_disabled_models(P.ACCOUNTS_DIR, ["deepseek-v4.1-flash-sg"])
         payload = self.view(realm="intl")
         item = self.row(payload, "deepseek-v4.1-flash-sg")
         self.assertTrue(item["excluded"])
-        self.assertTrue(item["enabled"])
-        self.assertNotIn("deepseek-v4.1-flash-sg",
-                         wb_settings.disabled_models(P.ACCOUNTS_DIR))
+        self.assertFalse(item["enabled"])
+        wb_settings.set_disabled_models(P.ACCOUNTS_DIR, [])
+        payload = self.view(realm="intl")
+        self.assertTrue(self.row(payload, "deepseek-v4.1-flash-sg")["enabled"])
 
     def test_refresh_reports_whether_the_server_answered(self):
         payload = self.view(realm="intl", refresh="1")

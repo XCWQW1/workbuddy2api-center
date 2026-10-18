@@ -20,10 +20,14 @@
 - **三种协议**：支持 OpenAI Chat Completions（旧版）、Responses 和 Anthropic Messages。
 - **流式纠错**：上游中断、报错或缺少收尾事件时，网关按各自协议返回错误收尾，上游心跳原样转发。
 - **智能调度**：国际版和国内版分别调度，尽可能节省 Token。
-- **出站身份**：每个账号可以在 WB、VSC、CLI 三种官方身份之间切换。
-- **密钥分配**：每个 API Key 可以绑定出口，并设置模型白名单、有效期、Token 配额、积分配额和 IP 白名单。
+- **出站身份**：每个账号可以在 WB、VSC、CLI 三种官方身份之间切换，出站版本与 UA 与官方客户端一致。
+- **密钥分配**：每个 API Key 可以绑定出口，并设置模型白名单、有效期、Token 配额、积分配额、IP 白名单和并发上限。
 - **代理槽**：账号可以绑定固定的代理出口，网关支持自动发现 mihomo 端口。
 - **用量审计**：网关为每条请求记录模型、Token、积分、密钥、来源 IP、状态码和实际使用的思考档位。
+- **模型目录**：按官方桌面端清单整理，剔除补全通道与专线变体，支持手动刷新与每日自动获取。
+- **积分与定价**：按 OpenRouter 价格估算每次请求的等价花费，支持人民币与美元切换。
+- **活动与自动化**：国内版签到、成长任务、猫猫旅行，国际版每日活跃打卡；后台调度器按固定时刻巡检。
+- **剩余用量与限额护栏**：账号级保留积分、每日 Token、每日积分、按模型 Token 四条护栏，另有剩余用量估算。
 - **本地网络工具**：网关可代替客户端执行声明的 `web_search` 和 `web_fetch` 工具。
 - **零依赖**：只需要 Python 3.9 或更新版本。项目提供 Windows、macOS、Linux 启动脚本和 Docker 镜像。
 
@@ -52,7 +56,7 @@
 | macOS | 双击 `start-wb-proxy.command`；首次启动遭到 Gatekeeper 拦截时，右键选择“打开” |
 | Linux 与 macOS 终端 | 执行 `./start-wb-proxy.sh`，可以在后面加端口号，例如 `./start-wb-proxy.sh 9000` |
 
-如果不想安装 Python，可以从 [Releases](https://github.com/flower-elf/workbuddy2api-center/releases) 下载绿色包 `wb-proxy-center-v*.zip`，包内带有 Windows 的 Python 运行时。Windows 解压后直接双击 `start-wb-proxy.bat`。macOS 和 Linux 解压后，同样用 `.command` 或 `.sh` 脚本启动。
+绿色包自带的精简 Python 运行时只覆盖 Windows；macOS 和 Linux 使用系统 Python。如果不想安装 Python，可以从 [Releases](https://github.com/flower-elf/workbuddy2api-center/releases) 下载绿色包 `wb-proxy-center-v*.zip`，包内带有 Windows 的 Python 运行时。Windows 解压后直接双击 `start-wb-proxy.bat`。macOS 和 Linux 解压后，同样用 `.command` 或 `.sh` 脚本启动。
 
 macOS 和 Linux 的脚本按顺序查找三个位置：包内的 `python/bin/python3`、`/usr/bin/python3` 和 Homebrew 的 python3。macOS 上没有 Python 时，执行 `xcode-select --install` 或 `brew install python`。
 
@@ -131,7 +135,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只运行名字里含 realm 的套件
 ```
 
-测试共有 56 个套件，其中 43 个是 Python 套件，13 个是 JavaScript 套件。JavaScript 套件需要 Node.js 22 或更新版本，没有安装 Node.js 时会跳过并给出提示。
+测试共有 190 个套件：135 个 Python 套件 + 55 个 JavaScript 套件。JavaScript 套件里有一部分覆盖仓库保留的上游 `dashboard.html`；自定义看板由 `tests/javascript` 的套件覆盖。JavaScript 套件需要 Node.js 22 或更新版本，没有安装 Node.js 时会跳过并给出提示。
 
 GitHub Actions 在三个环境里运行同一条命令：Ubuntu 的 Python 3.9 和 3.12，以及 Windows 的 Python 3.12。`tests/manual/_mobile_check.py` 是需要手动运行的 Playwright 布局检查器，不属于测试套件。
 
@@ -144,7 +148,6 @@ GitHub Actions 在三个环境里运行同一条命令：Ubuntu 的 Python 3.9 �
 - **模型名称**：填写 `/v1/models` 里列出的任意模型 ID，例如 `deepseek-v4.1-flash`、`glm-5.3`。
 
 **（1）Codex CLI 等 Responses 客户端**
-
 ```bash
 export OPENAI_BASE_URL="http://127.0.0.1:8788/v1"
 export OPENAI_API_KEY="你在“密钥”页添加的 API Key"
@@ -152,11 +155,15 @@ export OPENAI_API_KEY="你在“密钥”页添加的 API Key"
 
 **（2）Claude Code 等 Messages 客户端**
 
+> ⚠️ **积分风险**：网关把 Anthropic Messages 转换为 WorkBuddy 的 Chat / Responses 请求，`cache_control` 会被忽略。上游报告过长会话缓存命中率偏低、单次消耗偏高。因此这个入口默认关闭；确认理解风险后，才在启动前设置 `WB_ENABLE_ANTHROPIC_MESSAGES=1`。关闭时 `/v1/messages` 返回 400，请求不会转发到上游。
+
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8788"
 export ANTHROPIC_AUTH_TOKEN="你在“密钥”页添加的 API Key"
 export ANTHROPIC_MODEL="deepseek-v4.1-flash"
 ```
+
+设置页的 `messages_format` 可以选择 `openai-completions` 或 `openai-responses` 管线。两者都不是原生透传；`thinking` 历史块、`top_k`、`cache_control` 与 `betas` 会被忽略，`count_tokens` 只提供网关自己的估算值。
 
 **（3）curl**
 
@@ -182,7 +189,7 @@ curl http://127.0.0.1:8788/v1/chat/completions \
 | 任务 | 调度器状态与日志、国内版签到与成长任务、国际版每日活跃打卡、积分变动记录 |
 | 积分 | 每个账号每一笔套餐的来源、已用、剩余与到期时间 |
 | 密钥 | API Key 的出口、模型限制、有效期、配额、IP 白名单、用量与接入示例 |
-| 模型 | 模型目录与能力规格；网关拒绝取消勾选的模型，`/v1/models` 也不再列出它们 |
+| 模型 | 模型目录与能力规格；被筛选规则排除的模型会单独标注，只有明确取消勾选的模型会被网关拒绝，`/v1/models` 只列出启用的模型 |
 | 测试台 | 用面板会话直接调试模型，可以指定账号 |
 | 用量 | 按时间范围统计请求、Token、积分与缓存命中，并按账号、密钥与模型细分 |
 | 请求日志 | 每条请求的全部字段，可以按时间、版本、密钥、状态、模型、账号与来源 IP 筛选 |
@@ -308,7 +315,7 @@ Key 保存在 `accounts/settings.json`。在看板保存过 Key 之后，启动�
 
 ### Messages 接口
 
-`POST /v1/messages` 按 Anthropic Messages 协议收发，支持 `system`、多轮对话、图片、工具调用、思考内容和流式输出，错误也按这个协议的格式返回。
+`POST /v1/messages` 按 Anthropic Messages 协议收发，支持 `system`、多轮对话、图片、工具调用、思考内容和流式输出，错误也按这个协议的格式返回。这个入口默认关闭，启动前设置 `WB_ENABLE_ANTHROPIC_MESSAGES=1` 才会启用；关闭时返回 Anthropic 格式的 400，请求不会转发到上游。
 
 翻译方式在“设置 → 网关行为 → Messages 接口翻译”里选择。
 
@@ -344,7 +351,7 @@ Key 保存在 `accounts/settings.json`。在看板保存过 Key 之后，启动�
 | POST | /v1/messages | Anthropic Messages 协议 |
 | GET | /v1/models | 模型列表，含能力、规格、目录来源 `source` 与获取时间 `fetched_at` |
 
-`GET /health` 用于外部健康检查，不需要凭据。网关能够接单时，返回 `200` 和 `{"ok": true}`。没有账号可以处理请求，或者启动尚未完成时，返回 `503` 和 `{"ok": false, "error": "..."}`。
+`GET /health` 用于外部健康检查，不需要凭据。它始终返回 `200` 和 `{"ok": true, ...}`，包含 `realm`、`accounts`、`accounts_ready` 与 `api_key_required`；即使没有可用账号也不会返回 503。已授权请求还会返回 `uid`、`domain`、`issuer`、`credential_file` 与 `expires_at`。
 
 ### 看板接口
 
@@ -362,7 +369,7 @@ Key 保存在 `accounts/settings.json`。在看板保存过 Key 之后，启动�
 | GET | /accounts | 账号列表 |
 | GET | /accounts/export | 导出账号文档 |
 | POST | /accounts/import | 导入账号文档，支持 `dryRun` 与 `overwrite` |
-| POST | /accounts/import/desktop | 导入桌面端凭据，当前停用 |
+| POST | /accounts/import/desktop | 只读扫描桌面端凭据；传 `path` 导入一个，传 `all` 导入全部 |
 | POST | /accounts/refresh | 刷新一个或全部账号的令牌 |
 | POST | /accounts/test | 测试账号，可以临时指定模型 |
 | POST | /accounts/set | 修改单个字段：`enabled`、`priority`、`note`、`concurrencyLimit`、`proxy`、`proxySlot` |
@@ -430,26 +437,53 @@ Key 保存在 `accounts/settings.json`。在看板保存过 Key 之后，启动�
 | `WB_PROXY_KEY` | 空 | 与 `API_KEY` 作用相同 |
 | `ACCOUNTS_DIR` | `./accounts` | 账号凭证与设置目录 |
 | `WB_PROXY_USAGE_DIR` | `./usage` | 用量记录目录 |
+| `WB_PROXY_CATALOG_DIR` | `./catalog` | 模型目录落盘存档目录 |
 | `WB_PROXY_DEFAULT_REALM` | `intl` | 启动时的默认出口 |
+| `WB_ENABLE_ANTHROPIC_MESSAGES` | `0` | 打开 Anthropic Messages 入口；默认关闭，确认缓存与积分风险后再设 `1` |
 | `WB_CLIENT_TIMEOUT` | `120` | 客户端连接读写超时，单位为秒 |
-| `WB_MAX_PAYLOAD_BYTES` | `52428800` | 请求体上限，即 50 MiB，超出时返回 413 |
-| `WB_MAX_CONCURRENT_CHAT` | `32` | 同时处理的对话请求数 |
+| `WB_MAX_PAYLOAD_BYTES` | `16777216` | 请求体上限，即 16 MiB，超出时返回 413 |
+| `WB_MAX_CONCURRENT_CHAT` | `32` | 同时处理的对话请求数；设为 `auto` 时按可用账号数计算 |
 | `WB_CHAT_SLOT_WAIT` | `30` | 并发已满时排队等待的秒数 |
 | `WB_MAX_WEB_ROUNDS` | `3` | 本地网络工具最多运行的轮数，上限为 8 |
 | `WB_WEB_TURN_TIMEOUT` | `120` | 网页通道打卡一轮的等待上限，单位为秒 |
+| `WB_WEB_ENGINES` | 内置链 | 搜索引擎顺序，逗号分隔，例如 `duckduckgo,bing` |
+| `WB_WEB_COOLDOWN` | `600` | 被限流引擎的冷却秒数，0 表示不冷却 |
+| `WB_WEB_CACHE_TTL` | `600` | 搜索与抓取缓存秒数，0 表示关闭 |
+| `WB_WEB_MIN_INTERVAL` | `0.5` | 对外请求的最小间隔秒数 |
+| `WB_WEB_BUDGET` | `25` | 单次搜索所有引擎的总预算秒数 |
+| `WB_WEB_TOOLS_PROXY` | 空 | 搜索请求的出口代理；`web_fetch` 为固定解析 IP 的安全连接，不走这个代理 |
 | `WB_PROMPT_CACHE_KEY` | `0` | 实验开关，打开后向上游附带 `prompt_cache_key` |
+| `WB_AFFINITY_BY_PREFIX` | `1` | 没有会话标识时按对话前缀固定账号 |
+| `WB_STATS_TTL` | `15` | 用量统计缓存秒数 |
 | `WB_PROXY_DISCOVER_HOST` | `cli-proxy-mihomo` | 代理槽自动发现的主机名 |
 | `WB_PROXY_DISCOVER_PORTS` | `17901-17910` | 代理槽自动发现的端口范围 |
 | `TZ` | `Asia/Shanghai` | 容器时区；定时任务始终按 UTC+8 时间计算 |
 
----
-
 ## 七、致谢与引用声明
 
 - **[ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub)**：本仓库的上游。协议转换、账号调度、定时任务和请求侧的风控处理，都建立在它的基础上。
-- **[ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager)**：看板界面的参考来源
+- **[ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager)**：看板界面的参考来源。
 - **[linux-do/cdk](https://github.com/linux-do/cdk)**：LINUX DO 社区的 CDK 发放平台。本项目用原生 H5 和 JavaScript 重新实现了它的部分视觉风格。
-- **[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)**：参考了它的成长任务流程分析、设备指纹派生 `derive_id`、整点调度 `Scheduler`、指纹脱敏和 `reasoning_content` 回填。
+- **[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)**：成长任务全链路逆向、设备指纹稳定派生 `derive_id`、整点排程调度 `Scheduler`、指纹脱敏与 `reasoning_content` 回填。
+- **[CangShui/workbuddy-cliproxy-fix](https://github.com/CangShui/workbuddy-cliproxy-fix)**：早期客户端代理修复与接口差异参考。
+- **[lovingfish/workbuddy-cliproxy](https://github.com/lovingfish/workbuddy-cliproxy)** 与 **[mmqz/cpa-multi-plugins](https://github.com/mmqz/cpa-multi-plugins)**：网关通信与多插件管理原型参考。
+- **[ardeyouxipianyi/workbuddy2api](https://github.com/ardeyouxipianyi/workbuddy2api)**：国内版分发包逆向分析与出站 User-Agent 规范参考。
+- **[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)**：国内版连登管家、对话活跃上报的事件形状与风控口径、企业版门控。
+- **[aodianjun/workbuddy2api-hub](https://github.com/aodianjun/workbuddy2api-hub)**：OpenWrt 打包配方，审计后并入 `wrt/`。
+
+PR 贡献者（v1.4.5 之前的改动未进上方更新记录，这里一并列出）：
+
+- **[@ddddd-ren](https://github.com/ddddd-ren)**：用量日志倒序检索与看板防堆叠（PR #14）、原子写入与并发竞争修复（PR #13）、账号池 JSON 导出导入（PR #5）；
+- **[@wylftw0314-glitch](https://github.com/wylftw0314-glitch)**：Responses API custom 工具协议双向转译（PR #12）；
+- **[@shuishuipingan](https://github.com/shuishuipingan)**：成长任务领取竞态与专家/团队事件 id 去重、猫猫旅行派出修复、夜猫子任务接入调度器、启动端口误判（PR #21）、按模型冷却限流（PR #22）、任务接取强化与轮询加速（PR #27）、网络抖动重试与 403 直通（PR #28）、HTTP 连接同步（PR #30）；
+- **[@ayeaaaa](https://github.com/ayeaaaa)**：按账号绑定出口代理槽（PR #26）、DeepSeek `reasoning_content` 回填（PR #36）、看板移动端布局（PR #37）；
+- **[@t-789](https://github.com/t-789)**：macOS 启动脚本与防火墙助手（PR #31）；
+- **[@Cekxri](https://github.com/Cekxri)**：Codex App namespace 工具支持（PR #33）；
+- **[@wiggins-kong](https://github.com/wiggins-kong)**：API Key 行 id 唯一化（PR #40）、Docker 镜像缺少运行时模块（PR #41）；
+- **[@Pro-XK](https://github.com/Pro-XK)**：看板积分消耗与账号昵称（PR #45）；
+- **[@teddyli18000](https://github.com/teddyli18000)**：单模型限流可视化（PR #50）、`/health` 鉴权状态修正（PR #52）；
+- **[@LuFering](https://github.com/LuFering)**：Docker 部署下的 Linux 桌面凭据挂载说明（PR #55）；
+- **[@zhangzm0](https://github.com/zhangzm0)**：`tool_choice="none"` 保留工具声明（PR #57）。
 
 ---
 
